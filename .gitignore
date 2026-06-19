@@ -1,0 +1,40 @@
+# Dependencies
+node_modules/
+.venv/
+venv/
+__pycache__/
+
+# Build outputs
+dist/
+build/
+out/
+
+# Local env and secrets
+.env
+.env.*
+*.cookie
+cookies.txt
+
+# Downloaded media and temp files
+downloads/
+*.mp4
+*.mkv
+*.flv
+*.m4a
+*.aac
+*.webm
+*.part
+*.tmp
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+

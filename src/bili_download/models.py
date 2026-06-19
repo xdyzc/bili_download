@@ -72,6 +72,10 @@ class DownloadResult:
     page: VideoPage
     play_url: PlayUrl
     mode: str = "durl"
+    danmaku_video_path: Path | None = None
+    danmaku_xml_path: Path | None = None
+    danmaku_ass_path: Path | None = None
+    danmaku_count: int = 0
 
 
 @dataclass(frozen=True)

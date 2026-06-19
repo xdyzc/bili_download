@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import gzip
+import zlib
 from typing import Any, Iterable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -138,6 +140,25 @@ class BiliClient:
     def get_default_play_url(self, *, bvid: str, cid: int) -> PlayUrl:
         return self.get_play_url(bvid=bvid, cid=cid)
 
+    def get_danmaku_xml(self, *, cid: int, bvid: str | None = None) -> str:
+        referer = (
+            f"https://www.bilibili.com/video/{bvid}/"
+            if bvid
+            else "https://www.bilibili.com/"
+        )
+        request = Request(
+            f"https://comment.bilibili.com/{cid}.xml",
+            headers=_xml_headers(referer, cookie_header=self._cookie_header),
+        )
+        try:
+            with self._opener.open(request, timeout=self.timeout) as response:
+                raw = response.read()
+                encoding = response.headers.get("Content-Encoding", "")
+        except (HTTPError, URLError) as exc:
+            raise BiliNetworkError(f"danmaku request failed: cid={cid}") from exc
+
+        return _decode_response_body(raw, encoding).decode("utf-8", errors="replace")
+
     def open_stream(self, urls: Iterable[str], *, referer: str):
         last_error: Exception | None = None
         for url in urls:
@@ -243,3 +264,33 @@ def _download_headers(referer: str, *, cookie_header: str = "") -> dict[str, str
     if cookie_header:
         headers["Cookie"] = cookie_header
     return headers
+
+
+def _xml_headers(referer: str, *, cookie_header: str = "") -> dict[str, str]:
+    headers = {
+        "Accept": "application/xml,text/xml,*/*",
+        "Accept-Encoding": "gzip, deflate",
+        "Referer": referer,
+        "User-Agent": DEFAULT_USER_AGENT,
+    }
+    if cookie_header:
+        headers["Cookie"] = cookie_header
+    return headers
+
+
+def _decode_response_body(raw: bytes, encoding: str) -> bytes:
+    normalized = encoding.strip().lower()
+    if normalized == "gzip":
+        return gzip.decompress(raw)
+    if normalized == "deflate":
+        try:
+            return zlib.decompress(raw)
+        except zlib.error:
+            return zlib.decompress(raw, -zlib.MAX_WBITS)
+    if normalized == "br":
+        try:
+            import brotli
+        except ImportError:
+            return raw
+        return brotli.decompress(raw)
+    return raw

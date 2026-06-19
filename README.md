@@ -79,6 +79,13 @@ python -m venv .venv
 .\.venv\Scripts\bili-download.exe --cookie-file bili.json download BV1KGj36QEG3 --quality 116 --progress
 ```
 
+默认下载会读取弹幕，保存 `.danmaku.xml` 和 `.danmaku.ass`，并额外生成一个烧录弹幕的
+`.danmaku.mp4`；原始无弹幕 MP4 会保留。只想下载原视频时可以加：
+
+```powershell
+.\.venv\Scripts\bili-download.exe --cookie-file bili.json download BV1KGj36QEG3 --quality 16 --progress --no-danmaku
+```
+
 也可以直接双击项目根目录下的 `download.bat`，按提示输入 BV 号或视频链接，文件会保存到 `downloads` 文件夹。
 如果项目根目录存在 `bili.json`，启动脚本会自动带上这个 Cookie 文件，并显示当前登录状态和用户名。
 做真实下载测试时，建议优先选择一两分钟以内的视频，避免反复下载大文件。

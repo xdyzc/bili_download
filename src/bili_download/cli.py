@@ -64,6 +64,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="show download progress in the terminal",
     )
+    download_parser.add_argument(
+        "--no-danmaku",
+        action="store_true",
+        help="skip danmaku XML download and burned-in danmaku MP4 output",
+    )
 
     qualities_parser = subparsers.add_parser(
         "qualities",
@@ -141,8 +146,16 @@ def _download(args: argparse.Namespace) -> int:
         quality=args.quality,
         progress=args.progress,
         overwrite=args.overwrite,
+        danmaku=not args.no_danmaku,
     )
     print(f"saved={result.path}")
+    if result.danmaku_video_path is not None:
+        print(f"danmaku_video={result.danmaku_video_path}")
+    if result.danmaku_xml_path is not None:
+        print(f"danmaku_xml={result.danmaku_xml_path}")
+    if result.danmaku_ass_path is not None:
+        print(f"danmaku_ass={result.danmaku_ass_path}")
+    print(f"danmaku_count={result.danmaku_count}")
     print(f"title={result.video.title}")
     print(f"page={result.page.index}")
     print(f"bytes={result.bytes_written}")
@@ -269,6 +282,7 @@ def _interactive() -> int:
     print("", flush=True)
     print("Downloading to:", flush=True)
     print(f"  {download_dir}", flush=True)
+    print("Danmaku: enabled, burned-in MP4 will be generated when danmaku exists.", flush=True)
     print("", flush=True)
     exit_code = main(download_args)
     print("")

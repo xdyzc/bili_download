@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 import re
 import shutil
@@ -10,6 +11,7 @@ import sys
 import time
 
 from .client import BiliClient
+from .danmaku import parse_danmaku_xml, write_ass
 from .models import DashMedia, DownloadResult, PlayUrl, StreamSegment, VideoInfo, VideoPage
 from .video_id import parse_bili_video_ref
 
@@ -35,6 +37,7 @@ class BiliDownloader:
         quality: int | None = None,
         progress: bool = False,
         overwrite: bool = False,
+        danmaku: bool = False,
     ) -> DownloadResult:
         video_ref = parse_bili_video_ref(url_or_bv)
         video = self.client.get_video_info(video_ref)
@@ -54,6 +57,7 @@ class BiliDownloader:
                 requested_quality=quality,
                 progress=progress,
                 overwrite=overwrite,
+                danmaku=danmaku,
             )
 
         if not play_url.segments:
@@ -88,7 +92,7 @@ class BiliDownloader:
             path.unlink()
         part_path.replace(path)
 
-        return DownloadResult(
+        result = DownloadResult(
             path=path,
             bytes_written=bytes_written,
             segments=len(play_url.segments),
@@ -97,6 +101,9 @@ class BiliDownloader:
             play_url=play_url,
             mode="durl",
         )
+        if danmaku:
+            result = self._add_danmaku(result, overwrite=overwrite)
+        return result
 
     def _download_dash(
         self,
@@ -108,6 +115,7 @@ class BiliDownloader:
         requested_quality: int | None,
         progress: bool,
         overwrite: bool,
+        danmaku: bool,
     ) -> DownloadResult:
         video_stream = _select_dash_video(play_url, requested_quality)
         audio_stream = _select_dash_audio(play_url)
@@ -150,7 +158,7 @@ class BiliDownloader:
         video_part.unlink(missing_ok=True)
         audio_part.unlink(missing_ok=True)
 
-        return DownloadResult(
+        result = DownloadResult(
             path=path,
             bytes_written=bytes_written,
             segments=2,
@@ -158,6 +166,63 @@ class BiliDownloader:
             page=page,
             play_url=play_url,
             mode="dash",
+        )
+        if danmaku:
+            result = self._add_danmaku(
+                result,
+                width=video_stream.width,
+                height=video_stream.height,
+                overwrite=overwrite,
+            )
+        return result
+
+    def _add_danmaku(
+        self,
+        result: DownloadResult,
+        *,
+        width: int | None = None,
+        height: int | None = None,
+        overwrite: bool,
+    ) -> DownloadResult:
+        xml_path = result.path.with_name(f"{result.path.stem}.danmaku.xml")
+        ass_path = result.path.with_name(f"{result.path.stem}.danmaku.ass")
+        video_path = _danmaku_output_path(result.path)
+        if video_path.exists() and not overwrite:
+            raise FileExistsError(f"danmaku output file already exists: {video_path}")
+
+        xml_text = self.client.get_danmaku_xml(
+            cid=result.page.cid,
+            bvid=result.video.bvid,
+        )
+        xml_path.write_text(xml_text, encoding="utf-8")
+        events = parse_danmaku_xml(xml_text)
+        write_ass(
+            events,
+            ass_path,
+            width=width or 1920,
+            height=height or 1080,
+            video_duration=result.page.duration,
+        )
+        if not events:
+            return replace(
+                result,
+                danmaku_xml_path=xml_path,
+                danmaku_ass_path=ass_path,
+                danmaku_count=0,
+            )
+
+        _burn_ass_with_ffmpeg(
+            result.path,
+            ass_path,
+            video_path,
+            overwrite=overwrite,
+        )
+        return replace(
+            result,
+            danmaku_video_path=video_path,
+            danmaku_xml_path=xml_path,
+            danmaku_ass_path=ass_path,
+            danmaku_count=len(events),
         )
 
     def _write_stream(
@@ -344,6 +409,14 @@ def _progress_bar(percent: float, *, width: int = 28) -> str:
     return "#" * filled + "-" * (width - filled)
 
 
+def _danmaku_output_path(path: Path) -> Path:
+    return path.with_name(f"{path.stem}.danmaku{path.suffix}")
+
+
+def _escape_ass_filter_path(path: Path) -> str:
+    return str(path).replace("\\", "/").replace(":", "\\:")
+
+
 def _frame_rate_number(value: str) -> int:
     try:
         return int(float(value))
@@ -390,6 +463,69 @@ def _merge_with_ffmpeg(
             "ffmpeg failed to merge DASH video and audio. "
             f"Temporary files: {video_part}, {audio_part}\n{stderr.strip()}"
         )
+
+
+def _burn_ass_with_ffmpeg(
+    input_path: Path,
+    ass_path: Path,
+    output_path: Path,
+    *,
+    overwrite: bool,
+) -> None:
+    ffmpeg = _find_ffmpeg()
+    if not ffmpeg:
+        raise UnsupportedStreamError(
+            "Danmaku ASS was written, but ffmpeg was not found. "
+            "Install the bundled ffmpeg helper with '.\\.venv\\Scripts\\python.exe -m pip install -e .'. "
+            f"Original video: {input_path}; ASS: {ass_path}"
+        )
+
+    temp_path = output_path.with_name(f"{output_path.name}.tmp.mp4")
+    if temp_path.exists():
+        temp_path.unlink()
+    if output_path.exists() and overwrite:
+        output_path.unlink()
+
+    command = [
+        ffmpeg,
+        "-hide_banner",
+        "-y" if overwrite else "-n",
+        "-i",
+        str(input_path),
+        "-vf",
+        f"ass='{_escape_ass_filter_path(ass_path)}'",
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a?",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "18",
+        "-c:a",
+        "copy",
+        "-movflags",
+        "+faststart",
+        str(temp_path),
+    ]
+    completed = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if completed.returncode != 0:
+        temp_path.unlink(missing_ok=True)
+        stderr = completed.stderr.decode("utf-8", errors="replace")
+        raise UnsupportedStreamError(
+            "ffmpeg failed to burn danmaku into the video. "
+            f"Original video: {input_path}; ASS: {ass_path}\n{stderr.strip()}"
+        )
+
+    if output_path.exists() and overwrite:
+        output_path.unlink()
+    temp_path.replace(output_path)
 
 
 def _find_ffmpeg() -> str | None:

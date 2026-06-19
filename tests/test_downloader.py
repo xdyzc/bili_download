@@ -28,6 +28,7 @@ class FakeClient:
             pages=(VideoPage(index=1, cid=123, title="Intro"),),
         )
         self.last_quality: int | None = None
+        self.last_danmaku_cid: int | None = None
         self.play_url = play_url or PlayUrl(
             quality=16,
             format="mp4",
@@ -38,6 +39,11 @@ class FakeClient:
                 StreamSegment(url="https://example.test/part-2.mp4"),
             ),
         )
+
+    def get_danmaku_xml(self, *, cid: int, bvid: str | None = None) -> str:
+        assert bvid == "BV1xx411c7mD"
+        self.last_danmaku_cid = cid
+        return '<i><d p="1,1,25,16777215,0,0,0,1">hello</d></i>'
 
     def get_video_info(self, video_ref: BiliVideoRef) -> VideoInfo:
         assert video_ref.bvid == "BV1xx411c7mD"
@@ -121,6 +127,48 @@ def test_downloader_merges_dash_streams(monkeypatch, tmp_path) -> None:
     assert result.path.read_bytes() == b"merged"
     assert result.mode == "dash"
     assert result.bytes_written == 10
+
+
+def test_downloader_writes_and_burns_danmaku(monkeypatch, tmp_path) -> None:
+    client = FakeClient()
+
+    def fake_burn(input_path, ass_path, output_path, *, overwrite):
+        assert input_path.read_bytes() == b"hello world"
+        assert "Dialogue:" in ass_path.read_text(encoding="utf-8")
+        assert overwrite is False
+        output_path.write_bytes(b"with danmaku")
+
+    monkeypatch.setattr(downloader_module, "_burn_ass_with_ffmpeg", fake_burn)
+    downloader = BiliDownloader(client=client)
+
+    result = downloader.download("BV1xx411c7mD", output_dir=tmp_path, danmaku=True)
+
+    assert client.last_danmaku_cid == 123
+    assert result.path.read_bytes() == b"hello world"
+    assert result.danmaku_video_path is not None
+    assert result.danmaku_video_path.read_bytes() == b"with danmaku"
+    assert result.danmaku_xml_path is not None
+    assert result.danmaku_xml_path.read_text(encoding="utf-8").startswith("<i>")
+    assert result.danmaku_ass_path is not None
+    assert result.danmaku_count == 1
+
+
+def test_downloader_keeps_zero_danmaku_result_without_burning(monkeypatch, tmp_path) -> None:
+    client = FakeClient()
+    client.get_danmaku_xml = lambda *, cid, bvid=None: "<i></i>"  # type: ignore[method-assign]
+
+    def fail_burn(*args, **kwargs):
+        raise AssertionError("empty danmaku should not invoke ffmpeg")
+
+    monkeypatch.setattr(downloader_module, "_burn_ass_with_ffmpeg", fail_burn)
+    downloader = BiliDownloader(client=client)
+
+    result = downloader.download("BV1xx411c7mD", output_dir=tmp_path, danmaku=True)
+
+    assert result.danmaku_video_path is None
+    assert result.danmaku_xml_path is not None
+    assert result.danmaku_ass_path is not None
+    assert result.danmaku_count == 0
 
 
 def test_progress_output_has_bar_and_single_speed_suffix(monkeypatch, capsys) -> None:

@@ -36,6 +36,7 @@ def test_cli_download_prints_result(monkeypatch, capsys, tmp_path) -> None:
             quality,
             progress,
             overwrite,
+            danmaku,
         ):
             assert url_or_bv == "BV1xx411c7mD"
             assert output_dir == tmp_path
@@ -44,8 +45,13 @@ def test_cli_download_prints_result(monkeypatch, capsys, tmp_path) -> None:
             assert quality is None
             assert progress is False
             assert overwrite is False
+            assert danmaku is True
             return DownloadResult(
                 path=Path("downloads/Test Video.mp4"),
+                danmaku_video_path=Path("downloads/Test Video.danmaku.mp4"),
+                danmaku_xml_path=Path("downloads/Test Video.danmaku.xml"),
+                danmaku_ass_path=Path("downloads/Test Video.danmaku.ass"),
+                danmaku_count=2,
                 bytes_written=11,
                 segments=1,
                 video=VideoInfo(
@@ -72,6 +78,10 @@ def test_cli_download_prints_result(monkeypatch, capsys, tmp_path) -> None:
     assert exit_code == 0
     assert capsys.readouterr().out.splitlines() == [
         "saved=downloads\\Test Video.mp4",
+        "danmaku_video=downloads\\Test Video.danmaku.mp4",
+        "danmaku_xml=downloads\\Test Video.danmaku.xml",
+        "danmaku_ass=downloads\\Test Video.danmaku.ass",
+        "danmaku_count=2",
         "title=Test Video",
         "page=1",
         "bytes=11",
@@ -79,6 +89,58 @@ def test_cli_download_prints_result(monkeypatch, capsys, tmp_path) -> None:
         "quality=16",
         "mode=durl",
     ]
+
+
+def test_cli_download_can_skip_danmaku(monkeypatch, capsys, tmp_path) -> None:
+    class FakeDownloader:
+        def download(
+            self,
+            url_or_bv,
+            *,
+            output_dir,
+            output_file,
+            page,
+            quality,
+            progress,
+            overwrite,
+            danmaku,
+        ):
+            assert danmaku is False
+            return DownloadResult(
+                path=Path("downloads/Test Video.mp4"),
+                bytes_written=11,
+                segments=1,
+                video=VideoInfo(
+                    bvid="BV1xx411c7mD",
+                    aid=170001,
+                    title="Test Video",
+                    owner_name="tester",
+                    pages=(VideoPage(index=1, cid=123, title="Intro"),),
+                ),
+                page=VideoPage(index=1, cid=123, title="Intro"),
+                play_url=PlayUrl(
+                    quality=16,
+                    format="mp4",
+                    accept_quality=(16,),
+                    accept_description=("360P",),
+                    segments=(),
+                ),
+            )
+
+    monkeypatch.setattr(cli, "_build_downloader", lambda cookie_file: FakeDownloader())
+
+    exit_code = main(
+        [
+            "download",
+            "BV1xx411c7mD",
+            "--output-dir",
+            str(tmp_path),
+            "--no-danmaku",
+        ]
+    )
+
+    assert exit_code == 0
+    assert "danmaku_count=0" in capsys.readouterr().out
 
 
 def test_cli_qualities_prints_available_options(monkeypatch, capsys) -> None:
@@ -192,12 +254,14 @@ def test_interactive_mode_downloads_with_user_input(monkeypatch, capsys, tmp_pat
             quality,
             progress,
             overwrite,
+            danmaku,
         ):
             assert url_or_bv == "BV1xx411c7mD"
             assert output_dir == tmp_path / "downloads"
             assert quality == 80
             assert progress is True
             assert overwrite is True
+            assert danmaku is True
             return DownloadResult(
                 path=tmp_path / "downloads" / "Test Video.mp4",
                 bytes_written=11,
@@ -231,5 +295,6 @@ def test_interactive_mode_downloads_with_user_input(monkeypatch, capsys, tmp_pat
     assert "Account status:" in output
     assert "username=tester" in output
     assert "Available qualities:" in output
+    assert "Danmaku: enabled" in output
     assert "Done." in output
 

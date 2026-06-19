@@ -61,6 +61,8 @@ python -m venv .venv
 .\.venv\Scripts\bili-download.exe download BV1xx411c7mD
 ```
 
+也可以直接双击项目根目录下的 `download.bat`，按提示输入 BV 号或视频链接，文件会保存到 `downloads` 文件夹。
+
 指定输出文件：
 
 ```powershell

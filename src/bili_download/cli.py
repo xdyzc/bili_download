@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import sys
 
 from .client import BiliApiError, BiliClient, BiliNetworkError
 from .cookies import CookieLoadError, load_cookie_file
@@ -12,6 +13,11 @@ from .video_id import parse_bili_video_ref
 
 
 def main(argv: list[str] | None = None) -> int:
+    if argv is None:
+        argv = sys.argv[1:]
+    if not argv:
+        return _interactive()
+
     argv = _normalize_argv(argv)
     parser = argparse.ArgumentParser(prog="bili-download")
     parser.add_argument(
@@ -209,4 +215,73 @@ def _build_client(cookie_file: Path | None) -> BiliClient:
 
 def _build_downloader(cookie_file: Path | None) -> BiliDownloader:
     return BiliDownloader(_build_client(cookie_file))
+
+
+def _interactive() -> int:
+    print("")
+    print("Bili Download")
+    print("=============")
+    print("")
+
+    app_dir = _app_dir()
+    cookie_file = app_dir / "bili.json"
+    if cookie_file.exists():
+        print(f"Using cookie file: {cookie_file}")
+        print("")
+        print("Account status:")
+        account_code = main(["--cookie-file", str(cookie_file), "account"])
+        if account_code != 0:
+            print("Could not verify cookie login status.")
+        print("")
+        cookie_args = ["--cookie-file", str(cookie_file)]
+    else:
+        print("No bili.json found next to the executable. Continuing without cookies.")
+        print("")
+        cookie_args = []
+
+    video = input("Enter BV id or Bilibili video URL: ").strip()
+    if not video:
+        print("No input provided.")
+        input("Press Enter to exit:")
+        return 1
+
+    print("")
+    print("Available qualities:")
+    quality_code = main([*cookie_args, "qualities", video])
+    if quality_code != 0:
+        print("Could not list qualities. You can still try the default download.")
+    print("")
+
+    quality = input("Enter quality code, or press Enter for default: ").strip()
+    download_dir = app_dir / "downloads"
+    download_args = [
+        *cookie_args,
+        "download",
+        video,
+        "--output-dir",
+        str(download_dir),
+        "--overwrite",
+        "--progress",
+    ]
+    if quality:
+        download_args.extend(["--quality", quality])
+
+    print("", flush=True)
+    print("Downloading to:", flush=True)
+    print(f"  {download_dir}", flush=True)
+    print("", flush=True)
+    exit_code = main(download_args)
+    print("")
+    if exit_code == 0:
+        print("Done.")
+    else:
+        print(f"Download failed. Exit code: {exit_code}")
+    input("Press Enter to exit:")
+    return exit_code
+
+
+def _app_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path.cwd()
 

@@ -152,3 +152,84 @@ def test_cli_account_prints_login_status(monkeypatch, capsys) -> None:
         "vip=大会员",
     ]
 
+
+def test_interactive_mode_downloads_with_user_input(monkeypatch, capsys, tmp_path) -> None:
+    monkeypatch.setattr(cli, "_app_dir", lambda: tmp_path)
+    inputs = iter(["BV1xx411c7mD", "80", ""])
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(inputs))
+
+    class FakeClient:
+        def get_login_status(self):
+            return LoginStatus(is_login=True, username="tester")
+
+    class FakeDownloader:
+        def get_available_qualities(self, url_or_bv, *, page):
+            return (
+                VideoInfo(
+                    bvid="BV1xx411c7mD",
+                    aid=170001,
+                    title="Test Video",
+                    owner_name="tester",
+                    pages=(VideoPage(index=1, cid=123, title="Intro"),),
+                ),
+                VideoPage(index=1, cid=123, title="Intro"),
+                PlayUrl(
+                    quality=80,
+                    format="mp4",
+                    accept_quality=(80,),
+                    accept_description=("1080P",),
+                    segments=(),
+                ),
+            )
+
+        def download(
+            self,
+            url_or_bv,
+            *,
+            output_dir,
+            output_file,
+            page,
+            quality,
+            progress,
+            overwrite,
+        ):
+            assert url_or_bv == "BV1xx411c7mD"
+            assert output_dir == tmp_path / "downloads"
+            assert quality == 80
+            assert progress is True
+            assert overwrite is True
+            return DownloadResult(
+                path=tmp_path / "downloads" / "Test Video.mp4",
+                bytes_written=11,
+                segments=2,
+                video=VideoInfo(
+                    bvid="BV1xx411c7mD",
+                    aid=170001,
+                    title="Test Video",
+                    owner_name="tester",
+                    pages=(VideoPage(index=1, cid=123, title="Intro"),),
+                ),
+                page=VideoPage(index=1, cid=123, title="Intro"),
+                play_url=PlayUrl(
+                    quality=80,
+                    format="mp4",
+                    accept_quality=(80,),
+                    accept_description=("1080P",),
+                    segments=(),
+                ),
+                mode="dash",
+            )
+
+    monkeypatch.setattr(cli, "_build_client", lambda cookie_file: FakeClient())
+    monkeypatch.setattr(cli, "_build_downloader", lambda cookie_file: FakeDownloader())
+    (tmp_path / "bili.json").write_text("[]", encoding="utf-8")
+
+    exit_code = main([])
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "Account status:" in output
+    assert "username=tester" in output
+    assert "Available qualities:" in output
+    assert "Done." in output
+

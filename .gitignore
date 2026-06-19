@@ -10,6 +10,8 @@ __pycache__/
 dist/
 build/
 out/
+release/
+*.spec
 
 # Local env and secrets
 .env

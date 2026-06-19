@@ -8,7 +8,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, build_opener
 
-from .models import PlayUrl, StreamSegment, VideoInfo, VideoPage
+from .models import DashMedia, LoginStatus, PlayUrl, StreamSegment, VideoInfo, VideoPage
 from .video_id import BiliVideoRef
 
 
@@ -40,6 +40,19 @@ class BiliClient:
         self._opener = opener or build_opener()
         self._cookie_header = cookie_header
 
+    def get_login_status(self) -> LoginStatus:
+        payload = self._get_json("/x/web-interface/nav", {})
+        data = _expect_data(payload)
+        vip = data.get("vipInfo") or {}
+        vip_label = vip.get("label") or {}
+        label_text = vip_label.get("text") if isinstance(vip_label, dict) else ""
+        return LoginStatus(
+            is_login=bool(data.get("isLogin")),
+            username=str(data.get("uname") or ""),
+            user_id=_optional_int(data.get("mid")),
+            vip_label=str(label_text or ""),
+        )
+
     def get_video_info(self, video_ref: BiliVideoRef) -> VideoInfo:
         params = (
             {"bvid": video_ref.value}
@@ -69,14 +82,21 @@ class BiliClient:
             pages=pages,
         )
 
-    def get_play_url(self, *, bvid: str, cid: int, quality: int | None = None) -> PlayUrl:
+    def get_play_url(
+        self,
+        *,
+        bvid: str,
+        cid: int,
+        quality: int | None = None,
+        dash: bool = True,
+    ) -> PlayUrl:
         payload = self._get_json(
             "/x/player/playurl",
             {
                 "bvid": bvid,
                 "cid": str(cid),
-                "qn": str(quality or 16),
-                "fnval": "0",
+                "qn": str(quality or 127),
+                "fnval": "4048" if dash else "0",
                 "fnver": "0",
                 "fourk": "0",
                 "otype": "json",
@@ -94,6 +114,7 @@ class BiliClient:
             for segment in durl
             if segment.get("url")
         )
+        dash_data = data.get("dash") or {}
         return PlayUrl(
             quality=_optional_int(data.get("quality")),
             format=str(data.get("format") or ""),
@@ -102,6 +123,16 @@ class BiliClient:
                 str(item) for item in data.get("accept_description") or ()
             ),
             segments=segments,
+            dash_videos=tuple(
+                _parse_dash_media(item)
+                for item in dash_data.get("video") or ()
+                if item.get("base_url") or item.get("baseUrl")
+            ),
+            dash_audios=tuple(
+                _parse_dash_media(item)
+                for item in dash_data.get("audio") or ()
+                if item.get("base_url") or item.get("baseUrl")
+            ),
         )
 
     def get_default_play_url(self, *, bvid: str, cid: int) -> PlayUrl:
@@ -166,6 +197,29 @@ def _optional_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _parse_dash_media(item: dict[str, Any]) -> DashMedia:
+    return DashMedia(
+        id=int(item["id"]),
+        url=str(item.get("base_url") or item.get("baseUrl")),
+        backup_urls=tuple(
+            str(url)
+            for url in (
+                item.get("backup_url")
+                or item.get("backupUrl")
+                or item.get("backup_urls")
+                or ()
+            )
+        ),
+        bandwidth=_optional_int(item.get("bandwidth")),
+        codecs=str(item.get("codecs") or ""),
+        mime_type=str(item.get("mime_type") or item.get("mimeType") or ""),
+        width=_optional_int(item.get("width")),
+        height=_optional_int(item.get("height")),
+        frame_rate=str(item.get("frame_rate") or item.get("frameRate") or ""),
+        size=_optional_int(item.get("size")),
+    )
 
 
 def _json_headers(referer: str, *, cookie_header: str = "") -> dict[str, str]:

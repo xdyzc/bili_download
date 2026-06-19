@@ -5,10 +5,9 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from .client import BiliApiError, BiliNetworkError
+from .client import BiliApiError, BiliClient, BiliNetworkError
 from .cookies import CookieLoadError, load_cookie_file
 from .downloader import BiliDownloader, UnsupportedStreamError
-from .client import BiliClient
 from .video_id import parse_bili_video_ref
 
 
@@ -54,6 +53,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="replace the output file if it already exists",
     )
+    download_parser.add_argument(
+        "--progress",
+        action="store_true",
+        help="show download progress in the terminal",
+    )
 
     qualities_parser = subparsers.add_parser(
         "qualities",
@@ -61,6 +65,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     qualities_parser.add_argument("url_or_bv", help="Bilibili video URL, BV id, or av id")
     qualities_parser.add_argument("-p", "--page", type=int, help="video page number")
+
+    subparsers.add_parser("account", help="show current Bilibili login status")
 
     args = parser.parse_args(argv)
 
@@ -70,6 +76,9 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "qualities":
             return _qualities(args)
+
+        if args.command == "account":
+            return _account(args)
 
         if args.command == "parse":
             return _parse(args.url_or_id)
@@ -98,7 +107,7 @@ def _normalize_argv(argv: list[str] | None) -> list[str] | None:
         return argv
     if argv[0].startswith("-"):
         return argv
-    if argv[0] in {"parse", "download", "qualities"}:
+    if argv[0] in {"parse", "download", "qualities", "account"}:
         return argv
     return ["parse", *argv]
 
@@ -124,6 +133,7 @@ def _download(args: argparse.Namespace) -> int:
         output_file=args.output,
         page=args.page,
         quality=args.quality,
+        progress=args.progress,
         overwrite=args.overwrite,
     )
     print(f"saved={result.path}")
@@ -133,6 +143,7 @@ def _download(args: argparse.Namespace) -> int:
     print(f"segments={result.segments}")
     if result.play_url.quality is not None:
         print(f"quality={result.play_url.quality}")
+    print(f"mode={result.mode}")
     return 0
 
 
@@ -147,20 +158,55 @@ def _qualities(args: argparse.Namespace) -> int:
     if play_url.quality is not None:
         print(f"default={play_url.quality}")
 
+    dash_by_quality = {}
+    for stream in play_url.dash_videos:
+        current = dash_by_quality.get(stream.id)
+        if current is None or (stream.bandwidth or 0) > (current.bandwidth or 0):
+            dash_by_quality[stream.id] = stream
+
     for code, description in zip(
         play_url.accept_quality,
         play_url.accept_description,
         strict=False,
     ):
         marker = " *" if code == play_url.quality else ""
-        print(f"{code}\t{description}{marker}")
+        dash = dash_by_quality.get(code)
+        detail = ""
+        if dash is not None:
+            detail_parts = []
+            if dash.height:
+                detail_parts.append(f"{dash.height}p")
+            if dash.frame_rate:
+                detail_parts.append(f"{dash.frame_rate}fps")
+            if dash.codecs:
+                detail_parts.append(dash.codecs)
+            if detail_parts:
+                detail = "\t" + " ".join(detail_parts)
+        print(f"{code}\t{description}{detail}{marker}")
 
     return 0
 
 
-def _build_downloader(cookie_file: Path | None) -> BiliDownloader:
+def _account(args: argparse.Namespace) -> int:
+    client = _build_client(args.cookie_file)
+    status = client.get_login_status()
+    print(f"logged_in={str(status.is_login).lower()}")
+    if status.username:
+        print(f"username={status.username}")
+    if status.user_id is not None:
+        print(f"mid={status.user_id}")
+    if status.vip_label:
+        print(f"vip={status.vip_label}")
+    return 0
+
+
+def _build_client(cookie_file: Path | None) -> BiliClient:
     cookie_header = ""
     if cookie_file is not None:
         cookie_header = load_cookie_file(cookie_file).header
-    return BiliDownloader(BiliClient(cookie_header=cookie_header))
+    return BiliClient(cookie_header=cookie_header)
+
+
+def _build_downloader(cookie_file: Path | None) -> BiliDownloader:
+    return BiliDownloader(_build_client(cookie_file))
 

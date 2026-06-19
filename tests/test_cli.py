@@ -4,7 +4,14 @@ from pathlib import Path
 
 import bili_download.cli as cli
 from bili_download.cli import main
-from bili_download.models import DownloadResult, PlayUrl, VideoInfo, VideoPage
+from bili_download.models import (
+    DashMedia,
+    DownloadResult,
+    LoginStatus,
+    PlayUrl,
+    VideoInfo,
+    VideoPage,
+)
 
 
 def test_cli_prints_bvid(capsys) -> None:
@@ -27,6 +34,7 @@ def test_cli_download_prints_result(monkeypatch, capsys, tmp_path) -> None:
             output_file,
             page,
             quality,
+            progress,
             overwrite,
         ):
             assert url_or_bv == "BV1xx411c7mD"
@@ -34,6 +42,7 @@ def test_cli_download_prints_result(monkeypatch, capsys, tmp_path) -> None:
             assert output_file is None
             assert page is None
             assert quality is None
+            assert progress is False
             assert overwrite is False
             return DownloadResult(
                 path=Path("downloads/Test Video.mp4"),
@@ -68,6 +77,7 @@ def test_cli_download_prints_result(monkeypatch, capsys, tmp_path) -> None:
         "bytes=11",
         "segments=1",
         "quality=16",
+        "mode=durl",
     ]
 
 
@@ -91,6 +101,16 @@ def test_cli_qualities_prints_available_options(monkeypatch, capsys) -> None:
                     accept_quality=(80, 64, 32, 16),
                     accept_description=("1080P", "720P", "480P", "360P"),
                     segments=(),
+                    dash_videos=(
+                        DashMedia(
+                            id=80,
+                            url="https://example.test/video.m4s",
+                            height=1080,
+                            frame_rate="30.000",
+                            codecs="avc1.640033",
+                            bandwidth=1000,
+                        ),
+                    ),
                 ),
             )
 
@@ -103,9 +123,32 @@ def test_cli_qualities_prints_available_options(monkeypatch, capsys) -> None:
         "title=Test Video",
         "page=1",
         "default=80",
-        "80\t1080P *",
+        "80\t1080P\t1080p 30.000fps avc1.640033 *",
         "64\t720P",
         "32\t480P",
         "16\t360P",
+    ]
+
+
+def test_cli_account_prints_login_status(monkeypatch, capsys) -> None:
+    class FakeClient:
+        def get_login_status(self):
+            return LoginStatus(
+                is_login=True,
+                username="tester",
+                user_id=123,
+                vip_label="大会员",
+            )
+
+    monkeypatch.setattr(cli, "_build_client", lambda cookie_file: FakeClient())
+
+    exit_code = main(["account"])
+
+    assert exit_code == 0
+    assert capsys.readouterr().out.splitlines() == [
+        "logged_in=true",
+        "username=tester",
+        "mid=123",
+        "vip=大会员",
     ]
 

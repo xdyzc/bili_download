@@ -4,8 +4,9 @@ from io import BytesIO
 
 import pytest
 
+import bili_download.downloader as downloader_module
 from bili_download.downloader import BiliDownloader, UnsupportedStreamError
-from bili_download.models import PlayUrl, StreamSegment, VideoInfo, VideoPage
+from bili_download.models import DashMedia, PlayUrl, StreamSegment, VideoInfo, VideoPage
 from bili_download.video_id import BiliVideoRef
 
 
@@ -52,6 +53,10 @@ class FakeClient:
         url = tuple(urls)[0]
         if url.endswith("part-1.mp4"):
             return FakeResponse(b"hello ")
+        if url.endswith("video.m4s"):
+            return FakeResponse(b"video")
+        if url.endswith("audio.m4s"):
+            return FakeResponse(b"audio")
         return FakeResponse(b"world")
 
 
@@ -73,6 +78,49 @@ def test_downloader_passes_requested_quality(tmp_path) -> None:
     downloader.download("BV1xx411c7mD", output_dir=tmp_path, quality=80)
 
     assert client.last_quality == 80
+
+
+def test_downloader_merges_dash_streams(monkeypatch, tmp_path) -> None:
+    client = FakeClient(
+        PlayUrl(
+            quality=116,
+            format="dash",
+            accept_quality=(116,),
+            accept_description=("1080P60",),
+            segments=(),
+            dash_videos=(
+                DashMedia(
+                    id=116,
+                    url="https://example.test/video.m4s",
+                    bandwidth=1000,
+                    height=1080,
+                    frame_rate="60.000",
+                    codecs="avc1.640033",
+                ),
+            ),
+            dash_audios=(
+                DashMedia(
+                    id=30280,
+                    url="https://example.test/audio.m4s",
+                    bandwidth=320000,
+                ),
+            ),
+        )
+    )
+
+    def fake_merge(video_part, audio_part, output_path, *, overwrite):
+        assert video_part.read_bytes() == b"video"
+        assert audio_part.read_bytes() == b"audio"
+        output_path.write_bytes(b"merged")
+
+    monkeypatch.setattr(downloader_module, "_merge_with_ffmpeg", fake_merge)
+    downloader = BiliDownloader(client=client)
+
+    result = downloader.download("BV1xx411c7mD", output_dir=tmp_path, quality=116)
+
+    assert result.path.read_bytes() == b"merged"
+    assert result.mode == "dash"
+    assert result.bytes_written == 10
 
 
 def test_downloader_rejects_dash_only_response(tmp_path) -> None:

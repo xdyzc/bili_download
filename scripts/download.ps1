@@ -51,6 +51,12 @@ if (Test-Path $CookieFile) {
     Write-Host "Using cookie file:"
     Write-Host "  $CookieFile"
     Write-Host ""
+    Write-Host "Account status:"
+    & $Downloader @CookieArgs account
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "Could not verify cookie login status."
+    }
+    Write-Host ""
 }
 
 Write-Host "Available qualities:"
@@ -70,7 +76,7 @@ Write-Host "Downloading to:"
 Write-Host "  $DownloadDir"
 Write-Host ""
 
-$CommandArgs = $CookieArgs + @("download", $InputText, "--output-dir", $DownloadDir, "--overwrite")
+$CommandArgs = $CookieArgs + @("download", $InputText, "--output-dir", $DownloadDir, "--overwrite", "--progress")
 if (-not [string]::IsNullOrWhiteSpace($Quality)) {
     $CommandArgs += @("--quality", $Quality)
 }

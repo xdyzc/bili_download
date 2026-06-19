@@ -3,7 +3,9 @@ name = "bili-download"
 version = "0.1.0"
 description = "A learning-first Bilibili downloader project."
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "imageio-ffmpeg>=0.6",
+]
 
 [project.scripts]
 bili-download = "bili_download.cli:main"

@@ -35,12 +35,32 @@ class StreamSegment:
 
 
 @dataclass(frozen=True)
+class DashMedia:
+    id: int
+    url: str
+    backup_urls: tuple[str, ...] = ()
+    bandwidth: int | None = None
+    codecs: str = ""
+    mime_type: str = ""
+    width: int | None = None
+    height: int | None = None
+    frame_rate: str = ""
+    size: int | None = None
+
+    @property
+    def urls(self) -> tuple[str, ...]:
+        return (self.url, *self.backup_urls)
+
+
+@dataclass(frozen=True)
 class PlayUrl:
     quality: int | None
     format: str
     accept_quality: tuple[int, ...]
     accept_description: tuple[str, ...]
     segments: tuple[StreamSegment, ...]
+    dash_videos: tuple[DashMedia, ...] = ()
+    dash_audios: tuple[DashMedia, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -51,4 +71,12 @@ class DownloadResult:
     video: VideoInfo
     page: VideoPage
     play_url: PlayUrl
+    mode: str = "durl"
 
+
+@dataclass(frozen=True)
+class LoginStatus:
+    is_login: bool
+    username: str = ""
+    user_id: int | None = None
+    vip_label: str = ""

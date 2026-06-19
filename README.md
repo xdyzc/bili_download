@@ -61,7 +61,21 @@ python -m venv .venv
 .\.venv\Scripts\bili-download.exe download BV1xx411c7mD
 ```
 
+列出当前可用清晰度：
+
+```powershell
+.\.venv\Scripts\bili-download.exe --cookie-file bili.json qualities BV1xx411c7mD
+```
+
+指定清晰度下载：
+
+```powershell
+.\.venv\Scripts\bili-download.exe --cookie-file bili.json download BV1xx411c7mD --quality 80
+```
+
 也可以直接双击项目根目录下的 `download.bat`，按提示输入 BV 号或视频链接，文件会保存到 `downloads` 文件夹。
+如果项目根目录存在 `bili.json`，启动脚本会自动带上这个 Cookie 文件。
+做真实下载测试时，建议优先选择一两分钟以内的视频，避免反复下载大文件。
 
 指定输出文件：
 
@@ -72,7 +86,8 @@ python -m venv .venv
 第一版下载功能的边界：
 
 - 不使用 Cookie，只下载游客/当前网络可访问的公开视频默认流。
-- 不选择清晰度，先使用 Bilibili 返回的默认 `durl` 流。
+- 支持读取浏览器导出的 `bili.json`，用于访问你账号本来能看的清晰度。
+- 支持通过 `--quality` 指定 Bilibili qn 清晰度代码。
 - 暂不支持 DASH-only 音视频分离流；这会在后续版本中加入 FFmpeg 合并。
 - 不绕过登录、会员、区域、DRM 或其他访问限制。
 

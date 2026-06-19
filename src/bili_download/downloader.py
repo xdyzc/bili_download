@@ -28,12 +28,17 @@ class BiliDownloader:
         output_dir: Path = Path("downloads"),
         output_file: Path | None = None,
         page: int | None = None,
+        quality: int | None = None,
         overwrite: bool = False,
     ) -> DownloadResult:
         video_ref = parse_bili_video_ref(url_or_bv)
         video = self.client.get_video_info(video_ref)
         target_page = _select_page(video, page or video_ref.page)
-        play_url = self.client.get_default_play_url(bvid=video.bvid, cid=target_page.cid)
+        play_url = self.client.get_play_url(
+            bvid=video.bvid,
+            cid=target_page.cid,
+            quality=quality,
+        )
         if not play_url.segments:
             raise UnsupportedStreamError(
                 "Bilibili did not return a durl stream. "
@@ -74,6 +79,18 @@ class BiliDownloader:
             play_url=play_url,
         )
 
+    def get_available_qualities(
+        self,
+        url_or_bv: str,
+        *,
+        page: int | None = None,
+    ) -> tuple[VideoInfo, VideoPage, PlayUrl]:
+        video_ref = parse_bili_video_ref(url_or_bv)
+        video = self.client.get_video_info(video_ref)
+        target_page = _select_page(video, page or video_ref.page)
+        play_url = self.client.get_play_url(bvid=video.bvid, cid=target_page.cid)
+        return video, target_page, play_url
+
 
 def _select_page(video: VideoInfo, page: int | None) -> VideoPage:
     if page is None:
@@ -112,4 +129,3 @@ def _extension_for(play_url: PlayUrl) -> str:
     if "flv" in media_format:
         return ".flv"
     return ".flv"
-

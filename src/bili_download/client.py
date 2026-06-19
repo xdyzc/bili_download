@@ -29,9 +29,16 @@ class BiliNetworkError(RuntimeError):
 
 
 class BiliClient:
-    def __init__(self, *, timeout: int = 20, opener: Any | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        timeout: int = 20,
+        opener: Any | None = None,
+        cookie_header: str = "",
+    ) -> None:
         self.timeout = timeout
         self._opener = opener or build_opener()
+        self._cookie_header = cookie_header
 
     def get_video_info(self, video_ref: BiliVideoRef) -> VideoInfo:
         params = (
@@ -62,13 +69,13 @@ class BiliClient:
             pages=pages,
         )
 
-    def get_default_play_url(self, *, bvid: str, cid: int) -> PlayUrl:
+    def get_play_url(self, *, bvid: str, cid: int, quality: int | None = None) -> PlayUrl:
         payload = self._get_json(
             "/x/player/playurl",
             {
                 "bvid": bvid,
                 "cid": str(cid),
-                "qn": "16",
+                "qn": str(quality or 16),
                 "fnval": "0",
                 "fnver": "0",
                 "fourk": "0",
@@ -97,10 +104,16 @@ class BiliClient:
             segments=segments,
         )
 
+    def get_default_play_url(self, *, bvid: str, cid: int) -> PlayUrl:
+        return self.get_play_url(bvid=bvid, cid=cid)
+
     def open_stream(self, urls: Iterable[str], *, referer: str):
         last_error: Exception | None = None
         for url in urls:
-            request = Request(url, headers=_download_headers(referer))
+            request = Request(
+                url,
+                headers=_download_headers(referer, cookie_header=self._cookie_header),
+            )
             try:
                 return self._opener.open(request, timeout=self.timeout)
             except (HTTPError, URLError) as exc:
@@ -116,7 +129,10 @@ class BiliClient:
         referer: str = "https://www.bilibili.com/",
     ) -> dict[str, Any]:
         url = f"{API_BASE}{path}?{urlencode(params)}"
-        request = Request(url, headers=_json_headers(referer))
+        request = Request(
+            url,
+            headers=_json_headers(referer, cookie_header=self._cookie_header),
+        )
         try:
             with self._opener.open(request, timeout=self.timeout) as response:
                 raw = response.read()
@@ -152,19 +168,24 @@ def _optional_int(value: Any) -> int | None:
         return None
 
 
-def _json_headers(referer: str) -> dict[str, str]:
-    return {
+def _json_headers(referer: str, *, cookie_header: str = "") -> dict[str, str]:
+    headers = {
         "Accept": "application/json, text/plain, */*",
         "Referer": referer,
         "User-Agent": DEFAULT_USER_AGENT,
     }
+    if cookie_header:
+        headers["Cookie"] = cookie_header
+    return headers
 
 
-def _download_headers(referer: str) -> dict[str, str]:
-    return {
+def _download_headers(referer: str, *, cookie_header: str = "") -> dict[str, str]:
+    headers = {
         "Accept": "*/*",
         "Origin": "https://www.bilibili.com",
         "Referer": referer,
         "User-Agent": DEFAULT_USER_AGENT,
     }
-
+    if cookie_header:
+        headers["Cookie"] = cookie_header
+    return headers

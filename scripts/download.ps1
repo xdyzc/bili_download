@@ -1,5 +1,6 @@
 param(
     [string]$Video = "",
+    [string]$Quality = "",
     [switch]$NoPause
 )
 
@@ -7,6 +8,7 @@ $ErrorActionPreference = "Stop"
 
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $Downloader = Join-Path $ProjectRoot ".venv\Scripts\bili-download.exe"
+$CookieFile = Join-Path $ProjectRoot "bili.json"
 
 Write-Host ""
 Write-Host "Bili Download"
@@ -43,12 +45,37 @@ if ([string]::IsNullOrWhiteSpace($InputText)) {
 $DownloadDir = Join-Path $ProjectRoot "downloads"
 New-Item -ItemType Directory -Force -Path $DownloadDir | Out-Null
 
+$CookieArgs = @()
+if (Test-Path $CookieFile) {
+    $CookieArgs = @("--cookie-file", $CookieFile)
+    Write-Host "Using cookie file:"
+    Write-Host "  $CookieFile"
+    Write-Host ""
+}
+
+Write-Host "Available qualities:"
+& $Downloader @CookieArgs qualities $InputText
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "Could not list qualities. You can still try the default download."
+}
+Write-Host ""
+
+if ([string]::IsNullOrWhiteSpace($Quality) -and -not $NoPause) {
+    $Quality = Read-Host "Enter quality code, or press Enter for default"
+}
+$Quality = $Quality.Trim()
+
 Write-Host ""
 Write-Host "Downloading to:"
 Write-Host "  $DownloadDir"
 Write-Host ""
 
-& $Downloader download $InputText --output-dir $DownloadDir --overwrite
+$CommandArgs = $CookieArgs + @("download", $InputText, "--output-dir", $DownloadDir, "--overwrite")
+if (-not [string]::IsNullOrWhiteSpace($Quality)) {
+    $CommandArgs += @("--quality", $Quality)
+}
+
+& $Downloader @CommandArgs
 $ExitCode = $LASTEXITCODE
 
 Write-Host ""

@@ -16,6 +16,7 @@ out/
 .env.*
 *.cookie
 cookies.txt
+bili.json
 
 # Downloaded media and temp files
 downloads/

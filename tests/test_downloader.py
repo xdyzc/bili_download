@@ -26,6 +26,7 @@ class FakeClient:
             owner_name="tester",
             pages=(VideoPage(index=1, cid=123, title="Intro"),),
         )
+        self.last_quality: int | None = None
         self.play_url = play_url or PlayUrl(
             quality=16,
             format="mp4",
@@ -41,9 +42,10 @@ class FakeClient:
         assert video_ref.bvid == "BV1xx411c7mD"
         return self.video
 
-    def get_default_play_url(self, *, bvid: str, cid: int) -> PlayUrl:
+    def get_play_url(self, *, bvid: str, cid: int, quality: int | None = None) -> PlayUrl:
         assert bvid == "BV1xx411c7mD"
         assert cid == 123
+        self.last_quality = quality
         return self.play_url
 
     def open_stream(self, urls, *, referer: str):
@@ -64,6 +66,15 @@ def test_downloader_writes_segments_to_file(tmp_path) -> None:
     assert result.segments == 2
 
 
+def test_downloader_passes_requested_quality(tmp_path) -> None:
+    client = FakeClient()
+    downloader = BiliDownloader(client=client)
+
+    downloader.download("BV1xx411c7mD", output_dir=tmp_path, quality=80)
+
+    assert client.last_quality == 80
+
+
 def test_downloader_rejects_dash_only_response(tmp_path) -> None:
     client = FakeClient(
         PlayUrl(
@@ -78,4 +89,3 @@ def test_downloader_rejects_dash_only_response(tmp_path) -> None:
 
     with pytest.raises(UnsupportedStreamError):
         downloader.download("BV1xx411c7mD", output_dir=tmp_path)
-

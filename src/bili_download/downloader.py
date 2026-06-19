@@ -312,13 +312,14 @@ def _print_progress(
     speed = written / elapsed
     if total:
         percent = min(written / total * 100, 100)
+        bar = _progress_bar(percent)
         line = (
-            f"\r{label}: {percent:6.2f}% "
+            f"\r{label}: [{bar}] {percent:6.2f}% "
             f"{_format_bytes(written)}/{_format_bytes(total)} "
-            f"{_format_bytes(speed)}/s"
+            f"{_format_speed(speed)}"
         )
     else:
-        line = f"\r{label}: {_format_bytes(written)} {_format_bytes(speed)}/s"
+        line = f"\r{label}: {_format_bytes(written)} {_format_speed(speed)}"
     if done:
         line += "\n"
     print(line, end="", file=sys.stderr, flush=True)
@@ -332,6 +333,15 @@ def _format_bytes(value: float) -> str:
             return f"{size:.1f}{unit}"
         size /= 1024
     return f"{size:.1f}GB"
+
+
+def _format_speed(bytes_per_second: float) -> str:
+    return f"{_format_bytes(bytes_per_second)}/s"
+
+
+def _progress_bar(percent: float, *, width: int = 28) -> str:
+    filled = int(width * max(0.0, min(percent, 100.0)) / 100)
+    return "#" * filled + "-" * (width - filled)
 
 
 def _frame_rate_number(value: str) -> int:

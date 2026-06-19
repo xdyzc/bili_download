@@ -123,6 +123,25 @@ def test_downloader_merges_dash_streams(monkeypatch, tmp_path) -> None:
     assert result.bytes_written == 10
 
 
+def test_progress_output_has_bar_and_single_speed_suffix(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(downloader_module.time, "monotonic", lambda: 10.0)
+
+    downloader_module._print_progress(
+        "video qn=126",
+        50,
+        100,
+        9.0,
+        done=True,
+    )
+
+    output = capsys.readouterr().err
+    assert "[##############--------------]" in output
+    assert "50.00%" in output
+    assert "50.0B/100.0B" in output
+    assert "50.0B/s" in output
+    assert "/s/s" not in output
+
+
 def test_downloader_rejects_dash_only_response(tmp_path) -> None:
     client = FakeClient(
         PlayUrl(

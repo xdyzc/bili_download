@@ -55,6 +55,25 @@ python -m venv .venv
 .\.venv\Scripts\bili-download.exe "https://www.bilibili.com/video/BV1xx411c7mD/?p=3"
 ```
 
+下载一个公开视频的默认流：
+
+```powershell
+.\.venv\Scripts\bili-download.exe download BV1xx411c7mD
+```
+
+指定输出文件：
+
+```powershell
+.\.venv\Scripts\bili-download.exe download BV1xx411c7mD --output downloads\demo.flv --overwrite
+```
+
+第一版下载功能的边界：
+
+- 不使用 Cookie，只下载游客/当前网络可访问的公开视频默认流。
+- 不选择清晰度，先使用 Bilibili 返回的默认 `durl` 流。
+- 暂不支持 DASH-only 音视频分离流；这会在后续版本中加入 FFmpeg 合并。
+- 不绕过登录、会员、区域、DRM 或其他访问限制。
+
 ## 参考资料
 
 调研笔记见 [docs/research-notes.md](docs/research-notes.md)。

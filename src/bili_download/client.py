@@ -1,0 +1,170 @@
+"""Small Bilibili web API client used by the local downloader."""
+
+from __future__ import annotations
+
+import json
+from typing import Any, Iterable
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, build_opener
+
+from .models import PlayUrl, StreamSegment, VideoInfo, VideoPage
+from .video_id import BiliVideoRef
+
+
+API_BASE = "https://api.bilibili.com"
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/125.0 Safari/537.36"
+)
+
+
+class BiliApiError(RuntimeError):
+    """Raised when Bilibili returns an error response."""
+
+
+class BiliNetworkError(RuntimeError):
+    """Raised when a request cannot be completed."""
+
+
+class BiliClient:
+    def __init__(self, *, timeout: int = 20, opener: Any | None = None) -> None:
+        self.timeout = timeout
+        self._opener = opener or build_opener()
+
+    def get_video_info(self, video_ref: BiliVideoRef) -> VideoInfo:
+        params = (
+            {"bvid": video_ref.value}
+            if video_ref.kind == "bvid"
+            else {"aid": video_ref.value}
+        )
+        payload = self._get_json("/x/web-interface/view", params)
+        data = _expect_data(payload)
+        pages = tuple(
+            VideoPage(
+                index=int(page["page"]),
+                cid=int(page["cid"]),
+                title=str(page.get("part") or f"P{page['page']}"),
+                duration=_optional_int(page.get("duration")),
+            )
+            for page in data.get("pages", [])
+        )
+        if not pages:
+            raise BiliApiError("video metadata did not include any pages")
+
+        owner = data.get("owner") or {}
+        return VideoInfo(
+            bvid=str(data["bvid"]),
+            aid=int(data["aid"]),
+            title=str(data.get("title") or data["bvid"]),
+            owner_name=str(owner.get("name") or ""),
+            pages=pages,
+        )
+
+    def get_default_play_url(self, *, bvid: str, cid: int) -> PlayUrl:
+        payload = self._get_json(
+            "/x/player/playurl",
+            {
+                "bvid": bvid,
+                "cid": str(cid),
+                "qn": "16",
+                "fnval": "0",
+                "fnver": "0",
+                "fourk": "0",
+                "otype": "json",
+            },
+            referer=f"https://www.bilibili.com/video/{bvid}/",
+        )
+        data = _expect_data(payload)
+        durl = data.get("durl") or []
+        segments = tuple(
+            StreamSegment(
+                url=str(segment["url"]),
+                backup_urls=tuple(str(url) for url in segment.get("backup_url") or ()),
+                size=_optional_int(segment.get("size")),
+            )
+            for segment in durl
+            if segment.get("url")
+        )
+        return PlayUrl(
+            quality=_optional_int(data.get("quality")),
+            format=str(data.get("format") or ""),
+            accept_quality=tuple(int(qn) for qn in data.get("accept_quality") or ()),
+            accept_description=tuple(
+                str(item) for item in data.get("accept_description") or ()
+            ),
+            segments=segments,
+        )
+
+    def open_stream(self, urls: Iterable[str], *, referer: str):
+        last_error: Exception | None = None
+        for url in urls:
+            request = Request(url, headers=_download_headers(referer))
+            try:
+                return self._opener.open(request, timeout=self.timeout)
+            except (HTTPError, URLError) as exc:
+                last_error = exc
+
+        raise BiliNetworkError(f"could not open media stream: {last_error}")
+
+    def _get_json(
+        self,
+        path: str,
+        params: dict[str, str],
+        *,
+        referer: str = "https://www.bilibili.com/",
+    ) -> dict[str, Any]:
+        url = f"{API_BASE}{path}?{urlencode(params)}"
+        request = Request(url, headers=_json_headers(referer))
+        try:
+            with self._opener.open(request, timeout=self.timeout) as response:
+                raw = response.read()
+        except (HTTPError, URLError) as exc:
+            raise BiliNetworkError(f"request failed: {url}") from exc
+
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise BiliApiError("Bilibili returned invalid JSON") from exc
+
+        return payload
+
+
+def _expect_data(payload: dict[str, Any]) -> dict[str, Any]:
+    code = int(payload.get("code", -1))
+    if code != 0:
+        message = payload.get("message") or payload.get("msg") or "unknown error"
+        raise BiliApiError(f"Bilibili API error {code}: {message}")
+
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        raise BiliApiError("Bilibili response did not include a data object")
+    return data
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _json_headers(referer: str) -> dict[str, str]:
+    return {
+        "Accept": "application/json, text/plain, */*",
+        "Referer": referer,
+        "User-Agent": DEFAULT_USER_AGENT,
+    }
+
+
+def _download_headers(referer: str) -> dict[str, str]:
+    return {
+        "Accept": "*/*",
+        "Origin": "https://www.bilibili.com",
+        "Referer": referer,
+        "User-Agent": DEFAULT_USER_AGENT,
+    }
+

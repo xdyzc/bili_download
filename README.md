@@ -34,7 +34,27 @@
 
 详细练习见 [docs/git-playbook.md](docs/git-playbook.md)。
 
+## 本地运行
+
+创建虚拟环境并安装当前项目：
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e . pytest
+```
+
+运行测试：
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest
+```
+
+解析一个 Bilibili 视频地址：
+
+```powershell
+.\.venv\Scripts\bili-download.exe "https://www.bilibili.com/video/BV1xx411c7mD/?p=3"
+```
+
 ## 参考资料
 
 调研笔记见 [docs/research-notes.md](docs/research-notes.md)。
-

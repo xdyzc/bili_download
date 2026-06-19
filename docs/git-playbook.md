@@ -65,6 +65,18 @@ git merge feat/parse-video-id
 - `git diff`：提交前审查自己改了什么。
 - `git merge`：把功能分支合回主线。
 
+本项目第一次功能分支实际执行过：
+
+```powershell
+git switch -c feat/parse-video-id
+git add .gitignore pyproject.toml README.md src tests
+git commit -m "feat: parse bilibili video id"
+git switch main
+git merge --no-ff feat/parse-video-id
+```
+
+其中 `--no-ff` 会保留一次“这个功能分支被合入主线”的合并提交，适合学习阶段观察分支历史。
+
 ## 3. 提交前自查
 
 每次提交前先跑三件事：

@@ -24,7 +24,11 @@ def test_cli_prints_bvid(capsys) -> None:
     ]
 
 
-def test_cli_download_prints_result(monkeypatch, capsys, tmp_path) -> None:
+def test_cli_download_prints_result_without_danmaku_by_default(
+    monkeypatch,
+    capsys,
+    tmp_path,
+) -> None:
     class FakeDownloader:
         def download(
             self,
@@ -45,6 +49,59 @@ def test_cli_download_prints_result(monkeypatch, capsys, tmp_path) -> None:
             assert quality is None
             assert progress is False
             assert overwrite is False
+            assert danmaku is False
+            return DownloadResult(
+                path=Path("downloads/Test Video.mp4"),
+                bytes_written=11,
+                segments=1,
+                video=VideoInfo(
+                    bvid="BV1xx411c7mD",
+                    aid=170001,
+                    title="Test Video",
+                    owner_name="tester",
+                    pages=(VideoPage(index=1, cid=123, title="Intro"),),
+                ),
+                page=VideoPage(index=1, cid=123, title="Intro"),
+                play_url=PlayUrl(
+                    quality=16,
+                    format="mp4",
+                    accept_quality=(16,),
+                    accept_description=("360P",),
+                    segments=(),
+                ),
+            )
+
+    monkeypatch.setattr(cli, "_build_downloader", lambda cookie_file: FakeDownloader())
+
+    exit_code = main(["download", "BV1xx411c7mD", "--output-dir", str(tmp_path)])
+
+    assert exit_code == 0
+    assert capsys.readouterr().out.splitlines() == [
+        "saved=downloads\\Test Video.mp4",
+        "danmaku_count=0",
+        "title=Test Video",
+        "page=1",
+        "bytes=11",
+        "segments=1",
+        "quality=16",
+        "mode=durl",
+    ]
+
+
+def test_cli_download_can_enable_danmaku(monkeypatch, capsys, tmp_path) -> None:
+    class FakeDownloader:
+        def download(
+            self,
+            url_or_bv,
+            *,
+            output_dir,
+            output_file,
+            page,
+            quality,
+            progress,
+            overwrite,
+            danmaku,
+        ):
             assert danmaku is True
             return DownloadResult(
                 path=Path("downloads/Test Video.mp4"),
@@ -73,74 +130,24 @@ def test_cli_download_prints_result(monkeypatch, capsys, tmp_path) -> None:
 
     monkeypatch.setattr(cli, "_build_downloader", lambda cookie_file: FakeDownloader())
 
-    exit_code = main(["download", "BV1xx411c7mD", "--output-dir", str(tmp_path)])
-
-    assert exit_code == 0
-    assert capsys.readouterr().out.splitlines() == [
-        "saved=downloads\\Test Video.mp4",
-        "danmaku_video=downloads\\Test Video.danmaku.mp4",
-        "danmaku_xml=downloads\\Test Video.danmaku.xml",
-        "danmaku_ass=downloads\\Test Video.danmaku.ass",
-        "danmaku_count=2",
-        "title=Test Video",
-        "page=1",
-        "bytes=11",
-        "segments=1",
-        "quality=16",
-        "mode=durl",
-    ]
-
-
-def test_cli_download_can_skip_danmaku(monkeypatch, capsys, tmp_path) -> None:
-    class FakeDownloader:
-        def download(
-            self,
-            url_or_bv,
-            *,
-            output_dir,
-            output_file,
-            page,
-            quality,
-            progress,
-            overwrite,
-            danmaku,
-        ):
-            assert danmaku is False
-            return DownloadResult(
-                path=Path("downloads/Test Video.mp4"),
-                bytes_written=11,
-                segments=1,
-                video=VideoInfo(
-                    bvid="BV1xx411c7mD",
-                    aid=170001,
-                    title="Test Video",
-                    owner_name="tester",
-                    pages=(VideoPage(index=1, cid=123, title="Intro"),),
-                ),
-                page=VideoPage(index=1, cid=123, title="Intro"),
-                play_url=PlayUrl(
-                    quality=16,
-                    format="mp4",
-                    accept_quality=(16,),
-                    accept_description=("360P",),
-                    segments=(),
-                ),
-            )
-
-    monkeypatch.setattr(cli, "_build_downloader", lambda cookie_file: FakeDownloader())
-
     exit_code = main(
         [
             "download",
             "BV1xx411c7mD",
             "--output-dir",
             str(tmp_path),
-            "--no-danmaku",
+            "--danmaku",
         ]
     )
 
     assert exit_code == 0
-    assert "danmaku_count=0" in capsys.readouterr().out
+    assert capsys.readouterr().out.splitlines()[:5] == [
+        "saved=downloads\\Test Video.mp4",
+        "danmaku_video=downloads\\Test Video.danmaku.mp4",
+        "danmaku_xml=downloads\\Test Video.danmaku.xml",
+        "danmaku_ass=downloads\\Test Video.danmaku.ass",
+        "danmaku_count=2",
+    ]
 
 
 def test_cli_qualities_prints_available_options(monkeypatch, capsys) -> None:
@@ -217,7 +224,7 @@ def test_cli_account_prints_login_status(monkeypatch, capsys) -> None:
 
 def test_interactive_mode_downloads_with_user_input(monkeypatch, capsys, tmp_path) -> None:
     monkeypatch.setattr(cli, "_app_dir", lambda: tmp_path)
-    inputs = iter(["BV1xx411c7mD", "80", ""])
+    inputs = iter(["BV1xx411c7mD", "80", "", ""])
     monkeypatch.setattr("builtins.input", lambda prompt="": next(inputs))
 
     class FakeClient:
@@ -261,7 +268,7 @@ def test_interactive_mode_downloads_with_user_input(monkeypatch, capsys, tmp_pat
             assert quality == 80
             assert progress is True
             assert overwrite is True
-            assert danmaku is True
+            assert danmaku is False
             return DownloadResult(
                 path=tmp_path / "downloads" / "Test Video.mp4",
                 bytes_written=11,
@@ -295,6 +302,74 @@ def test_interactive_mode_downloads_with_user_input(monkeypatch, capsys, tmp_pat
     assert "Account status:" in output
     assert "username=tester" in output
     assert "Available qualities:" in output
-    assert "Danmaku: enabled" in output
+    assert "Danmaku: disabled" in output
     assert "Done." in output
+
+
+def test_interactive_mode_can_enable_danmaku(monkeypatch, capsys, tmp_path) -> None:
+    monkeypatch.setattr(cli, "_app_dir", lambda: tmp_path)
+    inputs = iter(["BV1xx411c7mD", "", "y", ""])
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(inputs))
+
+    class FakeDownloader:
+        def get_available_qualities(self, url_or_bv, *, page):
+            return (
+                VideoInfo(
+                    bvid="BV1xx411c7mD",
+                    aid=170001,
+                    title="Test Video",
+                    owner_name="tester",
+                    pages=(VideoPage(index=1, cid=123, title="Intro"),),
+                ),
+                VideoPage(index=1, cid=123, title="Intro"),
+                PlayUrl(
+                    quality=80,
+                    format="mp4",
+                    accept_quality=(80,),
+                    accept_description=("1080P",),
+                    segments=(),
+                ),
+            )
+
+        def download(
+            self,
+            url_or_bv,
+            *,
+            output_dir,
+            output_file,
+            page,
+            quality,
+            progress,
+            overwrite,
+            danmaku,
+        ):
+            assert danmaku is True
+            return DownloadResult(
+                path=tmp_path / "downloads" / "Test Video.mp4",
+                bytes_written=11,
+                segments=2,
+                video=VideoInfo(
+                    bvid="BV1xx411c7mD",
+                    aid=170001,
+                    title="Test Video",
+                    owner_name="tester",
+                    pages=(VideoPage(index=1, cid=123, title="Intro"),),
+                ),
+                page=VideoPage(index=1, cid=123, title="Intro"),
+                play_url=PlayUrl(
+                    quality=80,
+                    format="mp4",
+                    accept_quality=(80,),
+                    accept_description=("1080P",),
+                    segments=(),
+                ),
+                mode="dash",
+            )
+
+    monkeypatch.setattr(cli, "_build_downloader", lambda cookie_file: FakeDownloader())
+
+    exit_code = main([])
+
+    assert exit_code == 0
+    assert "Danmaku: enabled" in capsys.readouterr().out
 

@@ -79,11 +79,11 @@ python -m venv .venv
 .\.venv\Scripts\bili-download.exe --cookie-file bili.json download BV1KGj36QEG3 --quality 116 --progress
 ```
 
-默认下载会读取弹幕，保存 `.danmaku.xml` 和 `.danmaku.ass`，并额外生成一个烧录弹幕的
-`.danmaku.mp4`；原始无弹幕 MP4 会保留。只想下载原视频时可以加：
+默认下载只保存原始 MP4。需要合成弹幕版时，显式加 `--danmaku`，程序会保存
+`.danmaku.xml` 和 `.danmaku.ass`，并额外生成一个烧录弹幕的 `.danmaku.mp4`：
 
 ```powershell
-.\.venv\Scripts\bili-download.exe --cookie-file bili.json download BV1KGj36QEG3 --quality 16 --progress --no-danmaku
+.\.venv\Scripts\bili-download.exe --cookie-file bili.json download BV1KGj36QEG3 --quality 16 --progress --danmaku
 ```
 
 也可以直接双击项目根目录下的 `download.bat`，按提示输入 BV 号或视频链接，文件会保存到 `downloads` 文件夹。

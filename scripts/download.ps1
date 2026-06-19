@@ -1,6 +1,7 @@
 param(
     [string]$Video = "",
     [string]$Quality = "",
+    [switch]$Danmaku,
     [switch]$NoPause
 )
 
@@ -71,14 +72,27 @@ if ([string]::IsNullOrWhiteSpace($Quality) -and -not $NoPause) {
 }
 $Quality = $Quality.Trim()
 
+if (-not $Danmaku -and -not $NoPause) {
+    $DanmakuAnswer = Read-Host "Burn danmaku into an extra MP4? (y/N)"
+    $Danmaku = @("y", "yes") -contains $DanmakuAnswer.Trim().ToLowerInvariant()
+}
+
 Write-Host ""
 Write-Host "Downloading to:"
 Write-Host "  $DownloadDir"
+if ($Danmaku) {
+    Write-Host "Danmaku: enabled, an extra burned-in MP4 will be generated."
+} else {
+    Write-Host "Danmaku: disabled, only the original MP4 will be generated."
+}
 Write-Host ""
 
 $CommandArgs = $CookieArgs + @("download", $InputText, "--output-dir", $DownloadDir, "--overwrite", "--progress")
 if (-not [string]::IsNullOrWhiteSpace($Quality)) {
     $CommandArgs += @("--quality", $Quality)
+}
+if ($Danmaku) {
+    $CommandArgs += @("--danmaku")
 }
 
 & $Downloader @CommandArgs

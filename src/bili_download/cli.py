@@ -65,9 +65,9 @@ def main(argv: list[str] | None = None) -> int:
         help="show download progress in the terminal",
     )
     download_parser.add_argument(
-        "--no-danmaku",
+        "--danmaku",
         action="store_true",
-        help="skip danmaku XML download and burned-in danmaku MP4 output",
+        help="download danmaku and generate an extra burned-in danmaku MP4",
     )
 
     qualities_parser = subparsers.add_parser(
@@ -146,7 +146,7 @@ def _download(args: argparse.Namespace) -> int:
         quality=args.quality,
         progress=args.progress,
         overwrite=args.overwrite,
-        danmaku=not args.no_danmaku,
+        danmaku=args.danmaku,
     )
     print(f"saved={result.path}")
     if result.danmaku_video_path is not None:
@@ -266,6 +266,8 @@ def _interactive() -> int:
     print("")
 
     quality = input("Enter quality code, or press Enter for default: ").strip()
+    danmaku_answer = input("Burn danmaku into an extra MP4? (y/N): ").strip().lower()
+    with_danmaku = danmaku_answer in {"y", "yes"}
     download_dir = app_dir / "downloads"
     download_args = [
         *cookie_args,
@@ -278,11 +280,16 @@ def _interactive() -> int:
     ]
     if quality:
         download_args.extend(["--quality", quality])
+    if with_danmaku:
+        download_args.append("--danmaku")
 
     print("", flush=True)
     print("Downloading to:", flush=True)
     print(f"  {download_dir}", flush=True)
-    print("Danmaku: enabled, burned-in MP4 will be generated when danmaku exists.", flush=True)
+    if with_danmaku:
+        print("Danmaku: enabled, an extra burned-in MP4 will be generated.", flush=True)
+    else:
+        print("Danmaku: disabled, only the original MP4 will be generated.", flush=True)
     print("", flush=True)
     exit_code = main(download_args)
     print("")

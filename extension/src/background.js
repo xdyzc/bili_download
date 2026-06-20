@@ -107,20 +107,54 @@ async function startDirectDownload(payload) {
   const diagnostics = [];
 
   for (const segment of prepared.segments) {
-    const result = await downloadFileWithDiagnostics({
-      options: {
-        url: segment.url,
-        filename: segment.filename,
-        conflictAction: "uniquify",
-        saveAs: false
-      },
-      context: {
-        ...segment.context,
-        downloadMethod: "background-download"
+    const candidates = readCandidates(segment);
+    const candidateDiagnostics = [];
+    let lastError = null;
+    let downloaded = false;
+
+    for (const [candidateIndex, candidate] of candidates.entries()) {
+      try {
+        const result = await downloadFileWithDiagnostics({
+          options: {
+            url: candidate.url,
+            filename: segment.filename,
+            conflictAction: "uniquify",
+            saveAs: false
+          },
+          context: {
+            ...segment.context,
+            downloadMethod: "background-download",
+            candidateIndex: candidateIndex + 1,
+            candidateCount: candidates.length,
+            candidateKind: candidate.kind
+          }
+        });
+        ids.push(result.id);
+        diagnostics.push(result.diagnostic);
+        candidateDiagnostics.push(result.diagnostic);
+        downloaded = true;
+        break;
+      } catch (error) {
+        lastError = error;
+        const diagnostic = error.diagnostic || {
+          phase: "download-error",
+          error: error.message,
+          request: {
+            media: summarizeUrl(candidate.url),
+            filename: segment.filename
+          }
+        };
+        diagnostics.push(diagnostic);
+        candidateDiagnostics.push(diagnostic);
       }
-    });
-    ids.push(result.id);
-    diagnostics.push(result.diagnostic);
+    }
+
+    if (!downloaded) {
+      if (lastError?.diagnostic) {
+        lastError.diagnostic.allCandidateDiagnostics = candidateDiagnostics;
+      }
+      throw lastError || new Error("All media candidates failed.");
+    }
   }
 
   return {
@@ -142,7 +176,14 @@ async function prepareDirectDownload(payload) {
   }
 
   const playUrl = await fetchPlayUrl({ bvid, cid, quality });
-  const segments = Array.isArray(playUrl.durl) ? playUrl.durl.filter((item) => item?.url) : [];
+  const segments = Array.isArray(playUrl.durl)
+    ? playUrl.durl
+        .map((item) => ({
+          source: item,
+          candidates: buildSegmentCandidates(item)
+        }))
+        .filter((item) => item.candidates.length)
+    : [];
 
   if (!segments.length) {
     throw new Error("This stream is DASH-only. DASH support is the next milestone.");
@@ -152,7 +193,7 @@ async function prepareDirectDownload(payload) {
   const baseName = safeFilename(`${title}_${quality}`);
   const preparedSegments = [];
 
-  for (const [index, segment] of segments.entries()) {
+  for (const [index, segmentPlan] of segments.entries()) {
     const suffix = segments.length > 1 ? `_part${index + 1}` : "";
     const filename = `BiliDownload/${baseName}${suffix}${extension}`;
     const context = {
@@ -165,8 +206,9 @@ async function prepareDirectDownload(payload) {
       format: playUrl.format
     };
     preparedSegments.push({
-      url: segment.url,
+      url: segmentPlan.candidates[0].url,
       filename,
+      candidates: segmentPlan.candidates,
       context: {
         ...context,
         downloadMethod: "page-blob"
@@ -179,6 +221,38 @@ async function prepareDirectDownload(payload) {
     segments: preparedSegments,
     format: playUrl.format
   };
+}
+
+function buildSegmentCandidates(segment) {
+  const urls = [
+    segment?.url,
+    ...(Array.isArray(segment?.backup_url) ? segment.backup_url : []),
+    ...(Array.isArray(segment?.backupUrl) ? segment.backupUrl : [])
+  ];
+  const seen = new Set();
+  return urls
+    .filter((url) => typeof url === "string" && url)
+    .filter((url) => {
+      if (seen.has(url)) {
+        return false;
+      }
+      seen.add(url);
+      return true;
+    })
+    .map((url, index) => ({
+      url,
+      kind: index === 0 ? "primary" : "backup"
+    }));
+}
+
+function readCandidates(segment) {
+  const candidates = Array.isArray(segment?.candidates)
+    ? segment.candidates.filter((candidate) => candidate?.url)
+    : [];
+  if (candidates.length) {
+    return candidates;
+  }
+  return segment?.url ? [{ url: segment.url, kind: "primary" }] : [];
 }
 
 async function fetchPlayUrl({ bvid, cid, quality }) {

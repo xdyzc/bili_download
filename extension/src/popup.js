@@ -205,51 +205,95 @@ async function downloadSelectedQuality() {
 
 async function downloadViaPageBlob(segment) {
   const diagnostic = createPageDiagnostic(segment);
-  diagnostic.phase = "fetching-page-blob";
+  const candidates = readCandidates(segment);
+  let lastError = null;
 
-  try {
-    const [injection] = await chrome.scripting.executeScript({
-      target: {
-        tabId: state.tabId
-      },
-      world: "MAIN",
-      func: downloadMediaInPage,
-      args: [segment.url, filenameForPageDownload(segment.filename)]
-    });
-
-    const result = injection?.result;
-    diagnostic.fetch = pickFetchResult(result);
-
-    if (!result?.ok) {
-      diagnostic.phase = "page-fetch-message-error";
-      diagnostic.error = result?.error || "Page fetch failed.";
-      throw diagnosticError(diagnostic.error, diagnostic);
-    }
-
-    if (!result.responseOk) {
-      diagnostic.phase = "page-fetch-http-error";
-      diagnostic.error = `HTTP ${result.status || "unknown"}`;
-      throw diagnosticError(diagnostic.error, diagnostic);
-    }
-
-    diagnostic.phase = "complete";
-    diagnostic.saved = {
-      filename: result.filename,
-      mime: result.mime,
-      size: result.size
+  for (const [index, candidate] of candidates.entries()) {
+    diagnostic.phase = "fetching-page-blob";
+    diagnostic.context = {
+      ...segment.context,
+      candidateIndex: index + 1,
+      candidateCount: candidates.length,
+      candidateKind: candidate.kind
     };
-    await saveDiagnostic(diagnostic);
-    return diagnostic;
-  } catch (error) {
-    if (error.diagnostic) {
-      throw error;
-    }
+    diagnostic.request = {
+      media: summarizeUrl(candidate.url),
+      filename: segment.filename
+    };
 
-    diagnostic.phase = "page-blob-error";
-    diagnostic.error = error.message;
-    await saveDiagnostic(diagnostic);
-    throw diagnosticError(error.message, diagnostic);
+    try {
+      const [injection] = await chrome.scripting.executeScript({
+        target: {
+          tabId: state.tabId
+        },
+        world: "MAIN",
+        func: downloadMediaInPage,
+        args: [candidate.url, filenameForPageDownload(segment.filename)]
+      });
+
+      const result = injection?.result;
+      const attempt = {
+        at: new Date().toISOString(),
+        candidateIndex: index + 1,
+        candidateCount: candidates.length,
+        candidateKind: candidate.kind,
+        request: {
+          media: summarizeUrl(candidate.url)
+        },
+        fetch: pickFetchResult(result)
+      };
+      diagnostic.candidateAttempts.push(attempt);
+      diagnostic.fetch = attempt.fetch;
+
+      if (!result?.ok) {
+        diagnostic.phase = "page-fetch-message-error";
+        diagnostic.error = result?.error || "Page fetch failed.";
+        lastError = diagnosticError(diagnostic.error, diagnostic);
+        await saveDiagnostic(diagnostic);
+        continue;
+      }
+
+      if (!result.responseOk) {
+        diagnostic.phase = "page-fetch-http-error";
+        diagnostic.error = `HTTP ${result.status || "unknown"}`;
+        lastError = diagnosticError(diagnostic.error, diagnostic);
+        await saveDiagnostic(diagnostic);
+        continue;
+      }
+
+      diagnostic.phase = "complete";
+      diagnostic.error = null;
+      diagnostic.saved = {
+        filename: result.filename,
+        mime: result.mime,
+        size: result.size
+      };
+      await saveDiagnostic(diagnostic);
+      return diagnostic;
+    } catch (error) {
+      if (error.diagnostic) {
+        lastError = error;
+        continue;
+      }
+
+      diagnostic.phase = "page-blob-error";
+      diagnostic.error = error.message;
+      diagnostic.candidateAttempts.push({
+        at: new Date().toISOString(),
+        candidateIndex: index + 1,
+        candidateCount: candidates.length,
+        candidateKind: candidate.kind,
+        request: {
+          media: summarizeUrl(candidate.url)
+        },
+        error: error.message
+      });
+      await saveDiagnostic(diagnostic);
+      lastError = diagnosticError(error.message, diagnostic);
+    }
   }
+
+  throw lastError || diagnosticError("All page media candidates failed.", diagnostic);
 }
 
 async function copyDiagnostic() {
@@ -312,7 +356,8 @@ function createPageDiagnostic(segment) {
       filename: segment.filename
     },
     events: [],
-    dnrMatchedEvents: []
+    dnrMatchedEvents: [],
+    candidateAttempts: []
   };
 }
 
@@ -380,6 +425,16 @@ function summarizeUrl(value) {
 function filenameForPageDownload(filename) {
   const normalized = String(filename || "bili_video.mp4").replace(/\\/g, "/");
   return normalized.split("/").filter(Boolean).pop() || "bili_video.mp4";
+}
+
+function readCandidates(segment) {
+  const candidates = Array.isArray(segment?.candidates)
+    ? segment.candidates.filter((candidate) => candidate?.url)
+    : [];
+  if (candidates.length) {
+    return candidates;
+  }
+  return segment?.url ? [{ url: segment.url, kind: "primary" }] : [];
 }
 
 async function downloadMediaInPage(url, filename) {

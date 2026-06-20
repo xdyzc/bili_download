@@ -178,7 +178,13 @@ test("background loads qualities and starts direct browser downloads", async () 
             format: "mp4",
             accept_quality: [80, 64],
             accept_description: ["1080P", "720P"],
-            durl: [{ url: "https://example.hdslb.test/video.mp4" }]
+            durl: [{
+              url: "https://primary.hdslb.test/video.mp4",
+              backup_url: [
+                "https://backup.hdslb.test/video.mp4",
+                "https://primary.hdslb.test/video.mp4"
+              ]
+            }]
           }
         });
       }
@@ -208,8 +214,9 @@ test("background loads qualities and starts direct browser downloads", async () 
   assert.equal(result.method, "background-download");
   assert.equal(downloadOptions.length, 1);
   assert.equal(downloadOptions[0].filename, "BiliDownload/Smoke Video_80.mp4");
+  assert.equal(downloadOptions[0].url, "https://primary.hdslb.test/video.mp4");
   assert.equal(downloadOptions[0].headers, undefined);
-  assert.equal(result.diagnostics[0].initialItem.url.sample, "https://example.hdslb.test/video.mp4");
+  assert.equal(result.diagnostics[0].initialItem.url.sample, "https://primary.hdslb.test/video.mp4");
   assert.equal(result.diagnostics[0].initialItem.referrer, undefined);
   assert.equal(result.diagnostics[0].phase, "complete");
   assert.equal(result.diagnostics[0].latestItem.state, "complete");
@@ -236,6 +243,13 @@ test("background loads qualities and starts direct browser downloads", async () 
   assert.equal(preparedResponse.ok, true);
   assert.equal(preparedResponse.payload.count, 1);
   assert.equal(preparedResponse.payload.segments[0].context.downloadMethod, "page-blob");
+  assert.deepEqual(
+    toPlain(preparedResponse.payload.segments[0].candidates),
+    [
+      { url: "https://primary.hdslb.test/video.mp4", kind: "primary" },
+      { url: "https://backup.hdslb.test/video.mp4", kind: "backup" }
+    ]
+  );
 });
 
 
@@ -336,8 +350,18 @@ test("popup uses page context blob download before fallback", async () => {
               payload: {
                 count: 1,
                 segments: [{
-                  url: "https://example.hdslb.test/video.mp4?token=hidden",
+                  url: "https://primary.hdslb.test/video.mp4?token=hidden",
                   filename: "BiliDownload/Smoke Video_64.mp4",
+                  candidates: [
+                    {
+                      url: "https://primary.hdslb.test/video.mp4?token=hidden",
+                      kind: "primary"
+                    },
+                    {
+                      url: "https://backup.hdslb.test/video.mp4?token=hidden",
+                      kind: "backup"
+                    }
+                  ],
                   context: {
                     bvid: "BV1KGj36QEG3",
                     cid: 123,
@@ -361,6 +385,15 @@ test("popup uses page context blob download before fallback", async () => {
       scripting: {
         async executeScript(call) {
           scriptCalls.push(call);
+          if (call.args[0].includes("primary")) {
+            return [{
+              result: {
+                ok: false,
+                error: "Failed to fetch",
+                filename: call.args[1]
+              }
+            }];
+          }
           return [{
             result: {
               ok: true,
@@ -384,15 +417,26 @@ test("popup uses page context blob download before fallback", async () => {
   qualitySelect.value = "64";
   await sandbox.downloadSelectedQuality();
 
-  assert.equal(scriptCalls.length, 1);
+  assert.equal(scriptCalls.length, 2);
   assert.equal(scriptCalls[0].target.tabId, 99);
   assert.equal(scriptCalls[0].world, "MAIN");
   assert.equal(scriptCalls[0].args[1], "Smoke Video_64.mp4");
-  assert.equal(statusElement.textContent, "下载已开始: 1");
+  assert.equal(scriptCalls[0].args[0], "https://primary.hdslb.test/video.mp4?token=hidden");
+  assert.equal(scriptCalls[1].args[0], "https://backup.hdslb.test/video.mp4?token=hidden");
+  assert.match(statusElement.textContent, /1$/);
   assert.equal(
     runtimeMessages.some((message) => message.type === "BILI_DOWNLOAD_START_DIRECT"),
     false
   );
+  const savedDiagnostic = runtimeMessages
+    .filter((message) => message.type === "BILI_DOWNLOAD_SAVE_DIAGNOSTIC")
+    .at(-1).payload;
+  assert.equal(savedDiagnostic.phase, "complete");
+  assert.equal(savedDiagnostic.candidateAttempts.length, 2);
+  assert.equal(savedDiagnostic.candidateAttempts[0].candidateKind, "primary");
+  assert.equal(savedDiagnostic.candidateAttempts[0].fetch.error, "Failed to fetch");
+  assert.equal(savedDiagnostic.candidateAttempts[1].candidateKind, "backup");
+  assert.equal(savedDiagnostic.candidateAttempts[1].fetch.responseOk, true);
   assert.equal(clipboardWrites.length, 0);
   assert.equal(clickCount, 0);
 });

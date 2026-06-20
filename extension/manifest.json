@@ -24,8 +24,18 @@
   ],
   "permissions": [
     "activeTab",
+    "declarativeNetRequest",
     "downloads"
   ],
+  "declarative_net_request": {
+    "rule_resources": [
+      {
+        "id": "bili_media_headers",
+        "enabled": true,
+        "path": "rules/bili-media-headers.json"
+      }
+    ]
+  },
   "host_permissions": [
     "https://api.bilibili.com/*",
     "https://www.bilibili.com/*",

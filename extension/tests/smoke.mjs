@@ -10,8 +10,29 @@ test("manifest declares a pure browser extension MVP", async () => {
   assert.equal(manifest.manifest_version, 3);
   assert.equal(manifest.action.default_popup, "src/popup.html");
   assert.ok(manifest.permissions.includes("downloads"));
+  assert.ok(manifest.permissions.includes("declarativeNetRequest"));
   assert.ok(manifest.host_permissions.includes("https://api.bilibili.com/*"));
+  assert.equal(
+    manifest.declarative_net_request.rule_resources[0].path,
+    "rules/bili-media-headers.json"
+  );
   assert.ok(!manifest.host_permissions.some((item) => item.includes("127.0.0.1")));
+});
+
+
+test("media header rules use declarative request modification", async () => {
+  const rules = JSON.parse(await readFile("extension/rules/bili-media-headers.json", "utf8"));
+  const rule = rules[0];
+
+  assert.equal(rule.action.type, "modifyHeaders");
+  assert.equal(rule.condition.regexFilter, "^https://[^/]*\\.(bilivideo|bilivideo\\.cn|hdslb)\\.");
+  assert.deepEqual(
+    rule.action.requestHeaders.map((item) => [item.header, item.operation]),
+    [
+      ["Referer", "set"],
+      ["Origin", "set"]
+    ]
+  );
 });
 
 

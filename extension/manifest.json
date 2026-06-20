@@ -25,6 +25,8 @@
   "permissions": [
     "activeTab",
     "declarativeNetRequest",
+    "declarativeNetRequestFeedback",
+    "storage",
     "downloads"
   ],
   "declarative_net_request": {

@@ -1,15 +1,26 @@
 const API_BASE = "https://api.bilibili.com";
+const DIAGNOSTIC_STORAGE_KEY = "lastDiagnostic";
+const DNR_TEST_TYPES = ["main_frame", "other", "media", "xmlhttprequest"];
+
+let lastDiagnostic = null;
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === "BILI_DOWNLOAD_LOAD_VIDEO") {
     loadVideo(message.payload)
       .then((payload) => sendResponse({ ok: true, payload }))
-      .catch((error) => sendResponse({ ok: false, error: error.message }));
+      .catch((error) => sendResponse(errorResponse(error)));
     return true;
   }
 
   if (message?.type === "BILI_DOWNLOAD_START_DIRECT") {
     startDirectDownload(message.payload)
+      .then((payload) => sendResponse({ ok: true, payload }))
+      .catch((error) => sendResponse(errorResponse(error)));
+    return true;
+  }
+
+  if (message?.type === "BILI_DOWNLOAD_GET_DIAGNOSTIC") {
+    getLastDiagnostic()
       .then((payload) => sendResponse({ ok: true, payload }))
       .catch((error) => sendResponse({ ok: false, error: error.message }));
     return true;
@@ -17,6 +28,27 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   return false;
 });
+
+if (chrome.declarativeNetRequest?.onRuleMatchedDebug) {
+  chrome.declarativeNetRequest.onRuleMatchedDebug.addListener((info) => {
+    const url = info?.request?.url || "";
+    if (!isMediaHost(url)) {
+      return;
+    }
+
+    const diagnostic = lastDiagnostic || createBaseDiagnostic({ mediaUrl: url });
+    diagnostic.dnrMatchedEvents = [
+      ...(diagnostic.dnrMatchedEvents || []),
+      {
+        at: new Date().toISOString(),
+        ruleId: info.rule?.ruleId,
+        rulesetId: info.rule?.rulesetId,
+        request: pickRequestDetails(info.request)
+      }
+    ].slice(-10);
+    setLastDiagnostic(diagnostic);
+  });
+}
 
 async function loadVideo(page) {
   const bvid = normalizeBvid(page?.bvid);
@@ -75,22 +107,36 @@ async function startDirectDownload(payload) {
   const extension = extensionFor(playUrl.format);
   const baseName = safeFilename(`${title}_${quality}`);
   const ids = [];
+  const diagnostics = [];
 
   for (const [index, segment] of segments.entries()) {
     const suffix = segments.length > 1 ? `_part${index + 1}` : "";
     const filename = `BiliDownload/${baseName}${suffix}${extension}`;
-    const id = await downloadFile({
-      url: segment.url,
-      filename,
-      conflictAction: "uniquify",
-      saveAs: false
+    const result = await downloadFileWithDiagnostics({
+      options: {
+        url: segment.url,
+        filename,
+        conflictAction: "uniquify",
+        saveAs: false
+      },
+      context: {
+        bvid,
+        cid,
+        quality,
+        title,
+        segmentIndex: index + 1,
+        segmentCount: segments.length,
+        format: playUrl.format
+      }
     });
-    ids.push(id);
+    ids.push(result.id);
+    diagnostics.push(result.diagnostic);
   }
 
   return {
     ids,
-    count: ids.length
+    count: ids.length,
+    diagnostics
   };
 }
 
@@ -183,6 +229,43 @@ function safeFilename(value) {
     .slice(0, 120) || "bili_video";
 }
 
+async function downloadFileWithDiagnostics({ options, context }) {
+  const diagnostic = createBaseDiagnostic({
+    mediaUrl: options.url,
+    filename: options.filename,
+    context
+  });
+  diagnostic.phase = "probing-dnr";
+  diagnostic.dnr = await testDnrRules(options.url);
+  await setLastDiagnostic(diagnostic);
+
+  try {
+    diagnostic.phase = "starting-download";
+    await setLastDiagnostic(diagnostic);
+    const id = await downloadFile(options);
+    diagnostic.downloadId = id;
+    diagnostic.phase = "download-started";
+    diagnostic.initialItem = await getDownloadItem(id);
+    await setLastDiagnostic(diagnostic);
+
+    const observed = await observeDownload(id, diagnostic);
+    if (observed.item?.state === "interrupted" || observed.delta?.error) {
+      const reason = observed.item?.error || observed.delta?.error?.current || "download interrupted";
+      throw new DownloadDiagnosticError(`Download failed: ${reason}`, diagnostic);
+    }
+
+    return { id, diagnostic };
+  } catch (error) {
+    if (error instanceof DownloadDiagnosticError) {
+      throw error;
+    }
+    diagnostic.phase = "download-error";
+    diagnostic.error = error.message;
+    await setLastDiagnostic(diagnostic);
+    throw new DownloadDiagnosticError(error.message, diagnostic);
+  }
+}
+
 function downloadFile(options) {
   return new Promise((resolve, reject) => {
     chrome.downloads.download(options, (id) => {
@@ -194,4 +277,233 @@ function downloadFile(options) {
       resolve(id);
     });
   });
+}
+
+function observeDownload(id, diagnostic, timeoutMs = 12000) {
+  return new Promise((resolve) => {
+    let settled = false;
+    let timer = null;
+
+    const finish = async (payload) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      if (timer) {
+        clearTimeout(timer);
+      }
+      chrome.downloads.onChanged.removeListener(listener);
+      await setLastDiagnostic(diagnostic);
+      resolve(payload);
+    };
+
+    const listener = async (delta) => {
+      if (delta.id !== id) {
+        return;
+      }
+
+      const item = await getDownloadItem(id);
+      diagnostic.events.push({
+        at: new Date().toISOString(),
+        delta: pickDownloadDelta(delta),
+        item: pickDownloadItem(item)
+      });
+      diagnostic.latestItem = pickDownloadItem(item);
+
+      if (item?.state === "complete" || item?.state === "interrupted" || delta.error) {
+        diagnostic.phase = item?.state || "download-changed";
+        await finish({ item, delta, timeout: false });
+        return;
+      }
+
+      await setLastDiagnostic(diagnostic);
+    };
+
+    chrome.downloads.onChanged.addListener(listener);
+    timer = setTimeout(async () => {
+      const item = await getDownloadItem(id);
+      diagnostic.phase = "download-observation-timeout";
+      diagnostic.latestItem = pickDownloadItem(item);
+      await finish({ item, delta: null, timeout: true });
+    }, timeoutMs);
+  });
+}
+
+function getDownloadItem(id) {
+  return new Promise((resolve, reject) => {
+    chrome.downloads.search({ id }, (items) => {
+      const error = chrome.runtime.lastError;
+      if (error) {
+        reject(new Error(error.message));
+        return;
+      }
+      resolve(items?.[0] || null);
+    });
+  });
+}
+
+async function testDnrRules(url) {
+  if (!chrome.declarativeNetRequest?.testMatchOutcome) {
+    return { available: false, reason: "testMatchOutcome unavailable" };
+  }
+
+  const checks = [];
+  for (const type of DNR_TEST_TYPES) {
+    try {
+      const result = await chrome.declarativeNetRequest.testMatchOutcome({
+        url,
+        type,
+        initiator: "https://www.bilibili.com",
+        tabId: -1
+      });
+      checks.push({
+        type,
+        matchedRules: (result.matchedRules || []).map((item) => ({
+          ruleId: item.ruleId,
+          rulesetId: item.rulesetId
+        }))
+      });
+    } catch (error) {
+      checks.push({ type, error: error.message });
+    }
+  }
+
+  return {
+    available: true,
+    checks
+  };
+}
+
+function createBaseDiagnostic({ mediaUrl = "", filename = "", context = null }) {
+  return {
+    version: 1,
+    createdAt: new Date().toISOString(),
+    phase: "created",
+    context,
+    request: {
+      media: summarizeUrl(mediaUrl),
+      filename
+    },
+    events: [],
+    dnrMatchedEvents: []
+  };
+}
+
+async function setLastDiagnostic(diagnostic) {
+  lastDiagnostic = diagnostic;
+  try {
+    await chrome.storage?.local?.set({ [DIAGNOSTIC_STORAGE_KEY]: diagnostic });
+  } catch (_error) {
+    // Diagnostics are best-effort and should not break downloads.
+  }
+}
+
+async function getLastDiagnostic() {
+  if (lastDiagnostic) {
+    return lastDiagnostic;
+  }
+
+  try {
+    const stored = await chrome.storage?.local?.get(DIAGNOSTIC_STORAGE_KEY);
+    return stored?.[DIAGNOSTIC_STORAGE_KEY] || null;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function errorResponse(error) {
+  return {
+    ok: false,
+    error: error.message,
+    diagnostic: error.diagnostic || lastDiagnostic || null
+  };
+}
+
+class DownloadDiagnosticError extends Error {
+  constructor(message, diagnostic) {
+    super(message);
+    this.name = "DownloadDiagnosticError";
+    this.diagnostic = diagnostic;
+  }
+}
+
+function pickDownloadDelta(delta) {
+  return {
+    id: delta.id,
+    state: delta.state || null,
+    error: delta.error || null,
+    danger: delta.danger || null,
+    url: delta.url || null,
+    finalUrl: delta.finalUrl || null,
+    mime: delta.mime || null,
+    filename: delta.filename || null,
+    totalBytes: delta.totalBytes || null
+  };
+}
+
+function pickDownloadItem(item) {
+  if (!item) {
+    return null;
+  }
+
+  return {
+    id: item.id,
+    url: summarizeUrl(item.url),
+    finalUrl: summarizeUrl(item.finalUrl),
+    filename: item.filename,
+    mime: item.mime,
+    state: item.state,
+    error: item.error,
+    danger: item.danger,
+    fileSize: item.fileSize,
+    totalBytes: item.totalBytes,
+    bytesReceived: item.bytesReceived,
+    canResume: item.canResume,
+    paused: item.paused,
+    exists: item.exists,
+    byExtensionName: item.byExtensionName,
+    startTime: item.startTime,
+    endTime: item.endTime
+  };
+}
+
+function pickRequestDetails(request) {
+  return {
+    url: summarizeUrl(request?.url),
+    method: request?.method,
+    type: request?.type,
+    tabId: request?.tabId,
+    initiator: request?.initiator
+  };
+}
+
+function summarizeUrl(value) {
+  if (!value) {
+    return "";
+  }
+
+  try {
+    const url = new URL(value);
+    return {
+      host: url.host,
+      path: url.pathname.slice(0, 180),
+      searchLength: url.search.length,
+      sample: `${url.origin}${url.pathname}${url.search ? "?..." : ""}`
+    };
+  } catch (_error) {
+    return String(value).slice(0, 240);
+  }
+}
+
+function isMediaHost(value) {
+  try {
+    const host = new URL(value).host;
+    return (
+      host.endsWith("bilivideo.com") ||
+      host.endsWith("bilivideo.cn") ||
+      host.endsWith("hdslb.com")
+    );
+  } catch (_error) {
+    return false;
+  }
 }

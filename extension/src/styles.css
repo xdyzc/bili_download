@@ -119,6 +119,12 @@ select:disabled {
   color: #ffffff;
 }
 
+.secondary {
+  width: 100%;
+  margin-top: 8px;
+  background: var(--panel);
+}
+
 .note {
   margin-top: 10px;
   font-size: 12px;

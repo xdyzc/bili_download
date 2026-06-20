@@ -24,8 +24,14 @@ test("media header rules use declarative request modification", async () => {
   const rules = JSON.parse(await readFile("extension/rules/bili-media-headers.json", "utf8"));
   const rule = rules[0];
 
+  assert.deepEqual(
+    rules.map((item) => item.condition.urlFilter),
+    ["||bilivideo.com/", "||bilivideo.cn/", "||hdslb.com/"]
+  );
   assert.equal(rule.action.type, "modifyHeaders");
-  assert.equal(rule.condition.regexFilter, "^https://[^/]*\\.(bilivideo|bilivideo\\.cn|hdslb)\\.");
+  assert.ok(rule.condition.resourceTypes.includes("main_frame"));
+  assert.ok(rule.condition.resourceTypes.includes("image"));
+  assert.ok(rule.condition.resourceTypes.includes("other"));
   assert.deepEqual(
     rule.action.requestHeaders.map((item) => [item.header, item.operation]),
     [

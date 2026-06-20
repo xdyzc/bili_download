@@ -18,10 +18,76 @@
       ]
     },
     "condition": {
-      "regexFilter": "^https://[^/]*\\.(bilivideo|bilivideo\\.cn|hdslb)\\.",
+      "urlFilter": "||bilivideo.com/",
       "resourceTypes": [
+        "main_frame",
+        "sub_frame",
         "xmlhttprequest",
         "media",
+        "image",
+        "object",
+        "other"
+      ]
+    }
+  },
+  {
+    "id": 2,
+    "priority": 1,
+    "action": {
+      "type": "modifyHeaders",
+      "requestHeaders": [
+        {
+          "header": "Referer",
+          "operation": "set",
+          "value": "https://www.bilibili.com/"
+        },
+        {
+          "header": "Origin",
+          "operation": "set",
+          "value": "https://www.bilibili.com"
+        }
+      ]
+    },
+    "condition": {
+      "urlFilter": "||bilivideo.cn/",
+      "resourceTypes": [
+        "main_frame",
+        "sub_frame",
+        "xmlhttprequest",
+        "media",
+        "image",
+        "object",
+        "other"
+      ]
+    }
+  },
+  {
+    "id": 3,
+    "priority": 1,
+    "action": {
+      "type": "modifyHeaders",
+      "requestHeaders": [
+        {
+          "header": "Referer",
+          "operation": "set",
+          "value": "https://www.bilibili.com/"
+        },
+        {
+          "header": "Origin",
+          "operation": "set",
+          "value": "https://www.bilibili.com"
+        }
+      ]
+    },
+    "condition": {
+      "urlFilter": "||hdslb.com/",
+      "resourceTypes": [
+        "main_frame",
+        "sub_frame",
+        "xmlhttprequest",
+        "media",
+        "image",
+        "object",
         "other"
       ]
     }

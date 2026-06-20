@@ -151,7 +151,9 @@ async function startDirectDownload(payload) {
 
     if (!downloaded) {
       if (lastError?.diagnostic) {
-        lastError.diagnostic.allCandidateDiagnostics = candidateDiagnostics;
+        lastError.diagnostic.allCandidateDiagnostics = candidateDiagnostics
+          .filter((diagnostic) => diagnostic !== lastError.diagnostic)
+          .map((diagnostic) => sanitizeForMessage(diagnostic));
       }
       throw lastError || new Error("All media candidates failed.");
     }
@@ -505,9 +507,9 @@ function createBaseDiagnostic({ mediaUrl = "", filename = "", context = null }) 
 }
 
 async function setLastDiagnostic(diagnostic) {
-  lastDiagnostic = diagnostic;
+  lastDiagnostic = sanitizeForMessage(diagnostic);
   try {
-    await chrome.storage?.local?.set({ [DIAGNOSTIC_STORAGE_KEY]: diagnostic });
+    await chrome.storage?.local?.set({ [DIAGNOSTIC_STORAGE_KEY]: lastDiagnostic });
   } catch (_error) {
     // Diagnostics are best-effort and should not break downloads.
   }
@@ -530,8 +532,26 @@ function errorResponse(error) {
   return {
     ok: false,
     error: error.message,
-    diagnostic: error.diagnostic || lastDiagnostic || null
+    diagnostic: sanitizeForMessage(error.diagnostic || lastDiagnostic || null)
   };
+}
+
+function sanitizeForMessage(value) {
+  if (!value) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(JSON.stringify(value));
+  } catch (_error) {
+    return {
+      phase: value.phase || "diagnostic-serialization-error",
+      error: value.error || "Diagnostic could not be serialized.",
+      context: sanitizeForMessage(value.context),
+      request: sanitizeForMessage(value.request),
+      latestItem: sanitizeForMessage(value.latestItem)
+    };
+  }
 }
 
 class DownloadDiagnosticError extends Error {

@@ -823,6 +823,63 @@ test("background captures interrupted download diagnostics", async () => {
 });
 
 
+test("background error responses are message-serializable", async () => {
+  const code = await readFile("extension/src/background.js", "utf8");
+  const sandbox = {
+    Array,
+    Date,
+    Error,
+    Number,
+    Promise,
+    String,
+    URL,
+    URLSearchParams,
+    clearTimeout,
+    setTimeout,
+    chrome: {
+      runtime: {
+        lastError: null,
+        onMessage: {
+          addListener() {}
+        }
+      },
+      declarativeNetRequest: {
+        onRuleMatchedDebug: {
+          addListener() {}
+        }
+      },
+      storage: {
+        local: {
+          async get() {
+            return {};
+          },
+          async set() {}
+        }
+      }
+    }
+  };
+
+  vm.createContext(sandbox);
+  vm.runInContext(code, sandbox);
+
+  const diagnostic = {
+    phase: "interrupted",
+    error: "SERVER_FORBIDDEN",
+    context: { bvid: "BV1KGj36QEG3" }
+  };
+  diagnostic.allCandidateDiagnostics = [diagnostic];
+  const error = new Error("Download failed: SERVER_FORBIDDEN");
+  error.diagnostic = diagnostic;
+
+  const response = sandbox.errorResponse(error);
+
+  assert.equal(response.ok, false);
+  assert.equal(response.error, "Download failed: SERVER_FORBIDDEN");
+  assert.equal(response.diagnostic.phase, "interrupted");
+  assert.doesNotThrow(() => JSON.stringify(response));
+});
+
+
 function sendRuntimeMessage(listener, message) {
   return new Promise((resolve) => {
     const asyncResponse = listener(message, {}, resolve);

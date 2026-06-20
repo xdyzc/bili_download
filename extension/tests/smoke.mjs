@@ -401,7 +401,10 @@ test("popup uses page context blob download before fallback", async () => {
         }
       }
     },
-    setTimeout,
+    setTimeout(callback) {
+      callback();
+      return 1;
+    },
     document: {
       addEventListener() {},
       body: {
@@ -604,14 +607,29 @@ test("popup uses page context blob download before fallback", async () => {
 });
 
 
-test("popup reports failure without navigating when all fetch candidates fail", async () => {
+test("popup falls back to extension blob without navigating when page fetch fails", async () => {
   const code = await readFile("extension/src/popup.js", "utf8");
   const runtimeMessages = [];
   const scriptCalls = [];
+  const extensionFetchCalls = [];
   const statusElement = textElement();
   const qualitySelect = selectElement();
   const progressPanel = panelElement();
-  let nativeClickCount = 0;
+  const progressPercent = textElement();
+  const progressBar = styleElement();
+  const progressSize = textElement();
+  const progressSpeed = textElement();
+  const savedAnchors = [];
+  const objectUrls = [];
+  class TestURL extends URL {
+    static createObjectURL(blob) {
+      const value = `blob:extension-test/${objectUrls.length + 1}`;
+      objectUrls.push({ value, blob });
+      return value;
+    }
+
+    static revokeObjectURL() {}
+  }
 
   const sandbox = {
     Blob,
@@ -619,14 +637,39 @@ test("popup reports failure without navigating when all fetch candidates fail", 
     Error,
     RegExp,
     String,
-    URL,
+    URL: TestURL,
     console,
+    async fetch(url) {
+      extensionFetchCalls.push(url);
+      return {
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        headers: {
+          get(name) {
+            if (name.toLowerCase() === "content-length") {
+              return String(1024 * 1024);
+            }
+            if (name.toLowerCase() === "content-type") {
+              return "video/mp4";
+            }
+            return null;
+          }
+        },
+        async blob() {
+          return new Blob([new Uint8Array(1024 * 1024)], { type: "video/mp4" });
+        }
+      };
+    },
     navigator: {
       clipboard: {
         async writeText() {}
       }
     },
-    setTimeout,
+    setTimeout(callback) {
+      callback();
+      return 1;
+    },
     document: {
       addEventListener() {},
       body: {
@@ -639,7 +682,11 @@ test("popup reports failure without navigating when all fetch candidates fail", 
             download: "",
             rel: "",
             click() {
-              nativeClickCount += 1;
+              savedAnchors.push({
+                href: this.href,
+                download: this.download,
+                rel: this.rel
+              });
             },
             remove() {}
           };
@@ -656,10 +703,10 @@ test("popup reports failure without navigating when all fetch candidates fail", 
           "#download": buttonElement(),
           "#diagnostic": buttonElement(),
           "#progress": progressPanel,
-          "#progress-percent": textElement(),
-          "#progress-bar": styleElement(),
-          "#progress-size": textElement(),
-          "#progress-speed": textElement()
+          "#progress-percent": progressPercent,
+          "#progress-bar": progressBar,
+          "#progress-size": progressSize,
+          "#progress-speed": progressSpeed
         }[selector];
       }
     },
@@ -716,10 +763,10 @@ test("popup reports failure without navigating when all fetch candidates fail", 
                 segments: [{
                   url: "https://primary.hdslb.test/video.mp4",
                   filename: "BiliDownload/Smoke Video_64.mp4",
-                  size: 10 * 1024 * 1024,
+                  size: 1024 * 1024,
                   candidates: [
-                    { url: "https://primary.hdslb.test/video.mp4", kind: "primary", size: 10 * 1024 * 1024 },
-                    { url: "https://backup.hdslb.test/video.mp4", kind: "backup", size: 10 * 1024 * 1024 }
+                    { url: "https://primary.hdslb.test/video.mp4", kind: "primary", size: 1024 * 1024 },
+                    { url: "https://backup.hdslb.test/video.mp4", kind: "backup", size: 1024 * 1024 }
                   ],
                   context: {
                     bvid: "BV1KGj36QEG3",
@@ -766,7 +813,7 @@ test("popup reports failure without navigating when all fetch candidates fail", 
   qualitySelect.value = "64";
   await sandbox.downloadSelectedQuality();
 
-  assert.match(statusElement.textContent, /Failed to fetch https:\/\/backup\.hdslb\.test\/video\.mp4/);
+  assert.match(statusElement.textContent, /1$/);
   assert.equal(
     runtimeMessages.some((message) => message.type === "BILI_DOWNLOAD_START_DIRECT"),
     false
@@ -776,14 +823,25 @@ test("popup reports failure without navigating when all fetch candidates fail", 
   assert.equal(scriptCalls[1].func.name, "downloadMediaInPage");
   assert.equal(scriptCalls[0].args[0], "https://primary.hdslb.test/video.mp4");
   assert.equal(scriptCalls[1].args[0], "https://backup.hdslb.test/video.mp4");
-  assert.equal(nativeClickCount, 0);
+  assert.deepEqual(extensionFetchCalls, ["https://primary.hdslb.test/video.mp4"]);
+  assert.equal(savedAnchors.length, 1);
+  assert.match(savedAnchors[0].href, /^blob:extension-test\//);
+  assert.equal(savedAnchors[0].download, "Smoke Video_64.mp4");
+  assert.equal(progressPanel.hidden, false);
+  assert.equal(progressPercent.textContent, "100%");
+  assert.equal(progressBar.style.width, "100%");
+  assert.match(progressSize.textContent, /1\.0 MB \/ 1\.0 MB/);
+  assert.match(progressSpeed.textContent, /\/s$/);
   const savedDiagnostic = runtimeMessages
     .filter((message) => message.type === "BILI_DOWNLOAD_SAVE_DIAGNOSTIC")
     .at(-1).payload;
-  assert.equal(savedDiagnostic.phase, "page-fetch-message-error");
+  assert.equal(savedDiagnostic.phase, "complete");
   assert.equal(savedDiagnostic.candidateAttempts.length, 2);
   assert.equal(savedDiagnostic.candidateAttempts[0].fetch.error, "Failed to fetch https://primary.hdslb.test/video.mp4");
   assert.equal(savedDiagnostic.candidateAttempts[1].fetch.error, "Failed to fetch https://backup.hdslb.test/video.mp4");
+  assert.equal(savedDiagnostic.extensionCandidateAttempts.length, 1);
+  assert.equal(savedDiagnostic.extensionCandidateAttempts[0].fetch.responseOk, true);
+  assert.equal(savedDiagnostic.saved.method, "extension-blob");
 });
 
 

@@ -249,7 +249,8 @@ async function downloadViaPageBlob(segment) {
             segmentIndex: segment.context?.segmentIndex || 1,
             segmentCount: segment.context?.segmentCount || 1,
             candidateIndex: index + 1,
-            candidateCount: candidates.length
+            candidateCount: candidates.length,
+            totalBytes: candidate.size || segment.size || 0
           }
         ]
       });
@@ -317,7 +318,105 @@ async function downloadViaPageBlob(segment) {
     }
   }
 
-  throw lastError || diagnosticError("All page media candidates failed.", diagnostic);
+  return downloadViaExtensionBlob(segment, diagnostic, lastError);
+}
+
+async function downloadViaExtensionBlob(segment, diagnostic, previousError) {
+  const candidates = readCandidates(segment);
+  let lastError = previousError;
+
+  for (const [index, candidate] of candidates.entries()) {
+    diagnostic.phase = "fetching-extension-blob";
+    diagnostic.context = {
+      ...segment.context,
+      downloadMethod: "extension-blob",
+      candidateIndex: index + 1,
+      candidateCount: candidates.length,
+      candidateKind: candidate.kind
+    };
+    diagnostic.request = {
+      media: summarizeUrl(candidate.url),
+      filename: segment.filename
+    };
+    beginCandidateProgress({
+      segmentIndex: segment.context?.segmentIndex || 1,
+      segmentCount: segment.context?.segmentCount || 1,
+      candidateIndex: index + 1,
+      candidateCount: candidates.length,
+      totalBytes: candidate.size || segment.size || 0
+    });
+
+    try {
+      const result = await fetchMediaInExtension(
+        candidate.url,
+        filenameForPageDownload(segment.filename),
+        {
+          segmentIndex: segment.context?.segmentIndex || 1,
+          segmentCount: segment.context?.segmentCount || 1,
+          candidateIndex: index + 1,
+          candidateCount: candidates.length,
+          totalBytes: candidate.size || segment.size || 0
+        }
+      );
+      const attempt = {
+        at: new Date().toISOString(),
+        candidateIndex: index + 1,
+        candidateCount: candidates.length,
+        candidateKind: candidate.kind,
+        request: {
+          media: summarizeUrl(candidate.url)
+        },
+        fetch: pickFetchResult(result)
+      };
+      diagnostic.extensionCandidateAttempts.push(attempt);
+      diagnostic.fetch = attempt.fetch;
+
+      if (!result?.ok) {
+        diagnostic.phase = "extension-fetch-message-error";
+        diagnostic.error = result?.error || "Extension fetch failed.";
+        lastError = diagnosticError(diagnostic.error, diagnostic);
+        await saveDiagnostic(diagnostic);
+        continue;
+      }
+
+      if (!result.responseOk) {
+        diagnostic.phase = "extension-fetch-http-error";
+        diagnostic.error = `HTTP ${result.status || "unknown"}`;
+        lastError = diagnosticError(diagnostic.error, diagnostic);
+        await saveDiagnostic(diagnostic);
+        continue;
+      }
+
+      diagnostic.phase = "complete";
+      diagnostic.error = null;
+      completeProgress(result);
+      diagnostic.saved = {
+        filename: result.filename,
+        mime: result.mime,
+        size: result.size,
+        method: "extension-blob"
+      };
+      await saveDiagnostic(diagnostic);
+      return diagnostic;
+    } catch (error) {
+      diagnostic.phase = "extension-blob-error";
+      diagnostic.error = error.message;
+      diagnostic.extensionCandidateAttempts.push({
+        at: new Date().toISOString(),
+        candidateIndex: index + 1,
+        candidateCount: candidates.length,
+        candidateKind: candidate.kind,
+        request: {
+          media: summarizeUrl(candidate.url)
+        },
+        error: error.message
+      });
+      await saveDiagnostic(diagnostic);
+      lastError = diagnosticError(error.message, diagnostic);
+    }
+  }
+
+  throw lastError || diagnosticError("All media candidates failed.", diagnostic);
 }
 
 async function copyDiagnostic() {
@@ -381,7 +480,8 @@ function createPageDiagnostic(segment) {
     },
     events: [],
     dnrMatchedEvents: [],
-    candidateAttempts: []
+    candidateAttempts: [],
+    extensionCandidateAttempts: []
   };
 }
 
@@ -521,6 +621,116 @@ async function downloadMediaInPage(url, filename, progressContext) {
     }
 
     sendProgress({
+      ...progressContext,
+      receivedBytes,
+      totalBytes: contentLength || receivedBytes,
+      done: true
+    });
+
+    const mime = response.headers.get("content-type") || "video/mp4";
+    const body = new Blob(chunks, {
+      type: mime
+    });
+
+    const blobUrl = URL.createObjectURL(body);
+    try {
+      const anchor = document.createElement("a");
+      anchor.href = blobUrl;
+      anchor.download = filename;
+      anchor.rel = "noopener";
+      document.body.append(anchor);
+      anchor.click();
+      anchor.remove();
+    } finally {
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 30000);
+    }
+
+    return {
+      ok: true,
+      responseOk: true,
+      status: response.status,
+      statusText: response.statusText,
+      mime: body.type || response.headers.get("content-type") || "",
+      size: body.size,
+      totalBytes: contentLength || body.size,
+      receivedBytes,
+      filename
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error: error.message,
+      filename
+    };
+  }
+}
+
+async function fetchMediaInExtension(url, filename, progressContext) {
+  try {
+    const response = await fetch(url, {
+      credentials: "include",
+      headers: {
+        "Accept": "video/*,*/*;q=0.8"
+      },
+      cache: "no-store"
+    });
+    const contentLength = Number(response.headers.get("content-length")) ||
+      Number(progressContext?.totalBytes) ||
+      0;
+
+    if (!response.ok) {
+      const errorBody = await response.blob();
+      return {
+        ok: true,
+        responseOk: false,
+        status: response.status,
+        statusText: response.statusText,
+        mime: errorBody.type || response.headers.get("content-type") || "",
+        size: errorBody.size,
+        totalBytes: contentLength,
+        receivedBytes: 0,
+        filename
+      };
+    }
+
+    const reader = response.body?.getReader();
+    const chunks = [];
+    let receivedBytes = 0;
+    let lastProgressAt = 0;
+
+    if (!reader) {
+      const body = await response.blob();
+      receivedBytes = body.size;
+      updateProgress({
+        ...progressContext,
+        receivedBytes,
+        totalBytes: body.size || contentLength,
+        done: true
+      });
+      chunks.push(body);
+    } else {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          break;
+        }
+
+        chunks.push(value);
+        receivedBytes += value.byteLength;
+        const now = Date.now();
+        if (now - lastProgressAt > 180) {
+          lastProgressAt = now;
+          updateProgress({
+            ...progressContext,
+            receivedBytes,
+            totalBytes: contentLength,
+            done: false
+          });
+        }
+      }
+    }
+
+    updateProgress({
       ...progressContext,
       receivedBytes,
       totalBytes: contentLength || receivedBytes,

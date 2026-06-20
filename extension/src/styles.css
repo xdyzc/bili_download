@@ -125,6 +125,53 @@ select:disabled {
   background: var(--panel);
 }
 
+.progress-panel {
+  margin-top: 12px;
+  padding: 12px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.progress-head,
+.progress-stats {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.progress-head {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.progress-head strong {
+  color: var(--text);
+  font-size: 16px;
+}
+
+.progress-track {
+  height: 8px;
+  margin: 10px 0;
+  overflow: hidden;
+  background: #ecece7;
+  border-radius: 999px;
+}
+
+#progress-bar {
+  width: 0%;
+  height: 100%;
+  background: var(--accent);
+  transition: width 160ms ease;
+}
+
+.progress-stats {
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
 .note {
   margin-top: 10px;
   font-size: 12px;

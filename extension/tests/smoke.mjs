@@ -48,9 +48,75 @@ test("media header rules use declarative request modification", async () => {
 test("popup contains MVP controls", async () => {
   const html = await readFile("extension/src/popup.html", "utf8");
 
-  for (const id of ["status", "bvid", "copy", "title", "quality", "download", "diagnostic"]) {
+  for (const id of [
+    "status",
+    "bvid",
+    "copy",
+    "title",
+    "quality",
+    "download",
+    "diagnostic",
+    "progress",
+    "progress-percent",
+    "progress-bar",
+    "progress-size",
+    "progress-speed"
+  ]) {
     assert.match(html, new RegExp(`id="${id}"`));
   }
+});
+
+
+test("content script forwards page progress events", async () => {
+  const code = await readFile("extension/src/content.js", "utf8");
+  const runtimeMessages = [];
+  const listeners = {};
+
+  const sandbox = {
+    chrome: {
+      runtime: {
+        onMessage: {
+          addListener() {}
+        },
+        sendMessage(message) {
+          runtimeMessages.push(message);
+        }
+      }
+    },
+    document: {
+      querySelector() {
+        return null;
+      },
+      title: "Smoke Video"
+    },
+    location: {
+      href: "https://www.bilibili.com/video/BV1KGj36QEG3/"
+    },
+    window: {
+      addEventListener(type, listener) {
+        listeners[type] = listener;
+      }
+    },
+    String
+  };
+
+  vm.createContext(sandbox);
+  vm.runInContext(code, sandbox);
+
+  listeners["bili-download-progress"]({
+    detail: {
+      receivedBytes: 5,
+      totalBytes: 10
+    }
+  });
+
+  assert.deepEqual(toPlain(runtimeMessages), [{
+    type: "BILI_DOWNLOAD_PAGE_PROGRESS",
+    payload: {
+      receivedBytes: 5,
+      totalBytes: 10
+    }
+  }]);
 });
 
 
@@ -260,7 +326,13 @@ test("popup uses page context blob download before fallback", async () => {
   const clipboardWrites = [];
   const statusElement = textElement();
   const qualitySelect = selectElement();
+  const progressPanel = panelElement();
+  const progressPercent = textElement();
+  const progressBar = styleElement();
+  const progressSize = textElement();
+  const progressSpeed = textElement();
   let clickCount = 0;
+  let runtimeListener = null;
 
   const sandbox = {
     Blob,
@@ -305,7 +377,12 @@ test("popup uses page context blob download before fallback", async () => {
           "#quality": qualitySelect,
           "#copy": buttonElement(),
           "#download": buttonElement(),
-          "#diagnostic": buttonElement()
+          "#diagnostic": buttonElement(),
+          "#progress": progressPanel,
+          "#progress-percent": progressPercent,
+          "#progress-bar": progressBar,
+          "#progress-size": progressSize,
+          "#progress-speed": progressSpeed
         }[selector];
       }
     },
@@ -327,6 +404,12 @@ test("popup uses page context blob download before fallback", async () => {
         }
       },
       runtime: {
+        id: "extension-id",
+        onMessage: {
+          addListener(listener) {
+            runtimeListener = listener;
+          }
+        },
         async sendMessage(message) {
           runtimeMessages.push(message);
           if (message.type === "BILI_DOWNLOAD_GET_DIAGNOSTIC") {
@@ -401,7 +484,9 @@ test("popup uses page context blob download before fallback", async () => {
               status: 200,
               statusText: "OK",
               mime: "video/mp4",
-              size: 10,
+              size: 10 * 1024 * 1024,
+              totalBytes: 10 * 1024 * 1024,
+              receivedBytes: 10 * 1024 * 1024,
               filename: call.args[1]
             }
           }];
@@ -415,7 +500,19 @@ test("popup uses page context blob download before fallback", async () => {
 
   await sandbox.initialize();
   qualitySelect.value = "64";
-  await sandbox.downloadSelectedQuality();
+  const downloadPromise = sandbox.downloadSelectedQuality();
+  runtimeListener({
+    type: "BILI_DOWNLOAD_PAGE_PROGRESS",
+    payload: {
+      receivedBytes: 5 * 1024 * 1024,
+      totalBytes: 10 * 1024 * 1024,
+      segmentIndex: 1,
+      segmentCount: 1,
+      candidateIndex: 2,
+      candidateCount: 2
+    }
+  });
+  await downloadPromise;
 
   assert.equal(scriptCalls.length, 2);
   assert.equal(scriptCalls[0].target.tabId, 99);
@@ -423,7 +520,13 @@ test("popup uses page context blob download before fallback", async () => {
   assert.equal(scriptCalls[0].args[1], "Smoke Video_64.mp4");
   assert.equal(scriptCalls[0].args[0], "https://primary.hdslb.test/video.mp4?token=hidden");
   assert.equal(scriptCalls[1].args[0], "https://backup.hdslb.test/video.mp4?token=hidden");
+  assert.equal(scriptCalls[1].args[2].candidateIndex, 2);
   assert.match(statusElement.textContent, /1$/);
+  assert.equal(progressPanel.hidden, false);
+  assert.equal(progressPercent.textContent, "100%");
+  assert.equal(progressBar.style.width, "100%");
+  assert.match(progressSize.textContent, /10\.0 MB \/ 10\.0 MB/);
+  assert.match(progressSpeed.textContent, /\/s$/);
   assert.equal(
     runtimeMessages.some((message) => message.type === "BILI_DOWNLOAD_START_DIRECT"),
     false
@@ -614,6 +717,22 @@ function optionElement() {
     value: "",
     textContent: "",
     selected: false
+  };
+}
+
+
+function panelElement() {
+  return {
+    hidden: true
+  };
+}
+
+
+function styleElement() {
+  return {
+    style: {
+      width: ""
+    }
   };
 }
 

@@ -13,6 +13,8 @@ const TEXT = {
   fallbackDownloading: "\u9875\u9762\u4e0b\u8f7d\u5931\u8d25\uff0c\u5c1d\u8bd5\u540e\u53f0\u4e0b\u8f7d..."
 };
 
+const PROGRESS_MESSAGE_TYPE = "BILI_DOWNLOAD_PAGE_PROGRESS";
+
 const state = {
   tabId: null,
   page: {
@@ -22,6 +24,19 @@ const state = {
   },
   video: null,
   lastDiagnostic: null,
+  progress: {
+    active: false,
+    receivedBytes: 0,
+    totalBytes: 0,
+    percent: 0,
+    speedBytesPerSecond: 0,
+    startedAt: 0,
+    lastAt: 0,
+    segmentIndex: 0,
+    segmentCount: 0,
+    candidateIndex: 0,
+    candidateCount: 0
+  },
   busy: false
 };
 
@@ -32,11 +47,24 @@ const qualitySelect = document.querySelector("#quality");
 const copyButton = document.querySelector("#copy");
 const downloadButton = document.querySelector("#download");
 const diagnosticButton = document.querySelector("#diagnostic");
+const progressPanel = document.querySelector("#progress");
+const progressPercent = document.querySelector("#progress-percent");
+const progressBar = document.querySelector("#progress-bar");
+const progressSize = document.querySelector("#progress-size");
+const progressSpeed = document.querySelector("#progress-speed");
 
 document.addEventListener("DOMContentLoaded", initialize);
 copyButton.addEventListener("click", copyBvid);
 downloadButton.addEventListener("click", downloadSelectedQuality);
 diagnosticButton.addEventListener("click", copyDiagnostic);
+chrome.runtime.onMessage.addListener((message) => {
+  if (message?.type !== PROGRESS_MESSAGE_TYPE) {
+    return false;
+  }
+
+  updateProgress(message.payload);
+  return false;
+});
 
 async function initialize() {
   setBusy(true);
@@ -139,6 +167,7 @@ async function downloadSelectedQuality() {
   }
 
   setBusy(true);
+  resetProgress();
   setStatus(TEXT.downloading);
 
   try {
@@ -174,6 +203,7 @@ async function downloadSelectedQuality() {
       }
 
       setStatus(TEXT.fallbackDownloading);
+      setProgressFallbackMode();
       const fallback = await chrome.runtime.sendMessage({
         type: "BILI_DOWNLOAD_START_DIRECT",
         payload: {
@@ -194,6 +224,7 @@ async function downloadSelectedQuality() {
       }
 
       state.lastDiagnostic = fallback.payload.diagnostics?.at(-1) || state.lastDiagnostic;
+      completeProgress();
       setStatus(`${TEXT.downloadStarted}: ${fallback.payload.count}`);
     }
   } catch (error) {
@@ -220,6 +251,12 @@ async function downloadViaPageBlob(segment) {
       media: summarizeUrl(candidate.url),
       filename: segment.filename
     };
+    beginCandidateProgress({
+      segmentIndex: segment.context?.segmentIndex || 1,
+      segmentCount: segment.context?.segmentCount || 1,
+      candidateIndex: index + 1,
+      candidateCount: candidates.length
+    });
 
     try {
       const [injection] = await chrome.scripting.executeScript({
@@ -228,7 +265,16 @@ async function downloadViaPageBlob(segment) {
         },
         world: "MAIN",
         func: downloadMediaInPage,
-        args: [candidate.url, filenameForPageDownload(segment.filename)]
+        args: [
+          candidate.url,
+          filenameForPageDownload(segment.filename),
+          {
+            segmentIndex: segment.context?.segmentIndex || 1,
+            segmentCount: segment.context?.segmentCount || 1,
+            candidateIndex: index + 1,
+            candidateCount: candidates.length
+          }
+        ]
       });
 
       const result = injection?.result;
@@ -263,6 +309,7 @@ async function downloadViaPageBlob(segment) {
 
       diagnostic.phase = "complete";
       diagnostic.error = null;
+      completeProgress(result);
       diagnostic.saved = {
         filename: result.filename,
         mime: result.mime,
@@ -379,7 +426,9 @@ function pickFetchResult(response) {
     status: response.status,
     statusText: response.statusText,
     mime: response.mime,
-    size: response.size
+    size: response.size,
+    totalBytes: response.totalBytes,
+    receivedBytes: response.receivedBytes
   };
 }
 
@@ -437,7 +486,17 @@ function readCandidates(segment) {
   return segment?.url ? [{ url: segment.url, kind: "primary" }] : [];
 }
 
-async function downloadMediaInPage(url, filename) {
+async function downloadMediaInPage(url, filename, progressContext) {
+  const sendProgress = (payload) => {
+    try {
+      window.dispatchEvent(new CustomEvent("bili-download-progress", {
+        detail: payload
+      }));
+    } catch (_error) {
+      // Progress is best-effort; the popup may have been closed.
+    }
+  };
+
   try {
     const response = await fetch(url, {
       credentials: "include",
@@ -445,19 +504,71 @@ async function downloadMediaInPage(url, filename) {
       referrerPolicy: "strict-origin-when-cross-origin",
       cache: "no-store"
     });
-    const body = await response.blob();
+    const contentLength = Number(response.headers.get("content-length")) || 0;
 
     if (!response.ok) {
+      const errorBody = await response.blob();
       return {
         ok: true,
         responseOk: false,
         status: response.status,
         statusText: response.statusText,
-        mime: body.type || response.headers.get("content-type") || "",
-        size: body.size,
+        mime: errorBody.type || response.headers.get("content-type") || "",
+        size: errorBody.size,
+        totalBytes: contentLength,
+        receivedBytes: 0,
         filename
       };
     }
+
+    const reader = response.body?.getReader();
+    const chunks = [];
+    let receivedBytes = 0;
+    let lastProgressAt = 0;
+
+    if (!reader) {
+      const body = await response.blob();
+      receivedBytes = body.size;
+      sendProgress({
+        ...progressContext,
+        receivedBytes,
+        totalBytes: body.size || contentLength,
+        done: true
+      });
+      chunks.push(body);
+    } else {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          break;
+        }
+
+        chunks.push(value);
+        receivedBytes += value.byteLength;
+        const now = Date.now();
+        if (now - lastProgressAt > 180) {
+          lastProgressAt = now;
+          sendProgress({
+            ...progressContext,
+            receivedBytes,
+            totalBytes: contentLength,
+            done: false
+          });
+        }
+      }
+    }
+
+    sendProgress({
+      ...progressContext,
+      receivedBytes,
+      totalBytes: contentLength || receivedBytes,
+      done: true
+    });
+
+    const mime = response.headers.get("content-type") || "video/mp4";
+    const body = new Blob(chunks, {
+      type: mime
+    });
 
     const blobUrl = URL.createObjectURL(body);
     try {
@@ -479,6 +590,8 @@ async function downloadMediaInPage(url, filename) {
       statusText: response.statusText,
       mime: body.type || response.headers.get("content-type") || "",
       size: body.size,
+      totalBytes: contentLength || body.size,
+      receivedBytes,
       filename
     };
   } catch (error) {
@@ -488,6 +601,114 @@ async function downloadMediaInPage(url, filename) {
       filename
     };
   }
+}
+
+function resetProgress() {
+  state.progress = {
+    active: true,
+    receivedBytes: 0,
+    totalBytes: 0,
+    percent: 0,
+    speedBytesPerSecond: 0,
+    startedAt: Date.now(),
+    lastAt: Date.now(),
+    segmentIndex: 0,
+    segmentCount: 0,
+    candidateIndex: 0,
+    candidateCount: 0
+  };
+  renderProgress();
+}
+
+function beginCandidateProgress(context) {
+  state.progress.active = true;
+  state.progress.receivedBytes = 0;
+  state.progress.totalBytes = 0;
+  state.progress.percent = 0;
+  state.progress.speedBytesPerSecond = 0;
+  state.progress.startedAt = Date.now();
+  state.progress.lastAt = Date.now();
+  state.progress.segmentIndex = context.segmentIndex;
+  state.progress.segmentCount = context.segmentCount;
+  state.progress.candidateIndex = context.candidateIndex;
+  state.progress.candidateCount = context.candidateCount;
+  renderProgress();
+}
+
+function updateProgress(payload) {
+  if (!state.busy || !payload) {
+    return;
+  }
+
+  const now = Date.now();
+  const elapsedSeconds = Math.max((now - state.progress.startedAt) / 1000, 0.001);
+  const receivedBytes = Number(payload.receivedBytes) || 0;
+  const totalBytes = Number(payload.totalBytes) || state.progress.totalBytes || 0;
+  state.progress.active = true;
+  state.progress.receivedBytes = receivedBytes;
+  state.progress.totalBytes = totalBytes;
+  state.progress.percent = totalBytes ? Math.min((receivedBytes / totalBytes) * 100, 100) : 0;
+  state.progress.speedBytesPerSecond = receivedBytes / elapsedSeconds;
+  state.progress.lastAt = now;
+  state.progress.segmentIndex = payload.segmentIndex || state.progress.segmentIndex;
+  state.progress.segmentCount = payload.segmentCount || state.progress.segmentCount;
+  state.progress.candidateIndex = payload.candidateIndex || state.progress.candidateIndex;
+  state.progress.candidateCount = payload.candidateCount || state.progress.candidateCount;
+  renderProgress();
+}
+
+function completeProgress(result = null) {
+  const totalBytes = Number(result?.totalBytes || result?.size || state.progress.totalBytes) || 0;
+  const receivedBytes = Number(result?.receivedBytes || result?.size || totalBytes || state.progress.receivedBytes) || 0;
+  if (totalBytes || receivedBytes) {
+    state.progress.receivedBytes = receivedBytes;
+    state.progress.totalBytes = totalBytes || receivedBytes;
+    state.progress.percent = 100;
+  }
+  state.progress.active = false;
+  renderProgress();
+}
+
+function setProgressFallbackMode() {
+  state.progress.active = true;
+  state.progress.percent = 0;
+  renderProgress();
+}
+
+function renderProgress() {
+  if (!progressPanel) {
+    return;
+  }
+
+  const visible = state.progress.active || state.progress.receivedBytes || state.progress.totalBytes;
+  progressPanel.hidden = !visible;
+  const percent = Math.floor(state.progress.percent || 0);
+  progressPercent.textContent = state.progress.totalBytes ? `${percent}%` : "--";
+  progressBar.style.width = `${Math.min(percent, 100)}%`;
+  progressSize.textContent = `${formatBytes(state.progress.receivedBytes)} / ${
+    state.progress.totalBytes ? formatBytes(state.progress.totalBytes) : "--"
+  }`;
+  progressSpeed.textContent = state.progress.speedBytesPerSecond
+    ? `${formatBytes(state.progress.speedBytesPerSecond)}/s`
+    : "--/s";
+}
+
+function formatBytes(bytes) {
+  const value = Number(bytes) || 0;
+  if (value < 1024) {
+    return `${Math.round(value)} B`;
+  }
+
+  const units = ["KB", "MB", "GB"];
+  let current = value / 1024;
+  for (const unit of units) {
+    if (current < 1024 || unit === units.at(-1)) {
+      return `${current >= 100 ? current.toFixed(0) : current.toFixed(1)} ${unit}`;
+    }
+    current /= 1024;
+  }
+
+  return `${Math.round(value)} B`;
 }
 
 function updateControls() {

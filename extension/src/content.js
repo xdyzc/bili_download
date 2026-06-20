@@ -7,6 +7,13 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   return false;
 });
 
+window.addEventListener("bili-download-progress", (event) => {
+  chrome.runtime.sendMessage({
+    type: "BILI_DOWNLOAD_PAGE_PROGRESS",
+    payload: event.detail || {}
+  });
+});
+
 function readVideoPage() {
   return {
     bvid: extractBvid(location.href),

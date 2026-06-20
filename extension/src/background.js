@@ -74,7 +74,6 @@ async function startDirectDownload(payload) {
 
   const extension = extensionFor(playUrl.format);
   const baseName = safeFilename(`${title}_${quality}`);
-  const referer = `https://www.bilibili.com/video/${bvid}/`;
   const ids = [];
 
   for (const [index, segment] of segments.entries()) {
@@ -84,11 +83,7 @@ async function startDirectDownload(payload) {
       url: segment.url,
       filename,
       conflictAction: "uniquify",
-      saveAs: false,
-      headers: [
-        { name: "Referer", value: referer },
-        { name: "Origin", value: "https://www.bilibili.com" }
-      ]
+      saveAs: false
     });
     ids.push(id);
   }

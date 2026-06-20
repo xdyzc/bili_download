@@ -102,7 +102,7 @@ test("background loads qualities and starts direct browser downloads", async () 
   assert.equal(result.count, 1);
   assert.equal(downloadOptions.length, 1);
   assert.equal(downloadOptions[0].filename, "BiliDownload/Smoke Video_80.mp4");
-  assert.equal(downloadOptions[0].headers[0].name, "Referer");
+  assert.equal(downloadOptions[0].headers, undefined);
   assert.ok(fetchUrls.some((url) => url.includes("fnval=0")));
 });
 

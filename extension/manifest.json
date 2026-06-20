@@ -1,0 +1,33 @@
+{
+  "manifest_version": 3,
+  "name": "Bili Download",
+  "version": "0.1.0",
+  "description": "Send Bilibili video pages to the local Bili Download app.",
+  "action": {
+    "default_popup": "src/popup.html",
+    "default_title": "Bili Download"
+  },
+  "background": {
+    "service_worker": "src/background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.bilibili.com/video/*",
+        "https://m.bilibili.com/video/*"
+      ],
+      "js": [
+        "src/content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "permissions": [
+    "activeTab"
+  ],
+  "host_permissions": [
+    "https://www.bilibili.com/*",
+    "https://m.bilibili.com/*",
+    "http://127.0.0.1:8765/*"
+  ]
+}

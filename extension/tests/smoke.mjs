@@ -106,7 +106,10 @@ test("content script forwards page progress events", async () => {
   listeners["bili-download-progress"]({
     detail: {
       receivedBytes: 5,
-      totalBytes: 10
+      totalBytes: 10,
+      extra: {
+        notSerializable: true
+      }
     }
   });
 
@@ -114,7 +117,12 @@ test("content script forwards page progress events", async () => {
     type: "BILI_DOWNLOAD_PAGE_PROGRESS",
     payload: {
       receivedBytes: 5,
-      totalBytes: 10
+      totalBytes: 10,
+      segmentIndex: 0,
+      segmentCount: 0,
+      candidateIndex: 0,
+      candidateCount: 0,
+      done: false
     }
   }]);
 });
@@ -542,6 +550,159 @@ test("popup uses page context blob download before fallback", async () => {
   assert.equal(savedDiagnostic.candidateAttempts[1].fetch.responseOk, true);
   assert.equal(clipboardWrites.length, 0);
   assert.equal(clickCount, 0);
+});
+
+
+test("popup does not create browser download entries when all page candidates fail", async () => {
+  const code = await readFile("extension/src/popup.js", "utf8");
+  const runtimeMessages = [];
+  const statusElement = textElement();
+  const qualitySelect = selectElement();
+  const progressPanel = panelElement();
+
+  const sandbox = {
+    Blob,
+    Date,
+    Error,
+    RegExp,
+    String,
+    URL,
+    console,
+    navigator: {
+      clipboard: {
+        async writeText() {}
+      }
+    },
+    setTimeout,
+    document: {
+      addEventListener() {},
+      body: {
+        append() {}
+      },
+      createElement() {
+        return optionElement();
+      },
+      querySelector(selector) {
+        return {
+          "#status": statusElement,
+          "#bvid": textElement(),
+          "#title": textElement(),
+          "#quality": qualitySelect,
+          "#copy": buttonElement(),
+          "#download": buttonElement(),
+          "#diagnostic": buttonElement(),
+          "#progress": progressPanel,
+          "#progress-percent": textElement(),
+          "#progress-bar": styleElement(),
+          "#progress-size": textElement(),
+          "#progress-speed": textElement()
+        }[selector];
+      }
+    },
+    chrome: {
+      tabs: {
+        async query() {
+          return [{
+            id: 99,
+            url: "https://www.bilibili.com/video/BV1KGj36QEG3/",
+            title: "Smoke Video"
+          }];
+        },
+        async sendMessage() {
+          return {
+            bvid: "BV1KGj36QEG3",
+            title: "Smoke Video",
+            url: "https://www.bilibili.com/video/BV1KGj36QEG3/"
+          };
+        }
+      },
+      runtime: {
+        onMessage: {
+          addListener() {}
+        },
+        async sendMessage(message) {
+          runtimeMessages.push(message);
+          if (message.type === "BILI_DOWNLOAD_GET_DIAGNOSTIC") {
+            return { ok: true, payload: null };
+          }
+          if (message.type === "BILI_DOWNLOAD_LOAD_VIDEO") {
+            return {
+              ok: true,
+              payload: {
+                bvid: "BV1KGj36QEG3",
+                title: "Smoke Video",
+                page: { cid: 123 },
+                currentQuality: 64,
+                qualities: [{ code: 64, label: "64 - 720P" }]
+              }
+            };
+          }
+          if (message.type === "BILI_DOWNLOAD_PREPARE_DIRECT") {
+            return {
+              ok: true,
+              payload: {
+                count: 1,
+                segments: [{
+                  url: "https://primary.hdslb.test/video.mp4",
+                  filename: "BiliDownload/Smoke Video_64.mp4",
+                  candidates: [
+                    { url: "https://primary.hdslb.test/video.mp4", kind: "primary" },
+                    { url: "https://backup.hdslb.test/video.mp4", kind: "backup" }
+                  ],
+                  context: {
+                    bvid: "BV1KGj36QEG3",
+                    cid: 123,
+                    quality: 64,
+                    title: "Smoke Video",
+                    segmentIndex: 1,
+                    segmentCount: 1,
+                    format: "mp4",
+                    downloadMethod: "page-blob"
+                  }
+                }]
+              }
+            };
+          }
+          if (message.type === "BILI_DOWNLOAD_SAVE_DIAGNOSTIC") {
+            return { ok: true };
+          }
+          if (message.type === "BILI_DOWNLOAD_START_DIRECT") {
+            throw new Error("background fallback should not run");
+          }
+          throw new Error(`unexpected runtime message: ${message.type}`);
+        }
+      },
+      scripting: {
+        async executeScript(call) {
+          return [{
+            result: {
+              ok: false,
+              error: `Failed to fetch ${call.args[0]}`,
+              filename: call.args[1]
+            }
+          }];
+        }
+      }
+    }
+  };
+
+  vm.createContext(sandbox);
+  vm.runInContext(code, sandbox);
+
+  await sandbox.initialize();
+  qualitySelect.value = "64";
+  await sandbox.downloadSelectedQuality();
+
+  assert.match(statusElement.textContent, /Failed to fetch/);
+  assert.equal(
+    runtimeMessages.some((message) => message.type === "BILI_DOWNLOAD_START_DIRECT"),
+    false
+  );
+  const savedDiagnostic = runtimeMessages
+    .filter((message) => message.type === "BILI_DOWNLOAD_SAVE_DIAGNOSTIC")
+    .at(-1).payload;
+  assert.equal(savedDiagnostic.phase, "page-fetch-message-error");
+  assert.equal(savedDiagnostic.candidateAttempts.length, 2);
 });
 
 

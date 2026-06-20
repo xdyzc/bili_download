@@ -10,9 +10,21 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 window.addEventListener("bili-download-progress", (event) => {
   chrome.runtime.sendMessage({
     type: "BILI_DOWNLOAD_PAGE_PROGRESS",
-    payload: event.detail || {}
+    payload: normalizeProgressPayload(event.detail)
   });
 });
+
+function normalizeProgressPayload(value) {
+  return {
+    receivedBytes: Number(value?.receivedBytes) || 0,
+    totalBytes: Number(value?.totalBytes) || 0,
+    segmentIndex: Number(value?.segmentIndex) || 0,
+    segmentCount: Number(value?.segmentCount) || 0,
+    candidateIndex: Number(value?.candidateIndex) || 0,
+    candidateCount: Number(value?.candidateCount) || 0,
+    done: Boolean(value?.done)
+  };
+}
 
 function readVideoPage() {
   return {

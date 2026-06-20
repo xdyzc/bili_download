@@ -9,8 +9,7 @@ const TEXT = {
   downloadStarted: "\u4e0b\u8f7d\u5df2\u5f00\u59cb",
   dashOnly: "\u8fd9\u4e2a\u6e05\u6670\u5ea6\u9700\u8981 DASH\uff0c\u4e0b\u4e00\u6b65\u652f\u6301",
   diagnosticCopied: "\u8bca\u65ad\u4fe1\u606f\u5df2\u590d\u5236",
-  noDiagnostic: "\u6682\u65e0\u8bca\u65ad\u4fe1\u606f",
-  fallbackDownloading: "\u9875\u9762\u4e0b\u8f7d\u5931\u8d25\uff0c\u5c1d\u8bd5\u540e\u53f0\u4e0b\u8f7d..."
+  noDiagnostic: "\u6682\u65e0\u8bca\u65ad\u4fe1\u606f"
 };
 
 const PROGRESS_MESSAGE_TYPE = "BILI_DOWNLOAD_PAGE_PROGRESS";
@@ -186,48 +185,20 @@ async function downloadSelectedQuality() {
       throw new Error(prepared?.error || TEXT.dashOnly);
     }
 
-    try {
-      const diagnostics = [];
-      for (const [index, segment] of prepared.payload.segments.entries()) {
-        setStatus(`${TEXT.downloading} ${index + 1}/${prepared.payload.count}`);
-        const diagnostic = await downloadViaPageBlob(segment);
-        diagnostics.push(diagnostic);
-        state.lastDiagnostic = diagnostic;
-      }
-      setStatus(`${TEXT.downloadStarted}: ${prepared.payload.count}`);
-      await saveDiagnostic(state.lastDiagnostic);
-    } catch (pageError) {
-      if (pageError.diagnostic) {
-        state.lastDiagnostic = pageError.diagnostic;
-        await saveDiagnostic(pageError.diagnostic);
-      }
-
-      setStatus(TEXT.fallbackDownloading);
-      setProgressFallbackMode();
-      const fallback = await chrome.runtime.sendMessage({
-        type: "BILI_DOWNLOAD_START_DIRECT",
-        payload: {
-          bvid: state.video.bvid,
-          cid: state.video.page.cid,
-          quality: Number(qualitySelect.value),
-          title: state.video.title
-        }
-      });
-
-      if (!fallback?.ok) {
-        state.lastDiagnostic = mergeDiagnostics(
-          pageError.diagnostic,
-          fallback?.diagnostic || state.lastDiagnostic
-        );
-        await saveDiagnostic(state.lastDiagnostic);
-        throw new Error(fallback?.error || pageError.message || TEXT.dashOnly);
-      }
-
-      state.lastDiagnostic = fallback.payload.diagnostics?.at(-1) || state.lastDiagnostic;
-      completeProgress();
-      setStatus(`${TEXT.downloadStarted}: ${fallback.payload.count}`);
+    const diagnostics = [];
+    for (const [index, segment] of prepared.payload.segments.entries()) {
+      setStatus(`${TEXT.downloading} ${index + 1}/${prepared.payload.count}`);
+      const diagnostic = await downloadViaPageBlob(segment);
+      diagnostics.push(diagnostic);
+      state.lastDiagnostic = diagnostic;
     }
+    setStatus(`${TEXT.downloadStarted}: ${prepared.payload.count}`);
+    await saveDiagnostic(state.lastDiagnostic);
   } catch (error) {
+    if (error.diagnostic) {
+      state.lastDiagnostic = error.diagnostic;
+      await saveDiagnostic(error.diagnostic);
+    }
     setStatus(error.message);
   } finally {
     setBusy(false);
@@ -436,21 +407,6 @@ function diagnosticError(message, diagnostic) {
   const error = new Error(message);
   error.diagnostic = diagnostic;
   return error;
-}
-
-function mergeDiagnostics(pageDiagnostic, fallbackDiagnostic) {
-  if (!fallbackDiagnostic) {
-    return pageDiagnostic || null;
-  }
-
-  if (!pageDiagnostic) {
-    return fallbackDiagnostic;
-  }
-
-  return {
-    ...fallbackDiagnostic,
-    pageBlobAttempt: pageDiagnostic
-  };
 }
 
 function summarizeUrl(value) {
@@ -666,12 +622,6 @@ function completeProgress(result = null) {
     state.progress.percent = 100;
   }
   state.progress.active = false;
-  renderProgress();
-}
-
-function setProgressFallbackMode() {
-  state.progress.active = true;
-  state.progress.percent = 0;
   renderProgress();
 }
 

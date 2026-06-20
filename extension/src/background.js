@@ -19,6 +19,20 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
 
+  if (message?.type === "BILI_DOWNLOAD_PREPARE_DIRECT") {
+    prepareDirectDownload(message.payload)
+      .then((payload) => sendResponse({ ok: true, payload }))
+      .catch((error) => sendResponse(errorResponse(error)));
+    return true;
+  }
+
+  if (message?.type === "BILI_DOWNLOAD_SAVE_DIAGNOSTIC") {
+    setLastDiagnostic(message.payload)
+      .then(() => sendResponse({ ok: true }))
+      .catch((error) => sendResponse({ ok: false, error: error.message }));
+    return true;
+  }
+
   if (message?.type === "BILI_DOWNLOAD_GET_DIAGNOSTIC") {
     getLastDiagnostic()
       .then((payload) => sendResponse({ ok: true, payload }))
@@ -88,6 +102,36 @@ async function loadVideo(page) {
 }
 
 async function startDirectDownload(payload) {
+  const prepared = await prepareDirectDownload(payload);
+  const ids = [];
+  const diagnostics = [];
+
+  for (const segment of prepared.segments) {
+    const result = await downloadFileWithDiagnostics({
+      options: {
+        url: segment.url,
+        filename: segment.filename,
+        conflictAction: "uniquify",
+        saveAs: false
+      },
+      context: {
+        ...segment.context,
+        downloadMethod: "background-download"
+      }
+    });
+    ids.push(result.id);
+    diagnostics.push(result.diagnostic);
+  }
+
+  return {
+    ids,
+    count: ids.length,
+    diagnostics,
+    method: "background-download"
+  };
+}
+
+async function prepareDirectDownload(payload) {
   const bvid = normalizeBvid(payload?.bvid);
   const cid = Number(payload?.cid);
   const quality = Number(payload?.quality);
@@ -106,37 +150,34 @@ async function startDirectDownload(payload) {
 
   const extension = extensionFor(playUrl.format);
   const baseName = safeFilename(`${title}_${quality}`);
-  const ids = [];
-  const diagnostics = [];
+  const preparedSegments = [];
 
   for (const [index, segment] of segments.entries()) {
     const suffix = segments.length > 1 ? `_part${index + 1}` : "";
     const filename = `BiliDownload/${baseName}${suffix}${extension}`;
-    const result = await downloadFileWithDiagnostics({
-      options: {
-        url: segment.url,
-        filename,
-        conflictAction: "uniquify",
-        saveAs: false
-      },
+    const context = {
+      bvid,
+      cid,
+      quality,
+      title,
+      segmentIndex: index + 1,
+      segmentCount: segments.length,
+      format: playUrl.format
+    };
+    preparedSegments.push({
+      url: segment.url,
+      filename,
       context: {
-        bvid,
-        cid,
-        quality,
-        title,
-        segmentIndex: index + 1,
-        segmentCount: segments.length,
-        format: playUrl.format
+        ...context,
+        downloadMethod: "page-blob"
       }
     });
-    ids.push(result.id);
-    diagnostics.push(result.diagnostic);
   }
 
   return {
-    ids,
-    count: ids.length,
-    diagnostics
+    count: preparedSegments.length,
+    segments: preparedSegments,
+    format: playUrl.format
   };
 }
 
@@ -245,7 +286,7 @@ async function downloadFileWithDiagnostics({ options, context }) {
     const id = await downloadFile(options);
     diagnostic.downloadId = id;
     diagnostic.phase = "download-started";
-    diagnostic.initialItem = await getDownloadItem(id);
+    diagnostic.initialItem = pickDownloadItem(await getDownloadItem(id));
     await setLastDiagnostic(diagnostic);
 
     const observed = await observeDownload(id, diagnostic);

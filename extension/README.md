@@ -7,7 +7,8 @@ This folder contains the pure browser-extension prototype for Bili Download.
 - Manifest V3 Chrome/Edge extension.
 - Reads the current Bilibili video page and extracts the BV id.
 - Fetches video metadata and available qualities from Bilibili web APIs.
-- Starts browser downloads for directly available non-DASH streams.
+- Downloads directly available non-DASH streams from the Bilibili page context, then saves them as browser downloads.
+- Falls back to the browser downloads API and records diagnostics if page-context downloading fails.
 - Uses the browser's current Bilibili login state; no local `bili.json` import is needed.
 
 ## Current Limits
@@ -15,6 +16,7 @@ This folder contains the pure browser-extension prototype for Bili Download.
 - DASH video/audio separation is not handled yet.
 - Danmaku download and burning are not handled yet.
 - The extension only downloads content that the current browser session can access.
+- Page-context downloads currently buffer the whole file before saving, so large-file streaming is still a future step.
 
 ## Load Locally
 

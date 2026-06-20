@@ -1,9 +1,9 @@
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (message?.type !== "BILI_DOWNLOAD_GET_PAGE") {
+  if (message?.type === "BILI_DOWNLOAD_GET_PAGE") {
+    sendResponse(readVideoPage());
     return false;
   }
 
-  sendResponse(readVideoPage());
   return false;
 });
 

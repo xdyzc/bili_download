@@ -12,6 +12,7 @@ test("manifest declares a pure browser extension MVP", async () => {
   assert.ok(manifest.permissions.includes("downloads"));
   assert.ok(manifest.permissions.includes("declarativeNetRequest"));
   assert.ok(manifest.permissions.includes("declarativeNetRequestFeedback"));
+  assert.ok(manifest.permissions.includes("scripting"));
   assert.ok(manifest.permissions.includes("storage"));
   assert.ok(manifest.host_permissions.includes("https://api.bilibili.com/*"));
   assert.equal(
@@ -204,9 +205,12 @@ test("background loads qualities and starts direct browser downloads", async () 
     title: "Smoke Video"
   });
   assert.equal(result.count, 1);
+  assert.equal(result.method, "background-download");
   assert.equal(downloadOptions.length, 1);
   assert.equal(downloadOptions[0].filename, "BiliDownload/Smoke Video_80.mp4");
   assert.equal(downloadOptions[0].headers, undefined);
+  assert.equal(result.diagnostics[0].initialItem.url.sample, "https://example.hdslb.test/video.mp4");
+  assert.equal(result.diagnostics[0].initialItem.referrer, undefined);
   assert.equal(result.diagnostics[0].phase, "complete");
   assert.equal(result.diagnostics[0].latestItem.state, "complete");
   assert.deepEqual(toPlain(result.diagnostics[0].dnr.checks[0].matchedRules), [
@@ -219,6 +223,178 @@ test("background loads qualities and starts direct browser downloads", async () 
   });
   assert.equal(diagnosticResponse.ok, true);
   assert.equal(diagnosticResponse.payload.phase, "complete");
+
+  const preparedResponse = await sendRuntimeMessage(messageListener, {
+    type: "BILI_DOWNLOAD_PREPARE_DIRECT",
+    payload: {
+      bvid: "BV1KGj36QEG3",
+      cid: 123,
+      quality: 64,
+      title: "Smoke Video"
+    }
+  });
+  assert.equal(preparedResponse.ok, true);
+  assert.equal(preparedResponse.payload.count, 1);
+  assert.equal(preparedResponse.payload.segments[0].context.downloadMethod, "page-blob");
+});
+
+
+test("popup uses page context blob download before fallback", async () => {
+  const code = await readFile("extension/src/popup.js", "utf8");
+  const scriptCalls = [];
+  const runtimeMessages = [];
+  const clipboardWrites = [];
+  const statusElement = textElement();
+  const qualitySelect = selectElement();
+  let clickCount = 0;
+
+  const sandbox = {
+    Blob,
+    Date,
+    Error,
+    RegExp,
+    String,
+    URL,
+    console,
+    navigator: {
+      clipboard: {
+        async writeText(value) {
+          clipboardWrites.push(value);
+        }
+      }
+    },
+    setTimeout,
+    document: {
+      addEventListener() {},
+      body: {
+        append() {}
+      },
+      createElement(tagName) {
+        if (tagName === "a") {
+          return {
+            href: "",
+            download: "",
+            rel: "",
+            click() {
+              clickCount += 1;
+            },
+            remove() {}
+          };
+        }
+        return optionElement();
+      },
+      querySelector(selector) {
+        return {
+          "#status": statusElement,
+          "#bvid": textElement(),
+          "#title": textElement(),
+          "#quality": qualitySelect,
+          "#copy": buttonElement(),
+          "#download": buttonElement(),
+          "#diagnostic": buttonElement()
+        }[selector];
+      }
+    },
+    chrome: {
+      tabs: {
+        async query() {
+          return [{
+            id: 99,
+            url: "https://www.bilibili.com/video/BV1KGj36QEG3/",
+            title: "Smoke Video"
+          }];
+        },
+        async sendMessage() {
+          return {
+            bvid: "BV1KGj36QEG3",
+            title: "Smoke Video",
+            url: "https://www.bilibili.com/video/BV1KGj36QEG3/"
+          };
+        }
+      },
+      runtime: {
+        async sendMessage(message) {
+          runtimeMessages.push(message);
+          if (message.type === "BILI_DOWNLOAD_GET_DIAGNOSTIC") {
+            return { ok: true, payload: null };
+          }
+          if (message.type === "BILI_DOWNLOAD_LOAD_VIDEO") {
+            return {
+              ok: true,
+              payload: {
+                bvid: "BV1KGj36QEG3",
+                title: "Smoke Video",
+                page: { cid: 123 },
+                currentQuality: 64,
+                qualities: [{ code: 64, label: "64 - 720P" }]
+              }
+            };
+          }
+          if (message.type === "BILI_DOWNLOAD_PREPARE_DIRECT") {
+            return {
+              ok: true,
+              payload: {
+                count: 1,
+                segments: [{
+                  url: "https://example.hdslb.test/video.mp4?token=hidden",
+                  filename: "BiliDownload/Smoke Video_64.mp4",
+                  context: {
+                    bvid: "BV1KGj36QEG3",
+                    cid: 123,
+                    quality: 64,
+                    title: "Smoke Video",
+                    segmentIndex: 1,
+                    segmentCount: 1,
+                    format: "mp4",
+                    downloadMethod: "page-blob"
+                  }
+                }]
+              }
+            };
+          }
+          if (message.type === "BILI_DOWNLOAD_SAVE_DIAGNOSTIC") {
+            return { ok: true };
+          }
+          throw new Error(`unexpected runtime message: ${message.type}`);
+        }
+      },
+      scripting: {
+        async executeScript(call) {
+          scriptCalls.push(call);
+          return [{
+            result: {
+              ok: true,
+              responseOk: true,
+              status: 200,
+              statusText: "OK",
+              mime: "video/mp4",
+              size: 10,
+              filename: call.args[1]
+            }
+          }];
+        }
+      }
+    }
+  };
+
+  vm.createContext(sandbox);
+  vm.runInContext(code, sandbox);
+
+  await sandbox.initialize();
+  qualitySelect.value = "64";
+  await sandbox.downloadSelectedQuality();
+
+  assert.equal(scriptCalls.length, 1);
+  assert.equal(scriptCalls[0].target.tabId, 99);
+  assert.equal(scriptCalls[0].world, "MAIN");
+  assert.equal(scriptCalls[0].args[1], "Smoke Video_64.mp4");
+  assert.equal(statusElement.textContent, "下载已开始: 1");
+  assert.equal(
+    runtimeMessages.some((message) => message.type === "BILI_DOWNLOAD_START_DIRECT"),
+    false
+  );
+  assert.equal(clipboardWrites.length, 0);
+  assert.equal(clickCount, 0);
 });
 
 
@@ -349,6 +525,52 @@ function sendRuntimeMessage(listener, message) {
 
 function toPlain(value) {
   return JSON.parse(JSON.stringify(value));
+}
+
+
+function textElement() {
+  return {
+    value: "",
+    textContent: "",
+    disabled: false,
+    addEventListener() {}
+  };
+}
+
+
+function buttonElement() {
+  return {
+    disabled: false,
+    addEventListener() {}
+  };
+}
+
+
+function selectElement() {
+  return {
+    value: "",
+    disabled: false,
+    children: [],
+    append(option) {
+      this.children.push(option);
+      if (option.selected) {
+        this.value = option.value;
+      }
+    },
+    replaceChildren() {
+      this.children = [];
+      this.value = "";
+    }
+  };
+}
+
+
+function optionElement() {
+  return {
+    value: "",
+    textContent: "",
+    selected: false
+  };
 }
 
 

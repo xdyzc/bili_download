@@ -78,7 +78,7 @@ test("content script forwards page progress events", async () => {
         onMessage: {
           addListener() {}
         },
-        sendMessage(message) {
+        async sendMessage(message) {
           runtimeMessages.push(message);
         }
       }
@@ -135,6 +135,7 @@ test("background loads qualities and starts direct browser downloads", async () 
   const storage = {};
   const downloadItems = new Map();
   const changeListeners = new Set();
+  const connectedPorts = [];
   let messageListener = null;
 
   const sandbox = {
@@ -154,6 +155,11 @@ test("background loads qualities and starts direct browser downloads", async () 
         onMessage: {
           addListener(listener) {
             messageListener = listener;
+          }
+        },
+        onConnect: {
+          addListener(listener) {
+            connectedPorts.push(listener);
           }
         }
       },
@@ -254,6 +260,7 @@ test("background loads qualities and starts direct browser downloads", async () 
             accept_description: ["1080P", "720P"],
             durl: [{
               url: "https://primary.hdslb.test/video.mp4",
+              size: 10 * 1024 * 1024,
               backup_url: [
                 "https://backup.hdslb.test/video.mp4",
                 "https://primary.hdslb.test/video.mp4"
@@ -268,6 +275,16 @@ test("background loads qualities and starts direct browser downloads", async () 
 
   vm.createContext(sandbox);
   vm.runInContext(code, sandbox);
+  const portMessages = [];
+  connectedPorts[0]({
+    name: "BILI_DOWNLOAD_PROGRESS_PORT",
+    postMessage(message) {
+      portMessages.push(message);
+    },
+    onDisconnect: {
+      addListener() {}
+    }
+  });
 
   const video = await sandbox.loadVideo({
     bvid: "BV1KGj36QEG3",
@@ -320,10 +337,37 @@ test("background loads qualities and starts direct browser downloads", async () 
   assert.deepEqual(
     toPlain(preparedResponse.payload.segments[0].candidates),
     [
-      { url: "https://primary.hdslb.test/video.mp4", kind: "primary" },
-      { url: "https://backup.hdslb.test/video.mp4", kind: "backup" }
+      { url: "https://primary.hdslb.test/video.mp4", kind: "primary", size: 10 * 1024 * 1024 },
+      { url: "https://backup.hdslb.test/video.mp4", kind: "backup", size: 10 * 1024 * 1024 }
     ]
   );
+  assert.equal(preparedResponse.payload.segments[0].size, 10 * 1024 * 1024);
+
+  sandbox.chrome.runtime.onMessage.addListener;
+  await sendRuntimeMessage(messageListener, {
+    type: "BILI_DOWNLOAD_PAGE_PROGRESS",
+    payload: {
+      receivedBytes: 1024,
+      totalBytes: 2048,
+      segmentIndex: 1,
+      segmentCount: 1,
+      candidateIndex: 1,
+      candidateCount: 2
+    }
+  });
+  assert.deepEqual(toPlain(portMessages), [{
+    type: "BILI_DOWNLOAD_PAGE_PROGRESS",
+    payload: {
+      receivedBytes: 1024,
+      totalBytes: 2048,
+      segmentIndex: 1,
+      segmentCount: 1,
+      candidateIndex: 1,
+      candidateCount: 2,
+      done: false,
+      tabId: 0
+    }
+  }]);
 });
 
 
@@ -340,7 +384,7 @@ test("popup uses page context blob download before fallback", async () => {
   const progressSize = textElement();
   const progressSpeed = textElement();
   let clickCount = 0;
-  let runtimeListener = null;
+  let portListener = null;
 
   const sandbox = {
     Blob,
@@ -413,10 +457,14 @@ test("popup uses page context blob download before fallback", async () => {
       },
       runtime: {
         id: "extension-id",
-        onMessage: {
-          addListener(listener) {
-            runtimeListener = listener;
-          }
+        connect() {
+          return {
+            onMessage: {
+              addListener(listener) {
+                portListener = listener;
+              }
+            }
+          };
         },
         async sendMessage(message) {
           runtimeMessages.push(message);
@@ -443,14 +491,17 @@ test("popup uses page context blob download before fallback", async () => {
                 segments: [{
                   url: "https://primary.hdslb.test/video.mp4?token=hidden",
                   filename: "BiliDownload/Smoke Video_64.mp4",
+                  size: 10 * 1024 * 1024,
                   candidates: [
                     {
                       url: "https://primary.hdslb.test/video.mp4?token=hidden",
-                      kind: "primary"
+                      kind: "primary",
+                      size: 10 * 1024 * 1024
                     },
                     {
                       url: "https://backup.hdslb.test/video.mp4?token=hidden",
-                      kind: "backup"
+                      kind: "backup",
+                      size: 10 * 1024 * 1024
                     }
                   ],
                   context: {
@@ -509,7 +560,7 @@ test("popup uses page context blob download before fallback", async () => {
   await sandbox.initialize();
   qualitySelect.value = "64";
   const downloadPromise = sandbox.downloadSelectedQuality();
-  runtimeListener({
+  portListener({
     type: "BILI_DOWNLOAD_PAGE_PROGRESS",
     payload: {
       receivedBytes: 5 * 1024 * 1024,
@@ -553,12 +604,14 @@ test("popup uses page context blob download before fallback", async () => {
 });
 
 
-test("popup does not create browser download entries when all page candidates fail", async () => {
+test("popup uses one native page download when all fetch candidates fail", async () => {
   const code = await readFile("extension/src/popup.js", "utf8");
   const runtimeMessages = [];
+  const scriptCalls = [];
   const statusElement = textElement();
   const qualitySelect = selectElement();
   const progressPanel = panelElement();
+  let nativeClickCount = 0;
 
   const sandbox = {
     Blob,
@@ -579,7 +632,18 @@ test("popup does not create browser download entries when all page candidates fa
       body: {
         append() {}
       },
-      createElement() {
+      createElement(tagName) {
+        if (tagName === "a") {
+          return {
+            href: "",
+            download: "",
+            rel: "",
+            click() {
+              nativeClickCount += 1;
+            },
+            remove() {}
+          };
+        }
         return optionElement();
       },
       querySelector(selector) {
@@ -617,6 +681,13 @@ test("popup does not create browser download entries when all page candidates fa
         }
       },
       runtime: {
+        connect() {
+          return {
+            onMessage: {
+              addListener() {}
+            }
+          };
+        },
         onMessage: {
           addListener() {}
         },
@@ -645,9 +716,10 @@ test("popup does not create browser download entries when all page candidates fa
                 segments: [{
                   url: "https://primary.hdslb.test/video.mp4",
                   filename: "BiliDownload/Smoke Video_64.mp4",
+                  size: 10 * 1024 * 1024,
                   candidates: [
-                    { url: "https://primary.hdslb.test/video.mp4", kind: "primary" },
-                    { url: "https://backup.hdslb.test/video.mp4", kind: "backup" }
+                    { url: "https://primary.hdslb.test/video.mp4", kind: "primary", size: 10 * 1024 * 1024 },
+                    { url: "https://backup.hdslb.test/video.mp4", kind: "backup", size: 10 * 1024 * 1024 }
                   ],
                   context: {
                     bvid: "BV1KGj36QEG3",
@@ -674,6 +746,16 @@ test("popup does not create browser download entries when all page candidates fa
       },
       scripting: {
         async executeScript(call) {
+          scriptCalls.push(call);
+          if (call.func.name === "startNativeDownloadInPage") {
+            return [{
+              result: {
+                ok: true,
+                responseOk: true,
+                filename: call.args[1]
+              }
+            }];
+          }
           return [{
             result: {
               ok: false,
@@ -693,16 +775,21 @@ test("popup does not create browser download entries when all page candidates fa
   qualitySelect.value = "64";
   await sandbox.downloadSelectedQuality();
 
-  assert.match(statusElement.textContent, /Failed to fetch/);
+  assert.match(statusElement.textContent, /1$/);
   assert.equal(
     runtimeMessages.some((message) => message.type === "BILI_DOWNLOAD_START_DIRECT"),
     false
   );
+  assert.equal(scriptCalls.length, 3);
+  assert.equal(scriptCalls[2].func.name, "startNativeDownloadInPage");
+  assert.equal(scriptCalls[2].args[0], "https://primary.hdslb.test/video.mp4");
+  assert.equal(nativeClickCount, 0);
   const savedDiagnostic = runtimeMessages
     .filter((message) => message.type === "BILI_DOWNLOAD_SAVE_DIAGNOSTIC")
     .at(-1).payload;
-  assert.equal(savedDiagnostic.phase, "page-fetch-message-error");
+  assert.equal(savedDiagnostic.phase, "native-download-started");
   assert.equal(savedDiagnostic.candidateAttempts.length, 2);
+  assert.equal(savedDiagnostic.nativeDownload.result.responseOk, true);
 });
 
 

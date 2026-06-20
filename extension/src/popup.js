@@ -13,6 +13,7 @@ const TEXT = {
 };
 
 const PROGRESS_MESSAGE_TYPE = "BILI_DOWNLOAD_PAGE_PROGRESS";
+const PROGRESS_PORT_NAME = "BILI_DOWNLOAD_PROGRESS_PORT";
 
 const state = {
   tabId: null,
@@ -56,13 +57,17 @@ document.addEventListener("DOMContentLoaded", initialize);
 copyButton.addEventListener("click", copyBvid);
 downloadButton.addEventListener("click", downloadSelectedQuality);
 diagnosticButton.addEventListener("click", copyDiagnostic);
-chrome.runtime.onMessage.addListener((message) => {
+const progressPort = chrome.runtime.connect({ name: PROGRESS_PORT_NAME });
+progressPort.onMessage.addListener((message) => {
   if (message?.type !== PROGRESS_MESSAGE_TYPE) {
-    return false;
+    return;
+  }
+
+  if (message.payload?.tabId && state.tabId && message.payload.tabId !== state.tabId) {
+    return;
   }
 
   updateProgress(message.payload);
-  return false;
 });
 
 async function initialize() {
@@ -226,7 +231,8 @@ async function downloadViaPageBlob(segment) {
       segmentIndex: segment.context?.segmentIndex || 1,
       segmentCount: segment.context?.segmentCount || 1,
       candidateIndex: index + 1,
-      candidateCount: candidates.length
+      candidateCount: candidates.length,
+      totalBytes: candidate.size || segment.size || 0
     });
 
     try {
@@ -311,7 +317,69 @@ async function downloadViaPageBlob(segment) {
     }
   }
 
+  const nativeDiagnostic = await tryNativePageDownload(segment, diagnostic);
+  if (nativeDiagnostic.phase === "native-download-started") {
+    return nativeDiagnostic;
+  }
+
   throw lastError || diagnosticError("All page media candidates failed.", diagnostic);
+}
+
+async function tryNativePageDownload(segment, diagnostic) {
+  const candidates = readCandidates(segment);
+  const candidate = candidates[0];
+  if (!candidate?.url) {
+    return diagnostic;
+  }
+
+  beginCandidateProgress({
+    segmentIndex: segment.context?.segmentIndex || 1,
+    segmentCount: segment.context?.segmentCount || 1,
+    candidateIndex: 1,
+    candidateCount: candidates.length,
+    totalBytes: candidate.size || segment.size || 0
+  });
+
+  try {
+    const [injection] = await chrome.scripting.executeScript({
+      target: {
+        tabId: state.tabId
+      },
+      world: "MAIN",
+      func: startNativeDownloadInPage,
+      args: [candidate.url, filenameForPageDownload(segment.filename)]
+    });
+    const result = injection?.result;
+    diagnostic.phase = result?.ok ? "native-download-started" : "native-download-error";
+    diagnostic.error = result?.ok ? null : (result?.error || "Native page download failed.");
+    diagnostic.nativeDownload = {
+      at: new Date().toISOString(),
+      request: {
+        media: summarizeUrl(candidate.url)
+      },
+      result: pickFetchResult(result)
+    };
+    if (result?.ok) {
+      completeProgress({
+        size: candidate.size || segment.size || 0,
+        totalBytes: candidate.size || segment.size || 0,
+        receivedBytes: candidate.size || segment.size || 0
+      });
+      await saveDiagnostic(diagnostic);
+      return diagnostic;
+    }
+  } catch (error) {
+    diagnostic.nativeDownload = {
+      at: new Date().toISOString(),
+      request: {
+        media: summarizeUrl(candidate.url)
+      },
+      error: error.message
+    };
+  }
+
+  await saveDiagnostic(diagnostic);
+  return diagnostic;
 }
 
 async function copyDiagnostic() {
@@ -440,6 +508,29 @@ function readCandidates(segment) {
     return candidates;
   }
   return segment?.url ? [{ url: segment.url, kind: "primary" }] : [];
+}
+
+function startNativeDownloadInPage(url, filename) {
+  try {
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = filename;
+    anchor.rel = "noopener";
+    document.body.append(anchor);
+    anchor.click();
+    anchor.remove();
+    return {
+      ok: true,
+      responseOk: true,
+      filename
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error: error.message,
+      filename
+    };
+  }
 }
 
 async function downloadMediaInPage(url, filename, progressContext) {
@@ -579,7 +670,7 @@ function resetProgress() {
 function beginCandidateProgress(context) {
   state.progress.active = true;
   state.progress.receivedBytes = 0;
-  state.progress.totalBytes = 0;
+  state.progress.totalBytes = Number(context.totalBytes) || 0;
   state.progress.percent = 0;
   state.progress.speedBytesPerSecond = 0;
   state.progress.startedAt = Date.now();

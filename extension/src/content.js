@@ -8,10 +8,15 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 });
 
 window.addEventListener("bili-download-progress", (event) => {
-  chrome.runtime.sendMessage({
+  const promise = chrome.runtime.sendMessage({
     type: "BILI_DOWNLOAD_PAGE_PROGRESS",
     payload: normalizeProgressPayload(event.detail)
   });
+  if (promise?.catch) {
+    promise.catch(() => {
+      // The service worker or popup may be asleep; progress is best-effort.
+    });
+  }
 });
 
 function normalizeProgressPayload(value) {

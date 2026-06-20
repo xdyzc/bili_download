@@ -1,8 +1,11 @@
 const API_BASE = "https://api.bilibili.com";
 const DIAGNOSTIC_STORAGE_KEY = "lastDiagnostic";
 const DNR_TEST_TYPES = ["main_frame", "other", "media", "xmlhttprequest"];
+const PROGRESS_MESSAGE_TYPE = "BILI_DOWNLOAD_PAGE_PROGRESS";
+const PROGRESS_PORT_NAME = "BILI_DOWNLOAD_PROGRESS_PORT";
 
 let lastDiagnostic = null;
+const progressPorts = new Set();
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === "BILI_DOWNLOAD_LOAD_VIDEO") {
@@ -33,6 +36,12 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
 
+  if (message?.type === PROGRESS_MESSAGE_TYPE) {
+    relayProgress(message.payload, _sender?.tab?.id);
+    sendResponse({ ok: true });
+    return false;
+  }
+
   if (message?.type === "BILI_DOWNLOAD_GET_DIAGNOSTIC") {
     getLastDiagnostic()
       .then((payload) => sendResponse({ ok: true, payload }))
@@ -42,6 +51,48 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   return false;
 });
+
+chrome.runtime.onConnect?.addListener((port) => {
+  if (port.name !== PROGRESS_PORT_NAME) {
+    return;
+  }
+
+  progressPorts.add(port);
+  port.onDisconnect.addListener(() => {
+    progressPorts.delete(port);
+  });
+});
+
+function relayProgress(payload, tabId) {
+  const safePayload = normalizeProgressPayload(payload);
+  const message = {
+    type: PROGRESS_MESSAGE_TYPE,
+    payload: {
+      ...safePayload,
+      tabId: Number(tabId) || 0
+    }
+  };
+
+  for (const port of progressPorts) {
+    try {
+      port.postMessage(message);
+    } catch (_error) {
+      progressPorts.delete(port);
+    }
+  }
+}
+
+function normalizeProgressPayload(value) {
+  return {
+    receivedBytes: Number(value?.receivedBytes) || 0,
+    totalBytes: Number(value?.totalBytes) || 0,
+    segmentIndex: Number(value?.segmentIndex) || 0,
+    segmentCount: Number(value?.segmentCount) || 0,
+    candidateIndex: Number(value?.candidateIndex) || 0,
+    candidateCount: Number(value?.candidateCount) || 0,
+    done: Boolean(value?.done)
+  };
+}
 
 if (chrome.declarativeNetRequest?.onRuleMatchedDebug) {
   chrome.declarativeNetRequest.onRuleMatchedDebug.addListener((info) => {
@@ -210,6 +261,7 @@ async function prepareDirectDownload(payload) {
     preparedSegments.push({
       url: segmentPlan.candidates[0].url,
       filename,
+      size: Number(segmentPlan.source?.size) || 0,
       candidates: segmentPlan.candidates,
       context: {
         ...context,
@@ -243,7 +295,8 @@ function buildSegmentCandidates(segment) {
     })
     .map((url, index) => ({
       url,
-      kind: index === 0 ? "primary" : "backup"
+      kind: index === 0 ? "primary" : "backup",
+      size: Number(segment?.size) || 0
     }));
 }
 

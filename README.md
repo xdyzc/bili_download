@@ -120,6 +120,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build_exe.ps1
 
 ```text
 release\BiliDownload.exe
+release\BiliDownloadCLI.exe
 ```
 
 把 `BiliDownload.exe` 发给别人即可。需要登录态时，把浏览器导出的 `bili.json` 放在 EXE 同一目录；程序启动后会自动读取、显示登录状态、输入 BV、选择清晰度并下载到同目录的 `downloads` 文件夹。

@@ -15,10 +15,10 @@ Write-Host "Installing project and build dependencies..."
 Write-Host "Running tests..."
 & $Python -m pytest
 
-Write-Host "Building single-file executable..."
+Write-Host "Building GUI executable..."
 & $Python -m PyInstaller `
     --onefile `
-    --console `
+    --windowed `
     --name BiliDownload `
     --clean `
     --noconfirm `
@@ -26,12 +26,25 @@ Write-Host "Building single-file executable..."
     --hidden-import imageio_ffmpeg `
     packaging\entrypoint.py
 
+Write-Host "Building CLI executable..."
+& $Python -m PyInstaller `
+    --onefile `
+    --console `
+    --name BiliDownloadCLI `
+    --clean `
+    --noconfirm `
+    --collect-all imageio_ffmpeg `
+    --hidden-import imageio_ffmpeg `
+    packaging\cli_entrypoint.py
+
 $ReleaseDir = Join-Path $ProjectRoot "release"
 New-Item -ItemType Directory -Force -Path $ReleaseDir | Out-Null
 Copy-Item -Force (Join-Path $ProjectRoot "dist\BiliDownload.exe") (Join-Path $ReleaseDir "BiliDownload.exe")
+Copy-Item -Force (Join-Path $ProjectRoot "dist\BiliDownloadCLI.exe") (Join-Path $ReleaseDir "BiliDownloadCLI.exe")
 
 Write-Host ""
 Write-Host "Built:"
 Write-Host "  $ReleaseDir\BiliDownload.exe"
+Write-Host "  $ReleaseDir\BiliDownloadCLI.exe"
 Write-Host ""
 Write-Host "Put bili.json next to BiliDownload.exe before sharing or running with cookies."

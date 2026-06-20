@@ -86,6 +86,22 @@ def test_downloader_passes_requested_quality(tmp_path) -> None:
     assert client.last_quality == 80
 
 
+def test_downloader_reports_progress_callback(tmp_path) -> None:
+    events = []
+    downloader = BiliDownloader(client=FakeClient())
+
+    downloader.download(
+        "BV1xx411c7mD",
+        output_dir=tmp_path,
+        progress_callback=lambda label, written, total, done: events.append(
+            (label, written, total, done)
+        ),
+    )
+
+    assert events
+    assert events[-1] == ("video", 11, None, True)
+
+
 def test_downloader_merges_dash_streams(monkeypatch, tmp_path) -> None:
     client = FakeClient(
         PlayUrl(

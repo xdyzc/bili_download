@@ -9,6 +9,7 @@ dependencies = [
 
 [project.scripts]
 bili-download = "bili_download.cli:main"
+bili-download-gui = "bili_download.gui:main"
 
 [build-system]
 requires = ["setuptools>=68"]

@@ -1,5 +1,7 @@
 import sys
 
+from bili_download.cli import main
+
 
 try:
     sys.stdin.reconfigure(encoding="utf-8")
@@ -7,10 +9,5 @@ try:
     sys.stderr.reconfigure(encoding="utf-8")
 except AttributeError:
     pass
-
-if len(sys.argv) > 1:
-    from bili_download.cli import main
-else:
-    from bili_download.gui import main
 
 raise SystemExit(main())

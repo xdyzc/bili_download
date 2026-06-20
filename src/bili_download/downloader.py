@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import time
+from typing import Callable
 
 from .client import BiliClient
 from .danmaku import parse_danmaku_xml, write_ass
@@ -17,6 +18,7 @@ from .video_id import parse_bili_video_ref
 
 
 CHUNK_SIZE = 1024 * 256
+ProgressCallback = Callable[[str, int, int | None, bool], None]
 
 
 class UnsupportedStreamError(RuntimeError):
@@ -38,6 +40,7 @@ class BiliDownloader:
         progress: bool = False,
         overwrite: bool = False,
         danmaku: bool = False,
+        progress_callback: ProgressCallback | None = None,
     ) -> DownloadResult:
         video_ref = parse_bili_video_ref(url_or_bv)
         video = self.client.get_video_info(video_ref)
@@ -58,6 +61,7 @@ class BiliDownloader:
                 progress=progress,
                 overwrite=overwrite,
                 danmaku=danmaku,
+                progress_callback=progress_callback,
             )
 
         if not play_url.segments:
@@ -86,6 +90,7 @@ class BiliDownloader:
                     total=total,
                     initial=bytes_written,
                     progress=progress,
+                    progress_callback=progress_callback,
                 )
 
         if path.exists() and overwrite:
@@ -102,7 +107,11 @@ class BiliDownloader:
             mode="durl",
         )
         if danmaku:
-            result = self._add_danmaku(result, overwrite=overwrite)
+            result = self._add_danmaku(
+                result,
+                overwrite=overwrite,
+                progress_callback=progress_callback,
+            )
         return result
 
     def _download_dash(
@@ -116,6 +125,7 @@ class BiliDownloader:
         progress: bool,
         overwrite: bool,
         danmaku: bool,
+        progress_callback: ProgressCallback | None,
     ) -> DownloadResult:
         video_stream = _select_dash_video(play_url, requested_quality)
         audio_stream = _select_dash_audio(play_url)
@@ -143,6 +153,7 @@ class BiliDownloader:
                 label=f"video qn={video_stream.id}",
                 total=video_stream.size,
                 progress=progress,
+                progress_callback=progress_callback,
             )
         with audio_part.open("wb") as destination:
             bytes_written += self._write_stream(
@@ -152,9 +163,14 @@ class BiliDownloader:
                 label="audio",
                 total=audio_stream.size,
                 progress=progress,
+                progress_callback=progress_callback,
             )
 
+        if progress_callback:
+            progress_callback("merge", 0, None, False)
         _merge_with_ffmpeg(video_part, audio_part, path, overwrite=overwrite)
+        if progress_callback:
+            progress_callback("merge", 1, 1, True)
         video_part.unlink(missing_ok=True)
         audio_part.unlink(missing_ok=True)
 
@@ -173,6 +189,7 @@ class BiliDownloader:
                 width=video_stream.width,
                 height=video_stream.height,
                 overwrite=overwrite,
+                progress_callback=progress_callback,
             )
         return result
 
@@ -183,6 +200,7 @@ class BiliDownloader:
         width: int | None = None,
         height: int | None = None,
         overwrite: bool,
+        progress_callback: ProgressCallback | None = None,
     ) -> DownloadResult:
         xml_path = result.path.with_name(f"{result.path.stem}.danmaku.xml")
         ass_path = result.path.with_name(f"{result.path.stem}.danmaku.ass")
@@ -211,12 +229,16 @@ class BiliDownloader:
                 danmaku_count=0,
             )
 
+        if progress_callback:
+            progress_callback("danmaku", 0, None, False)
         _burn_ass_with_ffmpeg(
             result.path,
             ass_path,
             video_path,
             overwrite=overwrite,
         )
+        if progress_callback:
+            progress_callback("danmaku", 1, 1, True)
         return replace(
             result,
             danmaku_video_path=video_path,
@@ -235,6 +257,7 @@ class BiliDownloader:
         total: int | None = None,
         initial: int = 0,
         progress: bool,
+        progress_callback: ProgressCallback | None = None,
     ) -> int:
         written = 0
         started = time.monotonic()
@@ -248,8 +271,12 @@ class BiliDownloader:
                 written += len(chunk)
                 if progress:
                     _print_progress(label, initial + written, total, started)
+                if progress_callback:
+                    progress_callback(label, initial + written, total, False)
         if progress:
             _print_progress(label, initial + written, total, started, done=True)
+        if progress_callback:
+            progress_callback(label, initial + written, total, True)
         return written
 
     def get_available_qualities(

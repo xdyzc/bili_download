@@ -604,7 +604,7 @@ test("popup uses page context blob download before fallback", async () => {
 });
 
 
-test("popup uses one native page download when all fetch candidates fail", async () => {
+test("popup reports failure without navigating when all fetch candidates fail", async () => {
   const code = await readFile("extension/src/popup.js", "utf8");
   const runtimeMessages = [];
   const scriptCalls = [];
@@ -747,15 +747,6 @@ test("popup uses one native page download when all fetch candidates fail", async
       scripting: {
         async executeScript(call) {
           scriptCalls.push(call);
-          if (call.func.name === "startNativeDownloadInPage") {
-            return [{
-              result: {
-                ok: true,
-                responseOk: true,
-                filename: call.args[1]
-              }
-            }];
-          }
           return [{
             result: {
               ok: false,
@@ -775,21 +766,24 @@ test("popup uses one native page download when all fetch candidates fail", async
   qualitySelect.value = "64";
   await sandbox.downloadSelectedQuality();
 
-  assert.match(statusElement.textContent, /1$/);
+  assert.match(statusElement.textContent, /Failed to fetch https:\/\/backup\.hdslb\.test\/video\.mp4/);
   assert.equal(
     runtimeMessages.some((message) => message.type === "BILI_DOWNLOAD_START_DIRECT"),
     false
   );
-  assert.equal(scriptCalls.length, 3);
-  assert.equal(scriptCalls[2].func.name, "startNativeDownloadInPage");
-  assert.equal(scriptCalls[2].args[0], "https://primary.hdslb.test/video.mp4");
+  assert.equal(scriptCalls.length, 2);
+  assert.equal(scriptCalls[0].func.name, "downloadMediaInPage");
+  assert.equal(scriptCalls[1].func.name, "downloadMediaInPage");
+  assert.equal(scriptCalls[0].args[0], "https://primary.hdslb.test/video.mp4");
+  assert.equal(scriptCalls[1].args[0], "https://backup.hdslb.test/video.mp4");
   assert.equal(nativeClickCount, 0);
   const savedDiagnostic = runtimeMessages
     .filter((message) => message.type === "BILI_DOWNLOAD_SAVE_DIAGNOSTIC")
     .at(-1).payload;
-  assert.equal(savedDiagnostic.phase, "native-download-started");
+  assert.equal(savedDiagnostic.phase, "page-fetch-message-error");
   assert.equal(savedDiagnostic.candidateAttempts.length, 2);
-  assert.equal(savedDiagnostic.nativeDownload.result.responseOk, true);
+  assert.equal(savedDiagnostic.candidateAttempts[0].fetch.error, "Failed to fetch https://primary.hdslb.test/video.mp4");
+  assert.equal(savedDiagnostic.candidateAttempts[1].fetch.error, "Failed to fetch https://backup.hdslb.test/video.mp4");
 });
 
 

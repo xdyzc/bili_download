@@ -1,15 +1,20 @@
 # Bili Download Browser Extension
 
-This is the first browser-extension prototype for the local Bili Download project.
+This folder contains the pure browser-extension prototype for Bili Download.
 
-## Current Scope
+## Current MVP
 
 - Manifest V3 Chrome/Edge extension.
 - Reads the current Bilibili video page and extracts the BV id.
-- Shows the BV id and page title in the popup.
-- Prepares a call to the local downloader at `http://127.0.0.1:8765/api/downloads`.
+- Fetches video metadata and available qualities from Bilibili web APIs.
+- Starts browser downloads for directly available non-DASH streams.
+- Uses the browser's current Bilibili login state; no local `bili.json` import is needed.
 
-The local HTTP downloader service is the next milestone. Until that service exists, the popup can identify and copy the BV id, while "send to local downloader" will report that the local app is not connected.
+## Current Limits
+
+- DASH video/audio separation is not handled yet.
+- Danmaku download and burning are not handled yet.
+- The extension only downloads content that the current browser session can access.
 
 ## Load Locally
 
@@ -17,7 +22,18 @@ The local HTTP downloader service is the next milestone. Until that service exis
 2. Enable developer mode.
 3. Choose "Load unpacked".
 4. Select this `extension` folder.
+5. Open a Bilibili video page and click the extension icon.
 
-## Planned Bridge
+Downloaded files are placed under the browser downloads folder in a `BiliDownload` subfolder.
 
-The plugin should stay thin. It reads the page context and sends a request to the local Python app, while the local app keeps handling cookies, quality selection, media downloading, ffmpeg merging, and optional danmaku video generation.
+## Verify
+
+Run the extension smoke test from the project root:
+
+```powershell
+& 'C:\Users\36300\.cache\codex-runtimes\codex-primary-runtime\dependencies\node\bin\node.exe' --test extension\tests\smoke.mjs
+```
+
+## Next Milestone
+
+Support DASH by downloading video and audio streams first. After that, evaluate browser-side MP4 muxing.

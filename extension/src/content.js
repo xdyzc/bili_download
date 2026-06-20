@@ -22,7 +22,7 @@ function readTitle() {
     document.querySelector("h1");
 
   const title = titleElement?.textContent?.trim() || document.title;
-  return title.replace(/_哔哩哔哩_bilibili$/, "").trim();
+  return title.replace(/\s*[-_].*bilibili.*$/i, "").trim();
 }
 
 function extractBvid(value) {

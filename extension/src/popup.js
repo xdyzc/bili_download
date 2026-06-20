@@ -1,31 +1,67 @@
+const TEXT = {
+  checking: "\u68c0\u67e5\u5f53\u524d\u9875\u9762...",
+  loading: "\u6b63\u5728\u8bfb\u53d6\u89c6\u9891\u4fe1\u606f...",
+  ready: "\u53ef\u9009\u62e9\u6e05\u6670\u5ea6\u4e0b\u8f7d",
+  copied: "BV \u53f7\u5df2\u590d\u5236",
+  noVideo: "\u5f53\u524d\u9875\u9762\u4e0d\u662f Bilibili \u89c6\u9891\u9875",
+  noQuality: "\u6ca1\u6709\u53ef\u7528\u6e05\u6670\u5ea6",
+  downloading: "\u5df2\u4ea4\u7ed9\u6d4f\u89c8\u5668\u4e0b\u8f7d...",
+  downloadStarted: "\u4e0b\u8f7d\u5df2\u5f00\u59cb",
+  dashOnly: "\u8fd9\u4e2a\u6e05\u6670\u5ea6\u9700\u8981 DASH\uff0c\u4e0b\u4e00\u6b65\u652f\u6301"
+};
+
 const state = {
   tabId: null,
   page: {
     bvid: "",
     title: "",
     url: ""
-  }
+  },
+  video: null,
+  busy: false
 };
 
 const statusElement = document.querySelector("#status");
 const bvidInput = document.querySelector("#bvid");
 const titleInput = document.querySelector("#title");
+const qualitySelect = document.querySelector("#quality");
 const copyButton = document.querySelector("#copy");
-const sendButton = document.querySelector("#send");
+const downloadButton = document.querySelector("#download");
 
 document.addEventListener("DOMContentLoaded", initialize);
 copyButton.addEventListener("click", copyBvid);
-sendButton.addEventListener("click", sendToLocalDownloader);
+downloadButton.addEventListener("click", downloadSelectedQuality);
 
 async function initialize() {
   setBusy(true);
-  setStatus("检查当前页面...");
+  setStatus(TEXT.checking);
 
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     state.tabId = tab?.id || null;
     state.page = await readPage(tab);
+
+    if (!state.page.bvid) {
+      setStatus(TEXT.noVideo);
+      render();
+      return;
+    }
+
+    setStatus(TEXT.loading);
+    const response = await chrome.runtime.sendMessage({
+      type: "BILI_DOWNLOAD_LOAD_VIDEO",
+      payload: state.page
+    });
+
+    if (!response?.ok) {
+      throw new Error(response?.error || "Failed to load video.");
+    }
+
+    state.video = response.payload;
+    state.page.bvid = state.video.bvid;
+    state.page.title = state.video.title;
     render();
+    setStatus(state.video.qualities.length ? TEXT.ready : TEXT.noQuality);
   } catch (error) {
     setStatus(error.message);
     render();
@@ -62,11 +98,23 @@ async function readPage(tab) {
 function render() {
   bvidInput.value = state.page.bvid;
   titleInput.value = state.page.title;
+  renderQualities();
+  updateControls();
+}
 
-  const hasBvid = Boolean(state.page.bvid);
-  copyButton.disabled = !hasBvid;
-  sendButton.disabled = !hasBvid;
-  setStatus(hasBvid ? "已识别当前视频" : "当前页面不是 Bilibili 视频页");
+function renderQualities() {
+  qualitySelect.replaceChildren();
+  const qualities = state.video?.qualities || [];
+
+  for (const quality of qualities) {
+    const option = document.createElement("option");
+    option.value = String(quality.code);
+    option.textContent = quality.label;
+    if (quality.code === state.video.currentQuality) {
+      option.selected = true;
+    }
+    qualitySelect.append(option);
+  }
 }
 
 async function copyBvid() {
@@ -75,36 +123,51 @@ async function copyBvid() {
   }
 
   await navigator.clipboard.writeText(state.page.bvid);
-  setStatus("BV 号已复制");
+  setStatus(TEXT.copied);
 }
 
-async function sendToLocalDownloader() {
-  if (!state.page.bvid) {
+async function downloadSelectedQuality() {
+  if (!state.video || !qualitySelect.value) {
     return;
   }
 
   setBusy(true);
-  setStatus("正在发送...");
+  setStatus(TEXT.downloading);
 
   try {
     const response = await chrome.runtime.sendMessage({
-      type: "BILI_DOWNLOAD_SEND_TO_LOCAL",
-      payload: state.page
+      type: "BILI_DOWNLOAD_START_DIRECT",
+      payload: {
+        bvid: state.video.bvid,
+        cid: state.video.page.cid,
+        quality: Number(qualitySelect.value),
+        title: state.video.title
+      }
     });
+
     if (!response?.ok) {
-      throw new Error(response?.error || "本地下载器没有响应");
+      throw new Error(response?.error || TEXT.dashOnly);
     }
-    setStatus("已发送到本地下载器");
+
+    setStatus(`${TEXT.downloadStarted}: ${response.payload.count}`);
   } catch (error) {
-    setStatus(`本地下载器未连接: ${error.message}`);
+    setStatus(error.message);
   } finally {
     setBusy(false);
   }
 }
 
+function updateControls() {
+  const hasBvid = Boolean(state.page.bvid);
+  const hasQuality = Boolean(state.video?.qualities?.length);
+  copyButton.disabled = state.busy || !hasBvid;
+  downloadButton.disabled = state.busy || !hasBvid || !hasQuality;
+  qualitySelect.disabled = state.busy || !hasQuality;
+}
+
 function setBusy(value) {
-  copyButton.disabled = value || !state.page.bvid;
-  sendButton.disabled = value || !state.page.bvid;
+  state.busy = value;
+  updateControls();
 }
 
 function setStatus(text) {

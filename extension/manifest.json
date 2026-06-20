@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Bili Download",
-  "version": "0.1.0",
-  "description": "Send Bilibili video pages to the local Bili Download app.",
+  "version": "0.2.0",
+  "description": "Download directly available Bilibili video streams from the current page.",
   "action": {
     "default_popup": "src/popup.html",
     "default_title": "Bili Download"
@@ -23,11 +23,15 @@
     }
   ],
   "permissions": [
-    "activeTab"
+    "activeTab",
+    "downloads"
   ],
   "host_permissions": [
+    "https://api.bilibili.com/*",
     "https://www.bilibili.com/*",
     "https://m.bilibili.com/*",
-    "http://127.0.0.1:8765/*"
+    "https://*.bilivideo.com/*",
+    "https://*.bilivideo.cn/*",
+    "https://*.hdslb.com/*"
   ]
 }

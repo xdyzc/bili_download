@@ -65,7 +65,10 @@ test("popup contains MVP controls", async () => {
     "progress-percent",
     "progress-bar",
     "progress-size",
-    "progress-speed"
+    "progress-speed",
+    "download-controls",
+    "pause",
+    "cancel"
   ]) {
     assert.match(html, new RegExp(`id="${id}"`));
   }
@@ -680,7 +683,10 @@ test("popup uses page context blob download before fallback", async () => {
           "#progress-percent": progressPercent,
           "#progress-bar": progressBar,
           "#progress-size": progressSize,
-          "#progress-speed": progressSpeed
+          "#progress-speed": progressSpeed,
+          "#download-controls": panelElement(),
+          "#pause": buttonElement(),
+          "#cancel": buttonElement()
         }[selector];
       }
     },
@@ -949,7 +955,10 @@ test("popup falls back to extension blob without navigating when page fetch fail
           "#progress-percent": progressPercent,
           "#progress-bar": progressBar,
           "#progress-size": progressSize,
-          "#progress-speed": progressSpeed
+          "#progress-speed": progressSpeed,
+          "#download-controls": panelElement(),
+          "#pause": buttonElement(),
+          "#cancel": buttonElement()
         }[selector];
       }
     },
@@ -1196,7 +1205,10 @@ test("popup uses parallel extension range download for bilivideo media", async (
           "#progress-percent": progressPercent,
           "#progress-bar": progressBar,
           "#progress-size": progressSize,
-          "#progress-speed": progressSpeed
+          "#progress-speed": progressSpeed,
+          "#download-controls": panelElement(),
+          "#pause": buttonElement(),
+          "#cancel": buttonElement()
         }[selector];
       }
     },
@@ -1328,6 +1340,473 @@ test("popup uses parallel extension range download for bilivideo media", async (
 });
 
 
+test("popup cancels an active extension download without saving", async () => {
+  const code = await readFile("extension/src/popup.js", "utf8");
+  const runtimeMessages = [];
+  const fetchCalls = [];
+  const statusElement = textElement();
+  const qualitySelect = selectElement();
+  const progressPanel = panelElement();
+  const progressPercent = textElement();
+  const progressBar = styleElement();
+  const progressSize = textElement();
+  const progressSpeed = textElement();
+  const downloadControls = panelElement();
+  const pauseButton = buttonElement();
+  const cancelButton = buttonElement();
+  const savedAnchors = [];
+  let resolveSecondReadReady;
+  const secondReadReady = new Promise((resolve) => {
+    resolveSecondReadReady = resolve;
+  });
+  class TestURL extends URL {
+    static createObjectURL(blob) {
+      return `blob:cancel-test/${blob.size}`;
+    }
+
+    static revokeObjectURL() {}
+  }
+
+  const sandbox = {
+    AbortController,
+    Blob,
+    Date,
+    Error,
+    RegExp,
+    String,
+    URL: TestURL,
+    Uint8Array,
+    console,
+    async fetch(url, options = {}) {
+      fetchCalls.push({ url, signal: options.signal });
+      let readCount = 0;
+      return {
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        headers: {
+          get(name) {
+            if (name.toLowerCase() === "content-length") {
+              return String(1024 * 1024);
+            }
+            if (name.toLowerCase() === "content-type") {
+              return "video/mp4";
+            }
+            return null;
+          }
+        },
+        body: {
+          getReader() {
+            return {
+              read() {
+                readCount += 1;
+                if (readCount === 1) {
+                  return Promise.resolve({
+                    done: false,
+                    value: new Uint8Array(256 * 1024)
+                  });
+                }
+                resolveSecondReadReady();
+                return new Promise((_resolve, reject) => {
+                  options.signal.addEventListener("abort", () => {
+                    const error = new Error("The operation was aborted.");
+                    error.name = "AbortError";
+                    reject(error);
+                  });
+                });
+              }
+            };
+          }
+        }
+      };
+    },
+    navigator: {
+      clipboard: {
+        async writeText() {}
+      }
+    },
+    setTimeout(callback) {
+      callback();
+      return 1;
+    },
+    document: {
+      addEventListener() {},
+      body: {
+        append() {}
+      },
+      createElement(tagName) {
+        if (tagName === "a") {
+          return {
+            href: "",
+            download: "",
+            rel: "",
+            click() {
+              savedAnchors.push({
+                href: this.href,
+                download: this.download,
+                rel: this.rel
+              });
+            },
+            remove() {}
+          };
+        }
+        return optionElement();
+      },
+      querySelector(selector) {
+        return {
+          "#status": statusElement,
+          "#bvid": textElement(),
+          "#title": textElement(),
+          "#quality": qualitySelect,
+          "#copy": buttonElement(),
+          "#download": buttonElement(),
+          "#diagnostic": buttonElement(),
+          "#progress": progressPanel,
+          "#progress-percent": progressPercent,
+          "#progress-bar": progressBar,
+          "#progress-size": progressSize,
+          "#progress-speed": progressSpeed,
+          "#download-controls": downloadControls,
+          "#pause": pauseButton,
+          "#cancel": cancelButton
+        }[selector];
+      }
+    },
+    chrome: {
+      tabs: {
+        async query() {
+          return [{
+            id: 99,
+            url: "https://www.bilibili.com/video/BV1KGj36QEG3/",
+            title: "Smoke Video"
+          }];
+        },
+        async sendMessage() {
+          return {
+            bvid: "BV1KGj36QEG3",
+            title: "Smoke Video",
+            url: "https://www.bilibili.com/video/BV1KGj36QEG3/"
+          };
+        }
+      },
+      runtime: {
+        connect() {
+          return {
+            onMessage: {
+              addListener() {}
+            }
+          };
+        },
+        async sendMessage(message) {
+          runtimeMessages.push(message);
+          if (message.type === "BILI_DOWNLOAD_GET_DIAGNOSTIC") {
+            return { ok: true, payload: null };
+          }
+          if (message.type === "BILI_DOWNLOAD_LOAD_VIDEO") {
+            return {
+              ok: true,
+              payload: {
+                bvid: "BV1KGj36QEG3",
+                title: "Smoke Video",
+                page: { cid: 123 },
+                currentQuality: 64,
+                qualities: [{ code: 64, label: "64 - 720P" }]
+              }
+            };
+          }
+          if (message.type === "BILI_DOWNLOAD_PREPARE_DIRECT") {
+            return {
+              ok: true,
+              payload: {
+                count: 1,
+                segments: [{
+                  url: "https://primary.bilivideo.com/video.mp4",
+                  filename: "BiliDownload/Smoke Video_64.mp4",
+                  size: 1024 * 1024,
+                  candidates: [{ url: "https://primary.bilivideo.com/video.mp4", kind: "primary", size: 1024 * 1024 }],
+                  context: {
+                    bvid: "BV1KGj36QEG3",
+                    cid: 123,
+                    quality: 64,
+                    title: "Smoke Video",
+                    segmentIndex: 1,
+                    segmentCount: 1,
+                    format: "mp4",
+                    downloadMethod: "extension-blob"
+                  }
+                }]
+              }
+            };
+          }
+          if (message.type === "BILI_DOWNLOAD_SAVE_DIAGNOSTIC") {
+            return { ok: true };
+          }
+          throw new Error(`unexpected runtime message: ${message.type}`);
+        }
+      },
+      scripting: {
+        async executeScript() {
+          return [];
+        }
+      }
+    }
+  };
+
+  vm.createContext(sandbox);
+  vm.runInContext(code, sandbox);
+
+  await sandbox.initialize();
+  qualitySelect.value = "64";
+  const downloadPromise = sandbox.downloadSelectedQuality();
+  await secondReadReady;
+
+  assert.equal(downloadControls.hidden, false);
+  sandbox.cancelDownload();
+  await downloadPromise;
+
+  assert.equal(statusElement.textContent, "\u5df2\u53d6\u6d88\u4e0b\u8f7d");
+  assert.equal(downloadControls.hidden, true);
+  assert.equal(savedAnchors.length, 0);
+  assert.equal(fetchCalls.length, 1);
+  assert.equal(fetchCalls[0].signal.aborted, true);
+});
+
+
+test("popup pauses and resumes an active extension download", async () => {
+  const code = await readFile("extension/src/popup.js", "utf8");
+  const runtimeMessages = [];
+  const statusElement = textElement();
+  const qualitySelect = selectElement();
+  const progressPanel = panelElement();
+  const progressPercent = textElement();
+  const progressBar = styleElement();
+  const progressSize = textElement();
+  const progressSpeed = textElement();
+  const downloadControls = panelElement();
+  const pauseButton = buttonElement();
+  const cancelButton = buttonElement();
+  const savedAnchors = [];
+  let readCount = 0;
+  let resolveFirstReadRequested;
+  let resolveFirstChunk;
+  const firstReadRequested = new Promise((resolve) => {
+    resolveFirstReadRequested = resolve;
+  });
+  const firstChunk = new Promise((resolve) => {
+    resolveFirstChunk = resolve;
+  });
+  class TestURL extends URL {
+    static createObjectURL(blob) {
+      return `blob:pause-test/${blob.size}`;
+    }
+
+    static revokeObjectURL() {}
+  }
+
+  const sandbox = {
+    AbortController,
+    Blob,
+    Date,
+    Error,
+    RegExp,
+    String,
+    URL: TestURL,
+    Uint8Array,
+    console,
+    async fetch() {
+      return {
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        headers: {
+          get(name) {
+            if (name.toLowerCase() === "content-length") {
+              return String(256 * 1024);
+            }
+            if (name.toLowerCase() === "content-type") {
+              return "video/mp4";
+            }
+            return null;
+          }
+        },
+        body: {
+          getReader() {
+            return {
+              async read() {
+                readCount += 1;
+                if (readCount === 1) {
+                  resolveFirstReadRequested();
+                  await firstChunk;
+                  return {
+                    done: false,
+                    value: new Uint8Array(256 * 1024)
+                  };
+                }
+                return { done: true };
+              }
+            };
+          }
+        }
+      };
+    },
+    navigator: {
+      clipboard: {
+        async writeText() {}
+      }
+    },
+    setTimeout(callback) {
+      callback();
+      return 1;
+    },
+    document: {
+      addEventListener() {},
+      body: {
+        append() {}
+      },
+      createElement(tagName) {
+        if (tagName === "a") {
+          return {
+            href: "",
+            download: "",
+            rel: "",
+            click() {
+              savedAnchors.push({
+                href: this.href,
+                download: this.download,
+                rel: this.rel
+              });
+            },
+            remove() {}
+          };
+        }
+        return optionElement();
+      },
+      querySelector(selector) {
+        return {
+          "#status": statusElement,
+          "#bvid": textElement(),
+          "#title": textElement(),
+          "#quality": qualitySelect,
+          "#copy": buttonElement(),
+          "#download": buttonElement(),
+          "#diagnostic": buttonElement(),
+          "#progress": progressPanel,
+          "#progress-percent": progressPercent,
+          "#progress-bar": progressBar,
+          "#progress-size": progressSize,
+          "#progress-speed": progressSpeed,
+          "#download-controls": downloadControls,
+          "#pause": pauseButton,
+          "#cancel": cancelButton
+        }[selector];
+      }
+    },
+    chrome: {
+      tabs: {
+        async query() {
+          return [{
+            id: 99,
+            url: "https://www.bilibili.com/video/BV1KGj36QEG3/",
+            title: "Smoke Video"
+          }];
+        },
+        async sendMessage() {
+          return {
+            bvid: "BV1KGj36QEG3",
+            title: "Smoke Video",
+            url: "https://www.bilibili.com/video/BV1KGj36QEG3/"
+          };
+        }
+      },
+      runtime: {
+        connect() {
+          return {
+            onMessage: {
+              addListener() {}
+            }
+          };
+        },
+        async sendMessage(message) {
+          runtimeMessages.push(message);
+          if (message.type === "BILI_DOWNLOAD_GET_DIAGNOSTIC") {
+            return { ok: true, payload: null };
+          }
+          if (message.type === "BILI_DOWNLOAD_LOAD_VIDEO") {
+            return {
+              ok: true,
+              payload: {
+                bvid: "BV1KGj36QEG3",
+                title: "Smoke Video",
+                page: { cid: 123 },
+                currentQuality: 64,
+                qualities: [{ code: 64, label: "64 - 720P" }]
+              }
+            };
+          }
+          if (message.type === "BILI_DOWNLOAD_PREPARE_DIRECT") {
+            return {
+              ok: true,
+              payload: {
+                count: 1,
+                segments: [{
+                  url: "https://primary.bilivideo.com/video.mp4",
+                  filename: "BiliDownload/Smoke Video_64.mp4",
+                  size: 256 * 1024,
+                  candidates: [{ url: "https://primary.bilivideo.com/video.mp4", kind: "primary", size: 256 * 1024 }],
+                  context: {
+                    bvid: "BV1KGj36QEG3",
+                    cid: 123,
+                    quality: 64,
+                    title: "Smoke Video",
+                    segmentIndex: 1,
+                    segmentCount: 1,
+                    format: "mp4",
+                    downloadMethod: "extension-blob"
+                  }
+                }]
+              }
+            };
+          }
+          if (message.type === "BILI_DOWNLOAD_SAVE_DIAGNOSTIC") {
+            return { ok: true };
+          }
+          throw new Error(`unexpected runtime message: ${message.type}`);
+        }
+      },
+      scripting: {
+        async executeScript() {
+          return [];
+        }
+      }
+    }
+  };
+
+  vm.createContext(sandbox);
+  vm.runInContext(code, sandbox);
+
+  await sandbox.initialize();
+  qualitySelect.value = "64";
+  const downloadPromise = sandbox.downloadSelectedQuality();
+  await firstReadRequested;
+
+  sandbox.togglePauseDownload();
+  assert.equal(statusElement.textContent, "\u5df2\u6682\u505c\u4e0b\u8f7d");
+  assert.equal(pauseButton.textContent, "\u7ee7\u7eed");
+  resolveFirstChunk();
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(readCount, 1);
+
+  sandbox.togglePauseDownload();
+  await downloadPromise;
+
+  assert.equal(savedAnchors.length, 1);
+  assert.equal(savedAnchors[0].download, "Smoke Video_64.mp4");
+  assert.equal(progressPercent.textContent, "100%");
+  assert.equal(downloadControls.hidden, true);
+});
+
+
 test("popup muxes DASH segments into one MP4 download", async () => {
   const code = await readFile("extension/src/popup.js", "utf8");
   const runtimeMessages = [];
@@ -1431,7 +1910,10 @@ test("popup muxes DASH segments into one MP4 download", async () => {
           "#progress-percent": progressPercent,
           "#progress-bar": progressBar,
           "#progress-size": progressSize,
-          "#progress-speed": progressSpeed
+          "#progress-speed": progressSpeed,
+          "#download-controls": panelElement(),
+          "#pause": buttonElement(),
+          "#cancel": buttonElement()
         }[selector];
       }
     },

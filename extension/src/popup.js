@@ -10,11 +10,16 @@ const TEXT = {
   downloadStarted: "\u4e0b\u8f7d\u5df2\u5f00\u59cb",
   dashMuxed: "DASH \u5df2\u5408\u5e76\u4e3a MP4",
   diagnosticCopied: "\u8bca\u65ad\u4fe1\u606f\u5df2\u590d\u5236",
-  noDiagnostic: "\u6682\u65e0\u8bca\u65ad\u4fe1\u606f"
+  noDiagnostic: "\u6682\u65e0\u8bca\u65ad\u4fe1\u606f",
+  paused: "\u5df2\u6682\u505c\u4e0b\u8f7d",
+  resumed: "\u7ee7\u7eed\u4e0b\u8f7d...",
+  canceling: "\u6b63\u5728\u53d6\u6d88\u4e0b\u8f7d...",
+  canceled: "\u5df2\u53d6\u6d88\u4e0b\u8f7d"
 };
 
 const PROGRESS_MESSAGE_TYPE = "BILI_DOWNLOAD_PAGE_PROGRESS";
 const PROGRESS_PORT_NAME = "BILI_DOWNLOAD_PROGRESS_PORT";
+const PAGE_DOWNLOAD_CONTROL_EVENT = "bili-download-control";
 const PARALLEL_RANGE_MIN_BYTES = 8 * 1024 * 1024;
 const PARALLEL_RANGE_CHUNK_BYTES = 4 * 1024 * 1024;
 const PARALLEL_RANGE_CONCURRENCY = 4;
@@ -42,7 +47,8 @@ const state = {
     candidateIndex: 0,
     candidateCount: 0
   },
-  busy: false
+  busy: false,
+  downloadControl: null
 };
 
 const statusElement = document.querySelector("#status");
@@ -58,11 +64,16 @@ const progressPercent = document.querySelector("#progress-percent");
 const progressBar = document.querySelector("#progress-bar");
 const progressSize = document.querySelector("#progress-size");
 const progressSpeed = document.querySelector("#progress-speed");
+const downloadControls = document.querySelector("#download-controls");
+const pauseButton = document.querySelector("#pause");
+const cancelButton = document.querySelector("#cancel");
 
 document.addEventListener("DOMContentLoaded", initialize);
 copyButton.addEventListener("click", copyBvid);
 downloadButton.addEventListener("click", downloadSelectedQuality);
 diagnosticButton.addEventListener("click", copyDiagnostic);
+pauseButton?.addEventListener("click", togglePauseDownload);
+cancelButton?.addEventListener("click", cancelDownload);
 const progressPort = chrome.runtime.connect({ name: PROGRESS_PORT_NAME });
 progressPort.onMessage.addListener((message) => {
   if (message?.type !== PROGRESS_MESSAGE_TYPE) {
@@ -198,6 +209,8 @@ async function downloadSelectedQuality() {
     return;
   }
 
+  const control = createDownloadControl();
+  state.downloadControl = control;
   setBusy(true);
   resetProgress();
   setStatus(TEXT.downloading);
@@ -223,6 +236,8 @@ async function downloadSelectedQuality() {
     } else {
       const diagnostics = [];
       for (const [index, segment] of prepared.payload.segments.entries()) {
+        await waitForDownloadControl();
+        throwIfDownloadCanceled();
         const role = segment.context?.roleLabel || segment.context?.role || "";
         const suffix = role ? ` ${index + 1}/${prepared.payload.count} ${role}` : ` ${index + 1}/${prepared.payload.count}`;
         setStatus(`${TEXT.downloading}${suffix}`);
@@ -234,12 +249,19 @@ async function downloadSelectedQuality() {
       await saveDiagnostic(state.lastDiagnostic);
     }
   } catch (error) {
+    if (isDownloadCanceledError(error)) {
+      setStatus(TEXT.canceled);
+      return;
+    }
     if (error.diagnostic) {
       state.lastDiagnostic = error.diagnostic;
       await saveDiagnostic(error.diagnostic);
     }
     setStatus(error.message);
   } finally {
+    if (state.downloadControl === control) {
+      state.downloadControl = null;
+    }
     setBusy(false);
   }
 }
@@ -247,6 +269,8 @@ async function downloadSelectedQuality() {
 async function downloadDashAsMp4(prepared) {
   const downloads = [];
   for (const [index, segment] of prepared.segments.entries()) {
+    await waitForDownloadControl();
+    throwIfDownloadCanceled();
     const role = segment.context?.roleLabel || segment.context?.role || "";
     const suffix = role ? ` ${index + 1}/${prepared.count} ${role}` : ` ${index + 1}/${prepared.count}`;
     setStatus(`${TEXT.downloading}${suffix}`);
@@ -266,6 +290,8 @@ async function downloadDashAsMp4(prepared) {
     throw new Error("DASH video or audio data was not downloaded.");
   }
 
+  await waitForDownloadControl();
+  throwIfDownloadCanceled();
   setStatus(TEXT.muxing);
   beginMuxProgress(video.blob.size + audio.blob.size);
   try {
@@ -275,6 +301,8 @@ async function downloadDashAsMp4(prepared) {
       audioBlob: audio.blob,
       outputName: dashOutputFilename(prepared)
     });
+    await waitForDownloadControl();
+    throwIfDownloadCanceled();
     const downloadFilename = filenameForPageDownload(merged.filename);
     saveBlob(merged.blob, downloadFilename);
     completeProgress({
@@ -287,6 +315,9 @@ async function downloadDashAsMp4(prepared) {
     await saveDiagnostic(diagnostic);
     setStatus(`${TEXT.dashMuxed}: ${downloadFilename}`);
   } catch (error) {
+    if (isDownloadCanceledError(error)) {
+      throw error;
+    }
     const diagnostic = createMuxDiagnostic(prepared, downloads, null, error);
     state.lastDiagnostic = diagnostic;
     await saveDiagnostic(diagnostic);
@@ -303,6 +334,9 @@ async function downloadSegment(segment, options = {}) {
     try {
       return await downloadViaExtensionBlob(segment, diagnostic, null, downloadOptions);
     } catch (error) {
+      if (isDownloadCanceledError(error)) {
+        throw error;
+      }
       return downloadViaPageBlob(segment, diagnostic, error, downloadOptions);
     }
   }
@@ -310,6 +344,9 @@ async function downloadSegment(segment, options = {}) {
   try {
     return await downloadViaPageBlob(segment, diagnostic, null, downloadOptions);
   } catch (error) {
+    if (isDownloadCanceledError(error)) {
+      throw error;
+    }
     return downloadViaExtensionBlob(segment, diagnostic, error, downloadOptions);
   }
 }
@@ -319,6 +356,8 @@ async function downloadViaPageBlob(segment, diagnostic = createPageDiagnostic(se
   let lastError = previousError;
 
   for (const [index, candidate] of candidates.entries()) {
+    await waitForDownloadControl();
+    throwIfDownloadCanceled();
     diagnostic.phase = "fetching-page-blob";
     diagnostic.context = {
       ...segment.context,
@@ -355,11 +394,14 @@ async function downloadViaPageBlob(segment, diagnostic = createPageDiagnostic(se
             candidateIndex: index + 1,
             candidateCount: candidates.length,
             totalBytes: candidate.size || segment.size || 0
-          }
+          },
+          PAGE_DOWNLOAD_CONTROL_EVENT,
+          currentDownloadControlState()
         ]
       });
 
       const result = injection?.result;
+      throwIfDownloadCanceled();
       const attempt = {
         at: new Date().toISOString(),
         candidateIndex: index + 1,
@@ -374,6 +416,9 @@ async function downloadViaPageBlob(segment, diagnostic = createPageDiagnostic(se
       diagnostic.fetch = attempt.fetch;
 
       if (!result?.ok) {
+        if (state.downloadControl?.canceled) {
+          throw downloadCanceledError();
+        }
         diagnostic.phase = "page-fetch-message-error";
         diagnostic.error = result?.error || "Page fetch failed.";
         lastError = diagnosticError(diagnostic.error, diagnostic);
@@ -406,6 +451,9 @@ async function downloadViaPageBlob(segment, diagnostic = createPageDiagnostic(se
       await saveDiagnostic(diagnostic);
       return diagnostic;
     } catch (error) {
+      if (isDownloadCanceledError(error)) {
+        throw error;
+      }
       if (error.diagnostic) {
         lastError = error;
         continue;
@@ -436,6 +484,8 @@ async function downloadViaExtensionBlob(segment, diagnostic, previousError, opti
   let lastError = previousError;
 
   for (const [index, candidate] of candidates.entries()) {
+    await waitForDownloadControl();
+    throwIfDownloadCanceled();
     diagnostic.phase = "fetching-extension-blob";
     diagnostic.context = {
       ...segment.context,
@@ -515,6 +565,9 @@ async function downloadViaExtensionBlob(segment, diagnostic, previousError, opti
       await saveDiagnostic(diagnostic);
       return diagnostic;
     } catch (error) {
+      if (isDownloadCanceledError(error)) {
+        throw error;
+      }
       diagnostic.phase = "extension-blob-error";
       diagnostic.error = error.message;
       diagnostic.extensionCandidateAttempts.push({
@@ -696,6 +749,132 @@ function diagnosticError(message, diagnostic) {
   return error;
 }
 
+function createDownloadControl() {
+  return {
+    paused: false,
+    canceled: false,
+    abortControllers: new Set(),
+    waiters: []
+  };
+}
+
+function togglePauseDownload() {
+  const control = state.downloadControl;
+  if (!control || control.canceled) {
+    return;
+  }
+
+  control.paused = !control.paused;
+  if (control.paused) {
+    setStatus(TEXT.paused);
+  } else {
+    setStatus(TEXT.resumed);
+    resumeDownloadWaiters(control);
+  }
+  notifyPageDownloadControl();
+  renderDownloadControls();
+}
+
+function cancelDownload() {
+  const control = state.downloadControl;
+  if (!control || control.canceled) {
+    return;
+  }
+
+  control.canceled = true;
+  control.paused = false;
+  setStatus(TEXT.canceling);
+  for (const abortController of control.abortControllers) {
+    abortController.abort();
+  }
+  resumeDownloadWaiters(control);
+  notifyPageDownloadControl();
+  renderDownloadControls();
+}
+
+function resumeDownloadWaiters(control) {
+  const waiters = control.waiters.splice(0);
+  for (const resolve of waiters) {
+    resolve();
+  }
+}
+
+async function waitForDownloadControl() {
+  const control = state.downloadControl;
+  if (!control) {
+    return;
+  }
+
+  while (control.paused && !control.canceled) {
+    await new Promise((resolve) => control.waiters.push(resolve));
+  }
+  throwIfDownloadCanceled();
+}
+
+function throwIfDownloadCanceled() {
+  if (state.downloadControl?.canceled) {
+    throw downloadCanceledError();
+  }
+}
+
+function downloadCanceledError() {
+  const error = new Error(TEXT.canceled);
+  error.name = "DownloadCanceledError";
+  return error;
+}
+
+function isDownloadCanceledError(error) {
+  return error?.name === "DownloadCanceledError" ||
+    (state.downloadControl?.canceled && error?.name === "AbortError");
+}
+
+function getDownloadAbortSignal() {
+  const control = state.downloadControl;
+  if (!control || typeof AbortController === "undefined") {
+    return undefined;
+  }
+
+  const abortController = new AbortController();
+  control.abortControllers.add(abortController);
+  if (control.canceled) {
+    abortController.abort();
+  }
+  return abortController.signal;
+}
+
+function notifyPageDownloadControl() {
+  if (!state.tabId || !state.downloadControl) {
+    return;
+  }
+
+  try {
+    const promise = chrome.scripting.executeScript({
+      target: {
+        tabId: state.tabId
+      },
+      world: "MAIN",
+      func: dispatchPageDownloadControl,
+      args: [
+        PAGE_DOWNLOAD_CONTROL_EVENT,
+        {
+          paused: state.downloadControl.paused,
+          canceled: state.downloadControl.canceled
+        }
+      ]
+    });
+    promise?.catch?.(() => {});
+  } catch (_error) {
+    // Page-context controls are best-effort; extension fetches remain controlled.
+  }
+}
+
+function currentDownloadControlState() {
+  return {
+    paused: Boolean(state.downloadControl?.paused),
+    canceled: Boolean(state.downloadControl?.canceled)
+  };
+}
+
 function summarizeUrl(value) {
   if (!value) {
     return "";
@@ -757,7 +936,39 @@ function isExtensionFetchPreferred(value) {
   }
 }
 
-async function downloadMediaInPage(url, filename, saveToDisk, progressContext) {
+async function downloadMediaInPage(url, filename, saveToDisk, progressContext, controlEventName, initialControlState = null) {
+  const control = {
+    paused: Boolean(initialControlState?.paused),
+    canceled: Boolean(initialControlState?.canceled),
+    waiters: [],
+    abortController: new AbortController()
+  };
+  if (control.canceled) {
+    control.abortController.abort();
+  }
+  const onControl = (event) => {
+    control.paused = Boolean(event.detail?.paused);
+    if (event.detail?.canceled) {
+      control.canceled = true;
+      control.paused = false;
+      control.abortController.abort();
+    }
+    const waiters = control.waiters.splice(0);
+    for (const resolve of waiters) {
+      resolve();
+    }
+  };
+  window.addEventListener(controlEventName, onControl);
+  const waitForControl = async () => {
+    while (control.paused && !control.canceled) {
+      await new Promise((resolve) => control.waiters.push(resolve));
+    }
+    if (control.canceled) {
+      const error = new Error("\u5df2\u53d6\u6d88\u4e0b\u8f7d");
+      error.name = "DownloadCanceledError";
+      throw error;
+    }
+  };
   const sendProgress = (payload) => {
     try {
       window.dispatchEvent(new CustomEvent("bili-download-progress", {
@@ -769,11 +980,13 @@ async function downloadMediaInPage(url, filename, saveToDisk, progressContext) {
   };
 
   try {
+    await waitForControl();
     const response = await fetch(url, {
       credentials: "include",
       referrer: location.href,
       referrerPolicy: "strict-origin-when-cross-origin",
-      cache: "no-store"
+      cache: "no-store",
+      signal: control.abortController.signal
     });
     const contentLength = Number(response.headers.get("content-length")) || 0;
 
@@ -800,6 +1013,7 @@ async function downloadMediaInPage(url, filename, saveToDisk, progressContext) {
     if (!reader) {
       const body = await response.blob();
       receivedBytes = body.size;
+      await waitForControl();
       sendProgress({
         ...progressContext,
         receivedBytes,
@@ -809,10 +1023,12 @@ async function downloadMediaInPage(url, filename, saveToDisk, progressContext) {
       chunks.push(body);
     } else {
       while (true) {
+        await waitForControl();
         const { done, value } = await reader.read();
         if (done) {
           break;
         }
+        await waitForControl();
 
         chunks.push(value);
         receivedBytes += value.byteLength;
@@ -829,6 +1045,7 @@ async function downloadMediaInPage(url, filename, saveToDisk, progressContext) {
       }
     }
 
+    await waitForControl();
     sendProgress({
       ...progressContext,
       receivedBytes,
@@ -877,7 +1094,15 @@ async function downloadMediaInPage(url, filename, saveToDisk, progressContext) {
       filename,
       mode: "page-blob"
     };
+  } finally {
+    window.removeEventListener(controlEventName, onControl);
   }
+}
+
+function dispatchPageDownloadControl(controlEventName, detail) {
+  window.dispatchEvent(new CustomEvent(controlEventName, {
+    detail
+  }));
 }
 
 async function fetchMediaInExtension(url, filename, saveToDisk, progressContext) {
@@ -903,12 +1128,14 @@ async function fetchMediaInExtension(url, filename, saveToDisk, progressContext)
 
 async function fetchMediaInExtensionSingle(url, filename, saveToDisk, progressContext) {
   try {
+    await waitForDownloadControl();
     const response = await fetch(url, {
       credentials: "include",
       headers: {
         "Accept": "video/*,*/*;q=0.8"
       },
-      cache: "no-store"
+      cache: "no-store",
+      signal: getDownloadAbortSignal()
     });
     const contentLength = Number(response.headers.get("content-length")) ||
       Number(progressContext?.totalBytes) ||
@@ -937,6 +1164,7 @@ async function fetchMediaInExtensionSingle(url, filename, saveToDisk, progressCo
     if (!reader) {
       const body = await response.blob();
       receivedBytes = body.size;
+      await waitForDownloadControl();
       updateProgress({
         ...progressContext,
         receivedBytes,
@@ -946,10 +1174,12 @@ async function fetchMediaInExtensionSingle(url, filename, saveToDisk, progressCo
       chunks.push(body);
     } else {
       while (true) {
+        await waitForDownloadControl();
         const { done, value } = await reader.read();
         if (done) {
           break;
         }
+        await waitForDownloadControl();
 
         chunks.push(value);
         receivedBytes += value.byteLength;
@@ -966,6 +1196,7 @@ async function fetchMediaInExtensionSingle(url, filename, saveToDisk, progressCo
       }
     }
 
+    await waitForDownloadControl();
     updateProgress({
       ...progressContext,
       receivedBytes,
@@ -997,6 +1228,9 @@ async function fetchMediaInExtensionSingle(url, filename, saveToDisk, progressCo
       blob: saveToDisk === false ? body : null
     };
   } catch (error) {
+    if (state.downloadControl?.canceled || error.name === "AbortError" || error.name === "DownloadCanceledError") {
+      throw downloadCanceledError();
+    }
     return {
       ok: false,
       error: error.message,
@@ -1030,6 +1264,8 @@ async function fetchMediaInExtensionRanges(url, filename, saveToDisk, progressCo
     let nextIndex = 0;
     const worker = async () => {
       while (nextIndex < ranges.length) {
+        await waitForDownloadControl();
+        throwIfDownloadCanceled();
         const rangeIndex = nextIndex;
         nextIndex += 1;
         chunks[rangeIndex] = await fetchRangeChunk(url, ranges[rangeIndex], (loadedBytes) => {
@@ -1043,6 +1279,7 @@ async function fetchMediaInExtensionRanges(url, filename, saveToDisk, progressCo
 
     const workerCount = Math.min(PARALLEL_RANGE_CONCURRENCY, ranges.length);
     await Promise.all(Array.from({ length: workerCount }, () => worker()));
+    await waitForDownloadControl();
     updateProgress({
       ...progressContext,
       receivedBytes: totalBytes,
@@ -1073,6 +1310,9 @@ async function fetchMediaInExtensionRanges(url, filename, saveToDisk, progressCo
       blob: saveToDisk === false ? body : null
     };
   } catch (error) {
+    if (state.downloadControl?.canceled || error.name === "AbortError" || error.name === "DownloadCanceledError") {
+      throw downloadCanceledError();
+    }
     return {
       ok: false,
       error: error.message,
@@ -1083,13 +1323,15 @@ async function fetchMediaInExtensionRanges(url, filename, saveToDisk, progressCo
 }
 
 async function fetchRangeChunk(url, range, onProgress) {
+  await waitForDownloadControl();
   const response = await fetch(url, {
     credentials: "include",
     headers: {
       "Accept": "video/*,*/*;q=0.8",
       "Range": `bytes=${range.start}-${range.end}`
     },
-    cache: "no-store"
+    cache: "no-store",
+    signal: getDownloadAbortSignal()
   });
 
   if (response.status !== 206) {
@@ -1099,6 +1341,7 @@ async function fetchRangeChunk(url, range, onProgress) {
   const reader = response.body?.getReader();
   if (!reader) {
     const body = await response.blob();
+    await waitForDownloadControl();
     onProgress(body.size);
     return body;
   }
@@ -1106,10 +1349,12 @@ async function fetchRangeChunk(url, range, onProgress) {
   const chunks = [];
   let receivedBytes = 0;
   while (true) {
+    await waitForDownloadControl();
     const { done, value } = await reader.read();
     if (done) {
       break;
     }
+    await waitForDownloadControl();
 
     chunks.push(value);
     receivedBytes += value.byteLength;
@@ -1247,9 +1492,26 @@ function renderProgress() {
   progressSize.textContent = `${formatBytes(state.progress.receivedBytes)} / ${
     state.progress.totalBytes ? formatBytes(state.progress.totalBytes) : "--"
   }`;
-  progressSpeed.textContent = state.progress.speedBytesPerSecond
+  progressSpeed.textContent = state.downloadControl?.paused
+    ? "--/s"
+    : state.progress.speedBytesPerSecond
     ? `${formatBytes(state.progress.speedBytesPerSecond)}/s`
     : "--/s";
+}
+
+function renderDownloadControls() {
+  const control = state.downloadControl;
+  const visible = Boolean(state.busy && control);
+  if (downloadControls) {
+    downloadControls.hidden = !visible;
+  }
+  if (pauseButton) {
+    pauseButton.disabled = !visible || control?.canceled;
+    pauseButton.textContent = visible && control?.paused ? "\u7ee7\u7eed" : "\u6682\u505c";
+  }
+  if (cancelButton) {
+    cancelButton.disabled = !visible || control?.canceled;
+  }
 }
 
 function formatBytes(bytes) {
@@ -1277,6 +1539,7 @@ function updateControls() {
   downloadButton.disabled = state.busy || !hasBvid || !hasQuality;
   qualitySelect.disabled = state.busy || !hasQuality;
   diagnosticButton.disabled = state.busy || !state.lastDiagnostic;
+  renderDownloadControls();
 }
 
 function setBusy(value) {

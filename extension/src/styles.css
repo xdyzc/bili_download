@@ -195,6 +195,26 @@ select:disabled {
   font-variant-numeric: tabular-nums;
 }
 
+.progress-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.progress-actions button {
+  height: 32px;
+  font-size: 12px;
+}
+
+.progress-actions .danger {
+  color: #a3382d;
+}
+
+.progress-actions .danger:hover:not(:disabled) {
+  border-color: #a3382d;
+}
+
 .note {
   margin-top: 10px;
   font-size: 12px;

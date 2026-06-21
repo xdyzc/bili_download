@@ -150,8 +150,14 @@ async function loadVideo(page) {
     bvid,
     cid: videoPage.cid
   });
+  const availability = await buildQualityAvailability({
+    bvid,
+    cid: videoPage.cid,
+    playUrl,
+    account
+  });
 
-  const qualities = buildQualityOptions(playUrl);
+  const qualities = buildQualityOptions(playUrl, availability);
   return {
     bvid,
     aid: info.aid,
@@ -163,9 +169,9 @@ async function loadVideo(page) {
       title: videoPage.part || ""
     },
     account,
-    currentQuality: playUrl.quality || null,
-    directAvailable: Array.isArray(playUrl.durl) && playUrl.durl.length > 0,
-    dashAvailable: playUrl.dashVideos.length > 0,
+    currentQuality: selectDefaultQuality(qualities, playUrl.quality),
+    directAvailable: qualities.some((quality) => quality.available && quality.mode === "direct"),
+    dashAvailable: qualities.some((quality) => quality.available && quality.mode === "dash"),
     qualities
   };
 }
@@ -264,7 +270,6 @@ async function prepareDirectDownload(payload) {
   }
 
   const playUrl = await fetchPlayUrl({ bvid, cid, quality });
-  const directSegments = buildDirectSegmentPlans(playUrl);
 
   if (hasDashQuality(playUrl, quality)) {
     return prepareDashSegments({
@@ -276,11 +281,12 @@ async function prepareDirectDownload(payload) {
     });
   }
 
-  if (directSegments.length) {
+  if (hasExactDirectQuality(playUrl, quality)) {
+    const directSegments = buildDirectSegmentPlans(playUrl);
     return prepareDurlSegments({
       bvid,
       cid,
-      quality: responseQuality(playUrl, quality),
+      quality: responseQuality(playUrl) || quality,
       title,
       playUrl,
       segments: directSegments
@@ -288,19 +294,19 @@ async function prepareDirectDownload(payload) {
   }
 
   const directPlayUrl = await fetchPlayUrl({ bvid, cid, quality, fnval: 0 });
-  const legacyDirectSegments = buildDirectSegmentPlans(directPlayUrl);
-  if (legacyDirectSegments.length) {
+  if (hasExactDirectQuality(directPlayUrl, quality)) {
+    const legacyDirectSegments = buildDirectSegmentPlans(directPlayUrl);
     return prepareDurlSegments({
       bvid,
       cid,
-      quality: responseQuality(directPlayUrl, quality),
+      quality: responseQuality(directPlayUrl) || quality,
       title,
       playUrl: directPlayUrl,
       segments: legacyDirectSegments
     });
   }
 
-  throw new Error("Bilibili did not return a downloadable direct or DASH stream.");
+  throw unavailableQualityError(quality);
 }
 
 function buildDirectSegmentPlans(playUrl) {
@@ -511,7 +517,68 @@ function expectData(payload) {
   return payload.data;
 }
 
-function buildQualityOptions(playUrl) {
+async function buildQualityAvailability({ bvid, cid, playUrl, account }) {
+  const availability = new Map();
+  const requestedCodes = Array.isArray(playUrl.accept_quality) ? playUrl.accept_quality : [];
+
+  for (const stream of playUrl.dashVideos || []) {
+    markQualityAvailable(availability, stream.id, "dash");
+  }
+
+  if (hasDirectStreams(playUrl)) {
+    markQualityAvailable(availability, responseQuality(playUrl), "direct");
+  }
+
+  const missingCodes = requestedCodes
+    .map((code) => Number(code))
+    .filter((code) => Number.isFinite(code) && !availability.get(code)?.available);
+  await Promise.all(missingCodes.map(async (code) => {
+    try {
+      const directPlayUrl = await fetchPlayUrl({ bvid, cid, quality: code, fnval: 0 });
+      if (hasExactDirectQuality(directPlayUrl, code)) {
+        markQualityAvailable(availability, code, "direct");
+      }
+    } catch (_error) {
+      // The DASH response still gives us the advertised list; legacy direct probing is best effort.
+    }
+  }));
+
+  for (const code of requestedCodes) {
+    const numericCode = Number(code);
+    if (!Number.isFinite(numericCode) || availability.has(numericCode)) {
+      continue;
+    }
+    availability.set(numericCode, unavailableQualityInfo(account));
+  }
+
+  return availability;
+}
+
+function markQualityAvailable(availability, code, mode) {
+  const numericCode = Number(code);
+  if (!Number.isFinite(numericCode) || numericCode <= 0) {
+    return;
+  }
+  const current = availability.get(numericCode);
+  if (current?.mode === "dash") {
+    return;
+  }
+  availability.set(numericCode, {
+    available: true,
+    mode,
+    reason: ""
+  });
+}
+
+function unavailableQualityInfo(account) {
+  return {
+    available: false,
+    mode: "",
+    reason: account?.isLogin ? "unavailable" : "login-required"
+  };
+}
+
+function buildQualityOptions(playUrl, availability = new Map()) {
   const qualities = Array.isArray(playUrl.accept_quality) ? playUrl.accept_quality : [];
   const descriptions = Array.isArray(playUrl.accept_description) ? playUrl.accept_description : [];
   const dashByQuality = new Map();
@@ -523,10 +590,17 @@ function buildQualityOptions(playUrl) {
     }
   }
 
-  return qualities.map((code, index) => ({
-    code: Number(code),
-    label: buildQualityLabel(Number(code), descriptions[index], dashByQuality.get(Number(code)))
-  }));
+  return qualities.map((code, index) => {
+    const numericCode = Number(code);
+    const info = availability.get(numericCode) || unavailableQualityInfo(null);
+    return {
+      code: numericCode,
+      label: buildQualityLabel(numericCode, descriptions[index], dashByQuality.get(numericCode)),
+      available: info.available,
+      mode: info.mode || "",
+      reason: info.reason || ""
+    };
+  });
 }
 
 function buildQualityLabel(code, description, stream) {
@@ -594,8 +668,33 @@ function hasDashQuality(playUrl, requestedQuality) {
   return playUrl.dashVideos.some((stream) => stream.id === requestedQuality);
 }
 
-function responseQuality(playUrl, requestedQuality) {
-  return Number(playUrl.quality) || requestedQuality;
+function hasDirectStreams(playUrl) {
+  return buildDirectSegmentPlans(playUrl).length > 0;
+}
+
+function hasExactDirectQuality(playUrl, requestedQuality) {
+  return hasDirectStreams(playUrl) && responseQuality(playUrl) === requestedQuality;
+}
+
+function responseQuality(playUrl) {
+  return Number(playUrl.quality) || 0;
+}
+
+function selectDefaultQuality(qualities, responseQualityValue) {
+  const responseCode = Number(responseQualityValue);
+  const responseOption = qualities.find((quality) => (
+    quality.available && quality.code === responseCode
+  ));
+  if (responseOption) {
+    return responseOption.code;
+  }
+
+  const firstAvailable = qualities.find((quality) => quality.available);
+  return firstAvailable?.code || null;
+}
+
+function unavailableQualityError(quality) {
+  return new Error(`Quality ${quality} is not downloadable with the current browser Cookie. Please log in or choose a marked available quality.`);
 }
 
 function selectDashAudio(playUrl) {

@@ -385,7 +385,7 @@ test("background loads qualities and starts direct browser downloads", async () 
     payload: {
       bvid: "BV1KGj36QEG3",
       cid: 123,
-      quality: 64,
+      quality: 80,
       title: "Smoke Video"
     }
   });
@@ -612,7 +612,7 @@ test("background reads browser cookie account and prepares DASH streams", async 
       { url: "https://audio-backup.bilivideo.com/audio-high.m4s", kind: "backup", size: 2 * 1024 * 1024 }
     ]
   );
-  assert.ok(fetchUrls.every((url) => !url.includes("fnval=0")));
+  assert.ok(fetchUrls.some((url) => url.includes("fnval=0")));
   assert.ok(fetchUrls.some((url) => url.includes("fnval=4048")));
 });
 
@@ -754,6 +754,308 @@ test("background falls back to legacy direct streams when DASH lacks selected qu
   );
   assert.ok(fetchUrls.some((url) => url.includes("fnval=4048")));
   assert.ok(fetchUrls.some((url) => url.includes("fnval=0")));
+});
+
+
+test("background marks login-only qualities unavailable without downgrading", async () => {
+  const code = await readFile("extension/src/background.js", "utf8");
+  const fetchUrls = [];
+  let messageListener = null;
+
+  const sandbox = {
+    Array,
+    Date,
+    Error,
+    Number,
+    Promise,
+    String,
+    URL,
+    URLSearchParams,
+    clearTimeout,
+    setTimeout,
+    chrome: {
+      runtime: {
+        lastError: null,
+        onMessage: {
+          addListener(listener) {
+            messageListener = listener;
+          }
+        },
+        onConnect: {
+          addListener() {}
+        }
+      },
+      declarativeNetRequest: {
+        onRuleMatchedDebug: {
+          addListener() {}
+        }
+      },
+      storage: {
+        local: {
+          async get() {
+            return {};
+          },
+          async set() {}
+        }
+      }
+    },
+    fetch: async (url) => {
+      const value = String(url);
+      fetchUrls.push(value);
+      if (value.includes("/x/web-interface/nav")) {
+        return jsonResponse({
+          code: 0,
+          data: {
+            isLogin: false,
+            uname: "",
+            mid: 0,
+            vipInfo: {}
+          }
+        });
+      }
+      if (value.includes("/x/web-interface/view")) {
+        return jsonResponse({
+          code: 0,
+          data: {
+            aid: 100,
+            bvid: "BV1KGj36QEG3",
+            title: "No Cookie Video",
+            owner: { name: "tester" },
+            pages: [{ page: 1, cid: 789, part: "P1" }]
+          }
+        });
+      }
+      if (value.includes("/x/player/playurl") && value.includes("fnval=4048")) {
+        return jsonResponse({
+          code: 0,
+          data: {
+            quality: 64,
+            format: "mp4",
+            accept_quality: [80, 64, 32],
+            accept_description: ["1080P", "720P", "480P"],
+            durl: [],
+            dash: {
+              video: [{
+                id: 32,
+                base_url: "https://video-primary.bilivideo.com/32.m4s",
+                bandwidth: 800000,
+                codecs: "avc1.64001f",
+                mime_type: "video/mp4",
+                width: 852,
+                height: 480,
+                frame_rate: "30.000",
+                size: 4 * 1024 * 1024
+              }],
+              audio: [{
+                id: 30216,
+                base_url: "https://audio-primary.bilivideo.com/audio.m4s",
+                bandwidth: 64000,
+                codecs: "mp4a.40.2",
+                mime_type: "audio/mp4",
+                size: 1024 * 1024
+              }]
+            }
+          }
+        });
+      }
+      if (value.includes("/x/player/playurl") && value.includes("fnval=0")) {
+        return jsonResponse({
+          code: 0,
+          data: {
+            quality: 64,
+            format: "mp4",
+            accept_quality: [80, 64, 32],
+            accept_description: ["1080P", "720P", "480P"],
+            durl: [{
+              url: "https://legacy.hdslb.test/video-720.mp4",
+              size: 7 * 1024 * 1024
+            }]
+          }
+        });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    }
+  };
+
+  vm.createContext(sandbox);
+  vm.runInContext(code, sandbox);
+
+  const video = await sandbox.loadVideo({
+    bvid: "BV1KGj36QEG3",
+    title: "No Cookie Video",
+    url: "https://www.bilibili.com/video/BV1KGj36QEG3/"
+  });
+  assert.equal(video.account.isLogin, false);
+  assert.equal(video.currentQuality, 64);
+  assert.deepEqual(video.qualities.map((item) => [item.code, item.available, item.mode, item.reason]), [
+    [80, false, "", "login-required"],
+    [64, true, "direct", ""],
+    [32, true, "dash", ""]
+  ]);
+
+  const lockedResponse = await sendRuntimeMessage(messageListener, {
+    type: "BILI_DOWNLOAD_PREPARE_DIRECT",
+    payload: {
+      bvid: "BV1KGj36QEG3",
+      cid: 789,
+      quality: 80,
+      title: "No Cookie Video"
+    }
+  });
+  assert.equal(lockedResponse.ok, false);
+  assert.match(lockedResponse.error, /Quality 80 is not downloadable/);
+
+  const availableResponse = await sendRuntimeMessage(messageListener, {
+    type: "BILI_DOWNLOAD_PREPARE_DIRECT",
+    payload: {
+      bvid: "BV1KGj36QEG3",
+      cid: 789,
+      quality: 64,
+      title: "No Cookie Video"
+    }
+  });
+  assert.equal(availableResponse.ok, true);
+  assert.equal(availableResponse.payload.mode, "durl");
+  assert.equal(availableResponse.payload.segments[0].context.quality, 64);
+  assert.equal(availableResponse.payload.segments[0].url, "https://legacy.hdslb.test/video-720.mp4");
+  assert.ok(fetchUrls.some((url) => url.includes("qn=80") && url.includes("fnval=0")));
+});
+
+
+test("popup disables login-only quality options", async () => {
+  const code = await readFile("extension/src/popup.js", "utf8");
+  const statusElement = textElement();
+  const accountElement = textElement();
+  const qualitySelect = selectElement();
+  const downloadButton = buttonElement();
+  let prepareMessages = 0;
+
+  const sandbox = {
+    Blob,
+    Date,
+    Error,
+    RegExp,
+    String,
+    URL,
+    console,
+    navigator: {
+      clipboard: {
+        async writeText() {}
+      }
+    },
+    setTimeout(callback) {
+      callback();
+      return 1;
+    },
+    document: {
+      addEventListener() {},
+      body: {
+        append() {}
+      },
+      createElement() {
+        return optionElement();
+      },
+      querySelector(selector) {
+        return {
+          "#status": statusElement,
+          "#account": accountElement,
+          "#bvid": textElement(),
+          "#title": textElement(),
+          "#quality": qualitySelect,
+          "#copy": buttonElement(),
+          "#download": downloadButton,
+          "#diagnostic": buttonElement(),
+          "#progress": panelElement(),
+          "#progress-percent": textElement(),
+          "#progress-bar": styleElement(),
+          "#progress-size": textElement(),
+          "#progress-speed": textElement(),
+          "#download-controls": panelElement(),
+          "#pause": buttonElement(),
+          "#cancel": buttonElement()
+        }[selector];
+      }
+    },
+    chrome: {
+      tabs: {
+        async query() {
+          return [{
+            id: 99,
+            url: "https://www.bilibili.com/video/BV1KGj36QEG3/",
+            title: "No Cookie Video"
+          }];
+        },
+        async sendMessage() {
+          return {
+            bvid: "BV1KGj36QEG3",
+            title: "No Cookie Video",
+            url: "https://www.bilibili.com/video/BV1KGj36QEG3/"
+          };
+        }
+      },
+      runtime: {
+        connect() {
+          return {
+            onMessage: {
+              addListener() {}
+            }
+          };
+        },
+        async sendMessage(message) {
+          if (message.type === "BILI_DOWNLOAD_GET_DIAGNOSTIC") {
+            return { ok: true, payload: null };
+          }
+          if (message.type === "BILI_DOWNLOAD_LOAD_VIDEO") {
+            return {
+              ok: true,
+              payload: {
+                bvid: "BV1KGj36QEG3",
+                title: "No Cookie Video",
+                page: { cid: 789 },
+                account: { isLogin: false },
+                currentQuality: 64,
+                qualities: [
+                  { code: 80, label: "80 - 1080P", available: false, reason: "login-required", mode: "" },
+                  { code: 64, label: "64 - 720P", available: true, reason: "", mode: "direct" }
+                ]
+              }
+            };
+          }
+          if (message.type === "BILI_DOWNLOAD_PREPARE_DIRECT") {
+            prepareMessages += 1;
+            return { ok: false, error: "unexpected prepare" };
+          }
+          throw new Error(`unexpected runtime message: ${message.type}`);
+        }
+      },
+      scripting: {
+        async executeScript() {
+          throw new Error("should not download unavailable quality");
+        }
+      }
+    }
+  };
+
+  vm.createContext(sandbox);
+  vm.runInContext(code, sandbox);
+
+  await sandbox.initialize();
+
+  assert.equal(qualitySelect.children.length, 2);
+  assert.equal(qualitySelect.children[0].value, "80");
+  assert.equal(qualitySelect.children[0].disabled, true);
+  assert.match(qualitySelect.children[0].textContent, /Cookie/);
+  assert.equal(qualitySelect.children[1].value, "64");
+  assert.equal(qualitySelect.children[1].disabled, false);
+  assert.equal(qualitySelect.value, "64");
+  assert.equal(downloadButton.disabled, false);
+
+  qualitySelect.value = "80";
+  sandbox.updateControls();
+  assert.equal(downloadButton.disabled, true);
+  await sandbox.downloadSelectedQuality();
+  assert.match(statusElement.textContent, /Cookie/);
+  assert.equal(prepareMessages, 0);
 });
 
 
@@ -2431,6 +2733,7 @@ function optionElement() {
   return {
     value: "",
     textContent: "",
+    disabled: false,
     selected: false
   };
 }

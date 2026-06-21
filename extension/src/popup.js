@@ -5,6 +5,7 @@ const TEXT = {
   copied: "BV \u53f7\u5df2\u590d\u5236",
   noVideo: "\u5f53\u524d\u9875\u9762\u4e0d\u662f Bilibili \u89c6\u9891\u9875",
   noQuality: "\u6ca1\u6709\u53ef\u7528\u6e05\u6670\u5ea6",
+  qualityUnavailable: "\u8be5\u6e05\u6670\u5ea6\u9700\u8981 Cookie \u767b\u5f55\u540e\u624d\u80fd\u4e0b\u8f7d",
   downloading: "\u6b63\u5728\u8bf7\u6c42\u89c6\u9891\u6587\u4ef6...",
   muxing: "\u6b63\u5728\u5408\u5e76 MP4...",
   downloadStarted: "\u4e0b\u8f7d\u5df2\u5f00\u59cb",
@@ -72,6 +73,7 @@ document.addEventListener("DOMContentLoaded", initialize);
 copyButton.addEventListener("click", copyBvid);
 downloadButton.addEventListener("click", downloadSelectedQuality);
 diagnosticButton.addEventListener("click", copyDiagnostic);
+qualitySelect.addEventListener?.("change", updateControls);
 pauseButton?.addEventListener("click", togglePauseDownload);
 cancelButton?.addEventListener("click", cancelDownload);
 const progressPort = chrome.runtime.connect({ name: PROGRESS_PORT_NAME });
@@ -118,7 +120,7 @@ async function initialize() {
     state.page.bvid = state.video.bvid;
     state.page.title = state.video.title;
     render();
-    setStatus(state.video.qualities.length ? TEXT.ready : TEXT.noQuality);
+    setStatus(videoHasAvailableQuality(state.video) ? TEXT.ready : TEXT.noQuality);
   } catch (error) {
     setStatus(error.message);
     render();
@@ -183,16 +185,37 @@ function renderAccount() {
 function renderQualities() {
   qualitySelect.replaceChildren();
   const qualities = state.video?.qualities || [];
+  const selectedCode = Number(qualitySelect.value) || state.video?.currentQuality;
 
   for (const quality of qualities) {
     const option = document.createElement("option");
     option.value = String(quality.code);
-    option.textContent = quality.label;
-    if (quality.code === state.video.currentQuality) {
+    option.textContent = displayQualityLabel(quality);
+    option.disabled = quality.available === false;
+    if (quality.code === selectedCode) {
       option.selected = true;
     }
     qualitySelect.append(option);
   }
+
+  const selected = selectedQualityOption();
+  if (!selected || selected.disabled) {
+    const firstAvailable = Array.from(qualitySelect.children).find((option) => !option.disabled);
+    if (firstAvailable) {
+      qualitySelect.value = firstAvailable.value;
+    }
+  }
+}
+
+function displayQualityLabel(quality) {
+  if (quality.available !== false) {
+    return quality.label;
+  }
+
+  const suffix = quality.reason === "login-required"
+    ? "\u9700\u8981 Cookie"
+    : "\u5f53\u524d\u4e0d\u53ef\u7528";
+  return `${quality.label}\uff08${suffix}\uff09`;
 }
 
 async function copyBvid() {
@@ -206,6 +229,12 @@ async function copyBvid() {
 
 async function downloadSelectedQuality() {
   if (!state.video || !qualitySelect.value) {
+    return;
+  }
+
+  if (!selectedQualityAvailable()) {
+    setStatus(TEXT.qualityUnavailable);
+    updateControls();
     return;
   }
 
@@ -1535,11 +1564,29 @@ function formatBytes(bytes) {
 function updateControls() {
   const hasBvid = Boolean(state.page.bvid);
   const hasQuality = Boolean(state.video?.qualities?.length);
+  const hasAvailableQuality = Boolean(availableQualityOptions().length);
   copyButton.disabled = state.busy || !hasBvid;
-  downloadButton.disabled = state.busy || !hasBvid || !hasQuality;
+  downloadButton.disabled = state.busy || !hasBvid || !hasAvailableQuality || !selectedQualityAvailable();
   qualitySelect.disabled = state.busy || !hasQuality;
   diagnosticButton.disabled = state.busy || !state.lastDiagnostic;
   renderDownloadControls();
+}
+
+function availableQualityOptions() {
+  return Array.from(qualitySelect.children).filter((option) => !option.disabled);
+}
+
+function videoHasAvailableQuality(video) {
+  return Boolean(video?.qualities?.some((quality) => quality.available !== false));
+}
+
+function selectedQualityOption() {
+  return Array.from(qualitySelect.children).find((option) => option.value === qualitySelect.value) || null;
+}
+
+function selectedQualityAvailable() {
+  const option = selectedQualityOption();
+  return Boolean(option && !option.disabled);
 }
 
 function setBusy(value) {

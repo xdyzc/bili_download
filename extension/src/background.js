@@ -56,6 +56,13 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
 
+  if (message?.type === "BILI_DOWNLOAD_PREPARE_AUDIO") {
+    prepareAudioDownload(message.payload)
+      .then((payload) => sendResponse({ ok: true, payload }))
+      .catch((error) => sendResponse(errorResponse(error)));
+    return true;
+  }
+
   if (message?.type === "BILI_DOWNLOAD_SAVE_DIAGNOSTIC") {
     setLastDiagnostic(message.payload)
       .then(() => sendResponse({ ok: true }))
@@ -331,6 +338,24 @@ async function prepareDirectDownload(payload) {
   throw unavailableQualityError(quality);
 }
 
+async function prepareAudioDownload(payload) {
+  const bvid = normalizeBvid(payload?.bvid);
+  const cid = Number(payload?.cid);
+  const title = payload?.title || bvid;
+
+  if (!bvid || !cid) {
+    throw new Error("Missing video or cid.");
+  }
+
+  const playUrl = await fetchPlayUrl({ bvid, cid });
+  return prepareAudioSegment({
+    bvid,
+    cid,
+    title,
+    playUrl
+  });
+}
+
 function buildDirectSegmentPlans(playUrl) {
   return Array.isArray(playUrl.durl)
     ? playUrl.durl
@@ -597,6 +622,48 @@ function unavailableQualityInfo(account) {
     available: false,
     mode: "",
     reason: account?.isLogin ? "unavailable" : "login-required"
+  };
+}
+
+function prepareAudioSegment({ bvid, cid, title, playUrl }) {
+  const audioStream = selectDashAudio(playUrl);
+  if (!audioStream) {
+    throw new Error("DASH response did not include an audio stream.");
+  }
+
+  const candidates = buildDashCandidates(audioStream);
+  if (!candidates.length) {
+    throw new Error("DASH audio stream did not include a media URL.");
+  }
+
+  const baseName = safeFilename(title);
+  const segment = {
+    url: candidates[0].url,
+    filename: `BiliDownload/${baseName}.m4a`,
+    size: Number(audioStream.size) || 0,
+    candidates,
+    context: {
+      bvid,
+      cid,
+      quality: Number(audioStream.id) || 0,
+      title,
+      segmentIndex: 1,
+      segmentCount: 1,
+      role: "audio",
+      roleLabel: "\u97f3\u9891",
+      format: "audio",
+      codecs: audioStream.codecs || "",
+      mimeType: audioStream.mimeType || "",
+      downloadMethod: "page-blob"
+    }
+  };
+
+  return {
+    count: 1,
+    segments: [segment],
+    format: "audio",
+    mode: "audio",
+    audio: pickDashStream(audioStream)
   };
 }
 

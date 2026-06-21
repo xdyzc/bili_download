@@ -9,8 +9,12 @@ const TEXT = {
   qualityUnavailable: "\u8be5\u6e05\u6670\u5ea6\u9700\u8981 Cookie \u767b\u5f55\u540e\u624d\u80fd\u4e0b\u8f7d",
   noSelectedPages: "\u8bf7\u5148\u9009\u62e9\u8981\u4e0b\u8f7d\u7684\u5206 P",
   downloading: "\u6b63\u5728\u8bf7\u6c42\u89c6\u9891\u6587\u4ef6...",
+  downloadingAudio: "\u6b63\u5728\u8bf7\u6c42\u97f3\u9891\u6587\u4ef6...",
   downloadingPages: "\u6b63\u5728\u4e0b\u8f7d\u9009\u4e2d\u5206 P...",
+  downloadingPageAudio: "\u6b63\u5728\u4e0b\u8f7d\u9009\u4e2d\u97f3\u9891...",
   pagesDownloaded: "\u5df2\u4e0b\u8f7d\u9009\u4e2d\u5206 P",
+  audioDownloaded: "\u97f3\u9891\u5df2\u4e0b\u8f7d",
+  pageAudioDownloaded: "\u5df2\u4e0b\u8f7d\u9009\u4e2d\u97f3\u9891",
   muxing: "\u6b63\u5728\u5408\u5e76 MP4...",
   downloadStarted: "\u4e0b\u8f7d\u5df2\u5f00\u59cb",
   dashMuxed: "DASH \u5df2\u5408\u5e76\u4e3a MP4",
@@ -65,11 +69,13 @@ const titleInput = document.querySelector("#title");
 const qualitySelect = document.querySelector("#quality");
 const copyButton = document.querySelector("#copy");
 const downloadButton = document.querySelector("#download");
+const downloadAudioButton = document.querySelector("#download-audio");
 const pagePickerToggle = document.querySelector("#page-picker-toggle");
 const pagePicker = document.querySelector("#page-picker");
 const pageList = document.querySelector("#page-list");
 const pageSelectAllButton = document.querySelector("#page-select-all");
 const downloadSelectedPagesButton = document.querySelector("#download-selected-pages");
+const downloadSelectedPageAudioButton = document.querySelector("#download-selected-page-audio");
 const diagnosticButton = document.querySelector("#diagnostic");
 const progressPanel = document.querySelector("#progress");
 const progressPercent = document.querySelector("#progress-percent");
@@ -83,9 +89,11 @@ const cancelButton = document.querySelector("#cancel");
 document.addEventListener("DOMContentLoaded", initialize);
 copyButton.addEventListener("click", copyBvid);
 downloadButton.addEventListener("click", downloadSelectedQuality);
+downloadAudioButton?.addEventListener("click", downloadCurrentAudio);
 pagePickerToggle?.addEventListener("click", togglePagePicker);
 pageSelectAllButton?.addEventListener("click", toggleAllPages);
 downloadSelectedPagesButton?.addEventListener("click", downloadSelectedPages);
+downloadSelectedPageAudioButton?.addEventListener("click", downloadSelectedPageAudio);
 diagnosticButton.addEventListener("click", copyDiagnostic);
 qualitySelect.addEventListener?.("change", updateControls);
 pauseButton?.addEventListener("click", togglePauseDownload);
@@ -398,6 +406,41 @@ async function downloadSelectedQuality() {
   }
 }
 
+async function downloadCurrentAudio() {
+  if (!state.video) {
+    return;
+  }
+
+  const control = createDownloadControl();
+  state.downloadControl = control;
+  setBusy(true);
+  resetProgress();
+  setStatus(TEXT.downloadingAudio);
+
+  try {
+    const prepared = await prepareAudioDownload({
+      cid: state.video.page.cid
+    }, audioDownloadTitle(state.video.title, state.video.page));
+    await downloadPreparedPayload(prepared, TEXT.downloadingAudio);
+    setStatus(`${TEXT.audioDownloaded}: ${prepared.count}`);
+  } catch (error) {
+    if (isDownloadCanceledError(error)) {
+      setStatus(TEXT.canceled);
+      return;
+    }
+    if (error.diagnostic) {
+      state.lastDiagnostic = error.diagnostic;
+      await saveDiagnostic(error.diagnostic);
+    }
+    setStatus(error.message);
+  } finally {
+    if (state.downloadControl === control) {
+      state.downloadControl = null;
+    }
+    setBusy(false);
+  }
+}
+
 async function downloadSelectedPages() {
   if (!state.video || !qualitySelect.value) {
     return;
@@ -451,6 +494,52 @@ async function downloadSelectedPages() {
   }
 }
 
+async function downloadSelectedPageAudio() {
+  if (!state.video) {
+    return;
+  }
+
+  const pages = selectedPages();
+  if (!pages.length) {
+    setStatus(TEXT.noSelectedPages);
+    updateControls();
+    return;
+  }
+
+  const control = createDownloadControl();
+  state.downloadControl = control;
+  setBusy(true);
+  resetProgress();
+  setStatus(TEXT.downloadingPageAudio);
+
+  try {
+    for (const [index, page] of pages.entries()) {
+      await waitForDownloadControl();
+      throwIfDownloadCanceled();
+      const pageIndex = Number(page.index || page.page) || index + 1;
+      setStatus(`${TEXT.downloadingPageAudio} ${index + 1}/${pages.length} P${String(pageIndex).padStart(2, "0")}`);
+      const prepared = await prepareAudioDownload(page, audioDownloadTitle(state.video.title, page));
+      await downloadPreparedPayload(prepared, TEXT.downloadingAudio);
+    }
+    setStatus(`${TEXT.pageAudioDownloaded}: ${pages.length}`);
+  } catch (error) {
+    if (isDownloadCanceledError(error)) {
+      setStatus(TEXT.canceled);
+      return;
+    }
+    if (error.diagnostic) {
+      state.lastDiagnostic = error.diagnostic;
+      await saveDiagnostic(error.diagnostic);
+    }
+    setStatus(error.message);
+  } finally {
+    if (state.downloadControl === control) {
+      state.downloadControl = null;
+    }
+    setBusy(false);
+  }
+}
+
 async function preparePageDownload(page, quality, title) {
   const prepared = await chrome.runtime.sendMessage({
     type: "BILI_DOWNLOAD_PREPARE_DIRECT",
@@ -470,7 +559,25 @@ async function preparePageDownload(page, quality, title) {
   return prepared.payload;
 }
 
-async function downloadPreparedPayload(prepared) {
+async function prepareAudioDownload(page, title) {
+  const prepared = await chrome.runtime.sendMessage({
+    type: "BILI_DOWNLOAD_PREPARE_AUDIO",
+    payload: {
+      bvid: state.video.bvid,
+      cid: Number(page.cid),
+      title
+    }
+  });
+
+  if (!prepared?.ok) {
+    state.lastDiagnostic = prepared?.diagnostic || state.lastDiagnostic;
+    throw new Error(prepared?.error || "Failed to prepare audio download.");
+  }
+
+  return prepared.payload;
+}
+
+async function downloadPreparedPayload(prepared, statusText = TEXT.downloading) {
   if (prepared.mode === "dash") {
     await downloadDashAsMp4(prepared);
     return;
@@ -481,7 +588,7 @@ async function downloadPreparedPayload(prepared) {
     throwIfDownloadCanceled();
     const role = segment.context?.roleLabel || segment.context?.role || "";
     const suffix = role ? ` ${index + 1}/${prepared.count} ${role}` : ` ${index + 1}/${prepared.count}`;
-    setStatus(`${TEXT.downloading}${suffix}`);
+    setStatus(`${statusText}${suffix}`);
     const diagnostic = await downloadSegment(segment);
     state.lastDiagnostic = diagnostic;
   }
@@ -1780,6 +1887,9 @@ function updateControls() {
   const hasSelectedPages = Boolean(selectedPages().length);
   copyButton.disabled = state.busy || !hasBvid;
   downloadButton.disabled = state.busy || !hasBvid || !hasAvailableQuality || !selectedQualityAvailable();
+  if (downloadAudioButton) {
+    downloadAudioButton.disabled = state.busy || !hasBvid || !state.video?.page?.cid;
+  }
   qualitySelect.disabled = state.busy || !hasQuality;
   if (pagePickerToggle) {
     pagePickerToggle.disabled = state.busy || !hasMultiplePages;
@@ -1793,6 +1903,12 @@ function updateControls() {
       !hasMultiplePages ||
       !hasAvailableQuality ||
       !selectedQualityAvailable() ||
+      !hasSelectedPages;
+  }
+  if (downloadSelectedPageAudioButton) {
+    downloadSelectedPageAudioButton.disabled = state.busy ||
+      !hasBvid ||
+      !hasMultiplePages ||
       !hasSelectedPages;
   }
   updatePageSelectionAction();
@@ -1825,6 +1941,14 @@ function pageDownloadTitle(videoTitle, page) {
   const pageIndex = Number(page?.index || page?.page) || 1;
   const partTitle = page?.title ? `_${page.title}` : "";
   return `${videoTitle}_P${String(pageIndex).padStart(2, "0")}${partTitle}`;
+}
+
+function audioDownloadTitle(videoTitle, page) {
+  const hasMultiplePages = videoHasMultiplePages(state.video);
+  if (!hasMultiplePages) {
+    return `${videoTitle}_audio`;
+  }
+  return `${pageDownloadTitle(videoTitle, page)}_audio`;
 }
 
 function setBusy(value) {

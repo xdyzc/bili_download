@@ -141,11 +141,13 @@ test("popup contains MVP controls", async () => {
     "title",
     "quality",
     "download",
+    "download-audio",
     "page-picker-toggle",
     "page-picker",
     "page-list",
     "page-select-all",
     "download-selected-pages",
+    "download-selected-page-audio",
     "diagnostic",
     "progress",
     "progress-percent",
@@ -849,6 +851,120 @@ test("background reads browser cookie account and prepares DASH streams", async 
 });
 
 
+test("background prepares standalone DASH audio streams", async () => {
+  const code = await readFile("extension/src/background.js", "utf8");
+  let messageListener = null;
+
+  const sandbox = {
+    Array,
+    Date,
+    Error,
+    Number,
+    Promise,
+    String,
+    URL,
+    URLSearchParams,
+    clearTimeout,
+    setTimeout,
+    chrome: {
+      runtime: {
+        lastError: null,
+        onMessage: {
+          addListener(listener) {
+            messageListener = listener;
+          }
+        },
+        onConnect: {
+          addListener() {}
+        }
+      },
+      declarativeNetRequest: {
+        onRuleMatchedDebug: {
+          addListener() {}
+        }
+      },
+      storage: {
+        local: {
+          async get() {
+            return {};
+          },
+          async set() {}
+        }
+      }
+    },
+    fetch: async (url) => {
+      if (String(url).includes("/x/player/playurl")) {
+        return jsonResponse({
+          code: 0,
+          data: {
+            quality: 80,
+            format: "dash",
+            accept_quality: [80, 64],
+            accept_description: ["1080P", "720P"],
+            durl: [],
+            dash: {
+              video: [{
+                id: 80,
+                base_url: "https://video-primary.bilivideo.com/80.m4s",
+                bandwidth: 1500000,
+                codecs: "avc1.640028",
+                mime_type: "video/mp4",
+                size: 12 * 1024 * 1024
+              }],
+              audio: [
+                {
+                  id: 30216,
+                  base_url: "https://audio-primary.bilivideo.com/audio-low.m4s",
+                  bandwidth: 64000,
+                  codecs: "mp4a.40.2",
+                  mime_type: "audio/mp4",
+                  size: 1024 * 1024
+                },
+                {
+                  id: 30280,
+                  base_url: "https://audio-primary.bilivideo.com/audio-high.m4s",
+                  backup_url: ["https://audio-backup.bilivideo.com/audio-high.m4s"],
+                  bandwidth: 192000,
+                  codecs: "mp4a.40.2",
+                  mime_type: "audio/mp4",
+                  size: 2 * 1024 * 1024
+                }
+              ]
+            }
+          }
+        });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    }
+  };
+
+  vm.createContext(sandbox);
+  vm.runInContext(code, sandbox);
+
+  const response = await sendRuntimeMessage(messageListener, {
+    type: "BILI_DOWNLOAD_PREPARE_AUDIO",
+    payload: {
+      bvid: "BV1KGj36QEG3",
+      cid: 456,
+      title: "Dash Video_audio"
+    }
+  });
+
+  assert.equal(response.ok, true);
+  assert.equal(response.payload.mode, "audio");
+  assert.equal(response.payload.count, 1);
+  assert.equal(response.payload.segments[0].filename, "BiliDownload/Dash Video_audio.m4a");
+  assert.equal(response.payload.segments[0].url, "https://audio-primary.bilivideo.com/audio-high.m4s");
+  assert.equal(response.payload.segments[0].context.role, "audio");
+  assert.equal(response.payload.segments[0].context.quality, 30280);
+  assert.equal(response.payload.audio.bandwidth, 192000);
+  assert.deepEqual(toPlain(response.payload.segments[0].candidates), [
+    { url: "https://audio-primary.bilivideo.com/audio-high.m4s", kind: "primary", size: 2 * 1024 * 1024 },
+    { url: "https://audio-backup.bilivideo.com/audio-high.m4s", kind: "backup", size: 2 * 1024 * 1024 }
+  ]);
+});
+
+
 test("background falls back to legacy direct streams when DASH lacks selected quality", async () => {
   const code = await readFile("extension/src/background.js", "utf8");
   const fetchUrls = [];
@@ -1303,6 +1419,7 @@ test("popup lets users choose specific multi-page videos to download", async () 
   const pageList = containerElement();
   const pageSelectAllButton = buttonElement();
   const downloadSelectedPagesButton = buttonElement();
+  const downloadSelectedPageAudioButton = buttonElement();
 
   const sandbox = {
     Blob,
@@ -1352,6 +1469,7 @@ test("popup lets users choose specific multi-page videos to download", async () 
           "#page-list": pageList,
           "#page-select-all": pageSelectAllButton,
           "#download-selected-pages": downloadSelectedPagesButton,
+          "#download-selected-page-audio": downloadSelectedPageAudioButton,
           "#diagnostic": buttonElement(),
           "#progress": panelElement(),
           "#progress-percent": textElement(),
@@ -1436,6 +1554,33 @@ test("popup lets users choose specific multi-page videos to download", async () 
               }
             };
           }
+          if (message.type === "BILI_DOWNLOAD_PREPARE_AUDIO") {
+            return {
+              ok: true,
+              payload: {
+                count: 1,
+                mode: "audio",
+                segments: [{
+                  url: `https://audio.hdslb.test/${message.payload.cid}.m4s`,
+                  filename: `BiliDownload/${message.payload.title}.m4a`,
+                  size: 512,
+                  candidates: [{ url: `https://audio.hdslb.test/${message.payload.cid}.m4s`, kind: "primary", size: 512 }],
+                  context: {
+                    bvid: message.payload.bvid,
+                    cid: message.payload.cid,
+                    quality: 30280,
+                    title: message.payload.title,
+                    segmentIndex: 1,
+                    segmentCount: 1,
+                    role: "audio",
+                    roleLabel: "audio",
+                    format: "audio",
+                    downloadMethod: "page-blob"
+                  }
+                }]
+              }
+            };
+          }
           if (message.type === "BILI_DOWNLOAD_SAVE_DIAGNOSTIC") {
             return { ok: true };
           }
@@ -1477,6 +1622,7 @@ test("popup lets users choose specific multi-page videos to download", async () 
   let checkboxes = pageList.querySelectorAll("input[type=\"checkbox\"]");
   assert.deepEqual(checkboxes.map((checkbox) => checkbox.checked), [false, true, false]);
   assert.equal(downloadSelectedPagesButton.disabled, false);
+  assert.equal(downloadSelectedPageAudioButton.disabled, false);
 
   sandbox.toggleAllPages();
   checkboxes = pageList.querySelectorAll("input[type=\"checkbox\"]");
@@ -1502,6 +1648,189 @@ test("popup lets users choose specific multi-page videos to download", async () 
   assert.equal(scriptCalls[0].args[1], "Multi Page Video_P01_Opening_64.mp4");
   assert.equal(scriptCalls[1].args[1], "Multi Page Video_P03_Ending_64.mp4");
   assert.match(statusElement.textContent, /2$/);
+
+  scriptCalls.length = 0;
+  runtimeMessages.length = 0;
+  await sandbox.downloadSelectedPageAudio();
+
+  const audioPayloads = runtimeMessages
+    .filter((message) => message.type === "BILI_DOWNLOAD_PREPARE_AUDIO")
+    .map((message) => message.payload);
+  assert.deepEqual(audioPayloads.map((payload) => payload.cid), [101, 303]);
+  assert.deepEqual(audioPayloads.map((payload) => payload.title), [
+    "Multi Page Video_P01_Opening_audio",
+    "Multi Page Video_P03_Ending_audio"
+  ]);
+  assert.equal(scriptCalls.length, 2);
+  assert.equal(scriptCalls[0].args[1], "Multi Page Video_P01_Opening_audio.m4a");
+  assert.equal(scriptCalls[1].args[1], "Multi Page Video_P03_Ending_audio.m4a");
+  assert.match(statusElement.textContent, /2$/);
+});
+
+
+test("popup downloads current page audio as a standalone file", async () => {
+  const code = await readFile("extension/src/popup.js", "utf8");
+  const runtimeMessages = [];
+  const scriptCalls = [];
+  const statusElement = textElement();
+  const qualitySelect = selectElement();
+  const downloadAudioButton = buttonElement();
+
+  const sandbox = {
+    Blob,
+    Date,
+    Error,
+    RegExp,
+    String,
+    URL,
+    console,
+    navigator: {
+      clipboard: {
+        async writeText() {}
+      }
+    },
+    setTimeout(callback) {
+      callback();
+      return 1;
+    },
+    document: {
+      addEventListener() {},
+      body: {
+        append() {}
+      },
+      createElement() {
+        return optionElement();
+      },
+      querySelector(selector) {
+        return {
+          "#status": statusElement,
+          "#bvid": textElement(),
+          "#title": textElement(),
+          "#quality": qualitySelect,
+          "#copy": buttonElement(),
+          "#download": buttonElement(),
+          "#download-audio": downloadAudioButton,
+          "#diagnostic": buttonElement(),
+          "#progress": panelElement(),
+          "#progress-percent": textElement(),
+          "#progress-bar": styleElement(),
+          "#progress-size": textElement(),
+          "#progress-speed": textElement(),
+          "#download-controls": panelElement(),
+          "#pause": buttonElement(),
+          "#cancel": buttonElement()
+        }[selector];
+      }
+    },
+    chrome: {
+      tabs: {
+        async query() {
+          return [{
+            id: 99,
+            url: "https://www.bilibili.com/video/BV1KGj36QEG3/",
+            title: "Smoke Video"
+          }];
+        },
+        async sendMessage() {
+          return {
+            bvid: "BV1KGj36QEG3",
+            title: "Smoke Video",
+            url: "https://www.bilibili.com/video/BV1KGj36QEG3/"
+          };
+        }
+      },
+      runtime: {
+        connect() {
+          return {
+            onMessage: {
+              addListener() {}
+            }
+          };
+        },
+        async sendMessage(message) {
+          runtimeMessages.push(message);
+          if (message.type === "BILI_DOWNLOAD_GET_DIAGNOSTIC") {
+            return { ok: true, payload: null };
+          }
+          if (message.type === "BILI_DOWNLOAD_LOAD_VIDEO") {
+            return {
+              ok: true,
+              payload: {
+                bvid: "BV1KGj36QEG3",
+                title: "Smoke Video",
+                page: { cid: 123 },
+                currentQuality: 64,
+                qualities: [{ code: 64, label: "64 - 720P", available: true, mode: "direct" }]
+              }
+            };
+          }
+          if (message.type === "BILI_DOWNLOAD_PREPARE_AUDIO") {
+            return {
+              ok: true,
+              payload: {
+                count: 1,
+                mode: "audio",
+                segments: [{
+                  url: "https://audio.hdslb.test/123.m4s",
+                  filename: `BiliDownload/${message.payload.title}.m4a`,
+                  size: 512,
+                  candidates: [{ url: "https://audio.hdslb.test/123.m4s", kind: "primary", size: 512 }],
+                  context: {
+                    bvid: message.payload.bvid,
+                    cid: message.payload.cid,
+                    quality: 30280,
+                    title: message.payload.title,
+                    segmentIndex: 1,
+                    segmentCount: 1,
+                    role: "audio",
+                    roleLabel: "audio",
+                    format: "audio",
+                    downloadMethod: "page-blob"
+                  }
+                }]
+              }
+            };
+          }
+          if (message.type === "BILI_DOWNLOAD_SAVE_DIAGNOSTIC") {
+            return { ok: true };
+          }
+          throw new Error(`unexpected runtime message: ${message.type}`);
+        }
+      },
+      scripting: {
+        async executeScript(call) {
+          scriptCalls.push(call);
+          return [{
+            result: {
+              ok: true,
+              responseOk: true,
+              status: 200,
+              statusText: "OK",
+              mime: "audio/mp4",
+              size: 512,
+              totalBytes: 512,
+              receivedBytes: 512,
+              filename: call.args[1]
+            }
+          }];
+        }
+      }
+    }
+  };
+
+  vm.createContext(sandbox);
+  vm.runInContext(code, sandbox);
+
+  await sandbox.initialize();
+  assert.equal(downloadAudioButton.disabled, false);
+  await sandbox.downloadCurrentAudio();
+
+  const audioPayload = runtimeMessages.find((message) => message.type === "BILI_DOWNLOAD_PREPARE_AUDIO").payload;
+  assert.equal(audioPayload.cid, 123);
+  assert.equal(audioPayload.title, "Smoke Video_audio");
+  assert.equal(scriptCalls.length, 1);
+  assert.equal(scriptCalls[0].args[1], "Smoke Video_audio.m4a");
+  assert.match(statusElement.textContent, /1$/);
 });
 
 

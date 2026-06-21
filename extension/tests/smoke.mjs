@@ -3,6 +3,9 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 import vm from "node:vm";
 
+const { Muxer, ArrayBufferTarget } = await import("../vendor/mp4-muxer/mp4-muxer.mjs");
+const MP4Box = await import("../vendor/mp4box/mp4box.all.mjs");
+
 
 test("manifest declares a pure browser extension MVP", async () => {
   const manifest = JSON.parse(await readFile("extension/manifest.json", "utf8"));
@@ -66,6 +69,27 @@ test("popup contains MVP controls", async () => {
   ]) {
     assert.match(html, new RegExp(`id="${id}"`));
   }
+});
+
+
+test("DASH muxer combines video and audio into a parseable MP4", async () => {
+  const { muxDashToMp4 } = await import("../src/dash-muxer.mjs");
+  const videoBlob = new Blob([makeFragmentedVideoTrack()], { type: "video/mp4" });
+  const audioBlob = new Blob([makeFragmentedAudioTrack()], { type: "audio/mp4" });
+
+  const result = await muxDashToMp4({
+    videoBlob,
+    audioBlob,
+    outputName: "Merged Smoke.mp4"
+  });
+  const info = await parseMp4Info(await result.blob.arrayBuffer());
+
+  assert.equal(result.filename, "Merged Smoke.mp4");
+  assert.equal(result.blob.type, "video/mp4");
+  assert.ok(result.blob.size > videoBlob.size);
+  assert.equal(info.tracks.length, 2);
+  assert.ok(info.tracks.some((track) => track.video && track.codec.startsWith("avc1")));
+  assert.ok(info.tracks.some((track) => track.audio && track.codec.startsWith("mp4a")));
 });
 
 
@@ -791,7 +815,7 @@ test("popup uses page context blob download before fallback", async () => {
   assert.equal(scriptCalls[0].args[1], "Smoke Video_64.mp4");
   assert.equal(scriptCalls[0].args[0], "https://primary.hdslb.test/video.mp4?token=hidden");
   assert.equal(scriptCalls[1].args[0], "https://backup.hdslb.test/video.mp4?token=hidden");
-  assert.equal(scriptCalls[1].args[2].candidateIndex, 2);
+  assert.equal(scriptCalls[1].args[3].candidateIndex, 2);
   assert.match(statusElement.textContent, /1$/);
   assert.equal(progressPanel.hidden, false);
   assert.equal(progressPercent.textContent, "100%");
@@ -1294,6 +1318,259 @@ test("popup uses parallel extension range download for bilivideo media", async (
 });
 
 
+test("popup muxes DASH segments into one MP4 download", async () => {
+  const code = await readFile("extension/src/popup.js", "utf8");
+  const runtimeMessages = [];
+  const fetchCalls = [];
+  const statusElement = textElement();
+  const qualitySelect = selectElement();
+  const progressPanel = panelElement();
+  const progressPercent = textElement();
+  const progressBar = styleElement();
+  const progressSize = textElement();
+  const progressSpeed = textElement();
+  const savedAnchors = [];
+  const objectUrls = [];
+  const muxCalls = [];
+  class TestURL extends URL {
+    static createObjectURL(blob) {
+      const value = `blob:dash-mux-test/${objectUrls.length + 1}`;
+      objectUrls.push({ value, blob });
+      return value;
+    }
+
+    static revokeObjectURL() {}
+  }
+
+  const sandbox = {
+    Blob,
+    Date,
+    Error,
+    RegExp,
+    String,
+    URL: TestURL,
+    console,
+    globalThis: null,
+    async fetch(url, options = {}) {
+      fetchCalls.push({ url, headers: options.headers || {} });
+      const body = String(url).includes("video")
+        ? new Blob([makeFragmentedVideoTrack()], { type: "video/mp4" })
+        : new Blob([makeFragmentedAudioTrack()], { type: "audio/mp4" });
+      return {
+        ok: true,
+        status: options.headers?.Range ? 206 : 200,
+        statusText: "OK",
+        headers: {
+          get(name) {
+            if (name.toLowerCase() === "content-length") {
+              return String(body.size);
+            }
+            if (name.toLowerCase() === "content-type") {
+              return body.type;
+            }
+            return null;
+          }
+        },
+        async blob() {
+          return body;
+        }
+      };
+    },
+    navigator: {
+      clipboard: {
+        async writeText() {}
+      }
+    },
+    setTimeout(callback) {
+      callback();
+      return 1;
+    },
+    document: {
+      addEventListener() {},
+      body: {
+        append() {}
+      },
+      createElement(tagName) {
+        if (tagName === "a") {
+          return {
+            href: "",
+            download: "",
+            rel: "",
+            click() {
+              savedAnchors.push({
+                href: this.href,
+                download: this.download,
+                rel: this.rel
+              });
+            },
+            remove() {}
+          };
+        }
+        return optionElement();
+      },
+      querySelector(selector) {
+        return {
+          "#status": statusElement,
+          "#bvid": textElement(),
+          "#title": textElement(),
+          "#quality": qualitySelect,
+          "#copy": buttonElement(),
+          "#download": buttonElement(),
+          "#diagnostic": buttonElement(),
+          "#progress": progressPanel,
+          "#progress-percent": progressPercent,
+          "#progress-bar": progressBar,
+          "#progress-size": progressSize,
+          "#progress-speed": progressSpeed
+        }[selector];
+      }
+    },
+    chrome: {
+      tabs: {
+        async query() {
+          return [{
+            id: 99,
+            url: "https://www.bilibili.com/video/BV1KGj36QEG3/",
+            title: "Smoke Video"
+          }];
+        },
+        async sendMessage() {
+          return {
+            bvid: "BV1KGj36QEG3",
+            title: "Smoke Video",
+            url: "https://www.bilibili.com/video/BV1KGj36QEG3/"
+          };
+        }
+      },
+      runtime: {
+        connect() {
+          return {
+            onMessage: {
+              addListener() {}
+            }
+          };
+        },
+        onMessage: {
+          addListener() {}
+        },
+        async sendMessage(message) {
+          runtimeMessages.push(message);
+          if (message.type === "BILI_DOWNLOAD_GET_DIAGNOSTIC") {
+            return { ok: true, payload: null };
+          }
+          if (message.type === "BILI_DOWNLOAD_LOAD_VIDEO") {
+            return {
+              ok: true,
+              payload: {
+                bvid: "BV1KGj36QEG3",
+                title: "Smoke Video",
+                page: { cid: 123 },
+                currentQuality: 116,
+                qualities: [{ code: 116, label: "116 - 1080P60" }]
+              }
+            };
+          }
+          if (message.type === "BILI_DOWNLOAD_PREPARE_DIRECT") {
+            return {
+              ok: true,
+              payload: {
+                count: 2,
+                mode: "dash",
+                segments: [
+                  {
+                    url: "https://primary.bilivideo.com/video.m4s",
+                    filename: "BiliDownload/Smoke Video_116_video.m4s",
+                    size: 1024 * 1024,
+                    candidates: [{ url: "https://primary.bilivideo.com/video.m4s", kind: "primary", size: 1024 * 1024 }],
+                    context: {
+                      bvid: "BV1KGj36QEG3",
+                      cid: 123,
+                      quality: 116,
+                      title: "Smoke Video",
+                      segmentIndex: 1,
+                      segmentCount: 2,
+                      role: "video",
+                      roleLabel: "video",
+                      format: "dash",
+                      downloadMethod: "page-blob"
+                    }
+                  },
+                  {
+                    url: "https://primary.bilivideo.com/audio.m4s",
+                    filename: "BiliDownload/Smoke Video_116_audio.m4s",
+                    size: 512 * 1024,
+                    candidates: [{ url: "https://primary.bilivideo.com/audio.m4s", kind: "primary", size: 512 * 1024 }],
+                    context: {
+                      bvid: "BV1KGj36QEG3",
+                      cid: 123,
+                      quality: 116,
+                      title: "Smoke Video",
+                      segmentIndex: 2,
+                      segmentCount: 2,
+                      role: "audio",
+                      roleLabel: "audio",
+                      format: "dash",
+                      downloadMethod: "page-blob"
+                    }
+                  }
+                ]
+              }
+            };
+          }
+          if (message.type === "BILI_DOWNLOAD_SAVE_DIAGNOSTIC") {
+            return { ok: true };
+          }
+          throw new Error(`unexpected runtime message: ${message.type}`);
+        }
+      },
+      scripting: {
+        async executeScript() {
+          throw new Error("bilivideo DASH should use extension fetch path");
+        }
+      }
+    }
+  };
+  sandbox.globalThis = sandbox;
+  sandbox.__biliDownloadMuxer = {
+    async muxDashToMp4({ videoBlob, audioBlob, outputName }) {
+      muxCalls.push({ videoSize: videoBlob.size, audioSize: audioBlob.size, outputName });
+      return {
+        blob: new Blob([new Uint8Array(200)], { type: "video/mp4" }),
+        filename: outputName,
+        video: { codec: "avc1.640032", samples: 3 },
+        audio: { codec: "mp4a.40.2", samples: 4 }
+      };
+    }
+  };
+
+  vm.createContext(sandbox);
+  vm.runInContext(code, sandbox);
+
+  await sandbox.initialize();
+  qualitySelect.value = "116";
+  await sandbox.downloadSelectedQuality();
+
+  assert.equal(fetchCalls.length, 2);
+  assert.equal(savedAnchors.length, 1);
+  assert.equal(savedAnchors[0].download, "Smoke Video_116.mp4");
+  assert.equal(muxCalls.length, 1);
+  assert.equal(muxCalls[0].outputName, "BiliDownload/Smoke Video_116.mp4");
+  assert.match(statusElement.textContent, /MP4/);
+  assert.equal(progressPanel.hidden, false);
+  assert.equal(progressPercent.textContent, "100%");
+  assert.equal(progressBar.style.width, "100%");
+  const savedDiagnostic = runtimeMessages
+    .filter((message) => message.type === "BILI_DOWNLOAD_SAVE_DIAGNOSTIC")
+    .at(-1).payload;
+  assert.equal(savedDiagnostic.phase, "complete");
+  assert.equal(savedDiagnostic.saved.mode, "dash-muxed-mp4");
+  assert.equal(savedDiagnostic.saved.filename, "BiliDownload/Smoke Video_116.mp4");
+  assert.equal(savedDiagnostic.mux.ok, true);
+  assert.equal(savedDiagnostic.segmentDiagnostics.length, 2);
+  assert.equal(savedDiagnostic.segmentDiagnostics[0].blob, undefined);
+});
+
+
 test("background captures interrupted download diagnostics", async () => {
   const code = await readFile("extension/src/background.js", "utf8");
   const downloadItems = new Map();
@@ -1548,4 +1825,72 @@ function jsonResponse(payload) {
     ok: true,
     json: async () => payload
   };
+}
+
+
+function makeFragmentedVideoTrack() {
+  const target = new ArrayBufferTarget();
+  const muxer = new Muxer({
+    target,
+    video: {
+      codec: "avc",
+      width: 16,
+      height: 16,
+      frameRate: 30
+    },
+    fastStart: "fragmented"
+  });
+  const meta = {
+    decoderConfig: {
+      codec: "avc1.42001e",
+      description: new Uint8Array([1, 66, 0, 30, 255, 225, 0, 0, 1, 0, 0])
+    }
+  };
+  for (let index = 0; index < 3; index += 1) {
+    muxer.addVideoChunkRaw(
+      new Uint8Array([0, 0, 0, 1, 0x65, index]),
+      index === 0 ? "key" : "delta",
+      index * 33333,
+      33333,
+      meta
+    );
+  }
+  muxer.finalize();
+  return target.buffer;
+}
+
+
+function makeFragmentedAudioTrack() {
+  const target = new ArrayBufferTarget();
+  const muxer = new Muxer({
+    target,
+    audio: {
+      codec: "aac",
+      sampleRate: 48000,
+      numberOfChannels: 2
+    },
+    fastStart: "fragmented"
+  });
+  for (let index = 0; index < 4; index += 1) {
+    muxer.addAudioChunkRaw(
+      new Uint8Array([0x21, 0x10, index]),
+      "key",
+      index * 21333,
+      21333
+    );
+  }
+  muxer.finalize();
+  return target.buffer;
+}
+
+
+function parseMp4Info(buffer) {
+  return new Promise((resolve, reject) => {
+    const file = MP4Box.createFile();
+    file.onError = (error) => reject(error instanceof Error ? error : new Error(String(error)));
+    file.onReady = (info) => resolve(info);
+    buffer.fileStart = 0;
+    file.appendBuffer(buffer);
+    file.flush();
+  });
 }

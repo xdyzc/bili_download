@@ -9,16 +9,16 @@ This folder contains the pure browser-extension prototype for Bili Download.
 - Uses the browser's current Bilibili login cookie and shows the detected account in the popup.
 - Fetches video metadata, all cookie-accessible qualities, and DASH stream metadata from Bilibili web APIs.
 - Downloads directly available non-DASH streams as a single browser download.
-- Downloads DASH qualities as separate video and audio `.m4s` files.
+- Downloads DASH qualities and muxes video/audio into a single MP4 in the browser.
 - Falls back to the browser downloads API and records diagnostics if page-context downloading fails.
 - No local `bili.json` import is needed for the extension.
 
 ## Current Limits
 
-- DASH video/audio muxing is not handled yet, so high-quality DASH downloads are saved as two files.
+- Browser-side DASH muxing currently remuxes supported MP4-based DASH streams without re-encoding.
 - Danmaku download and burning are not handled yet.
 - The extension only downloads content that the current browser session can access.
-- Page-context downloads currently buffer the whole file before saving, so large-file streaming is still a future step.
+- Page-context downloads and browser muxing currently buffer media in memory before saving, so very large files can be memory-heavy.
 
 ## Load Locally
 
@@ -40,4 +40,4 @@ Run the extension smoke test from the project root:
 
 ## Next Milestone
 
-Evaluate browser-side MP4 muxing for DASH video/audio files.
+Improve large-file streaming and add danmaku support.

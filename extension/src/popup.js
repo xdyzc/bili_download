@@ -6,8 +6,9 @@ const TEXT = {
   noVideo: "\u5f53\u524d\u9875\u9762\u4e0d\u662f Bilibili \u89c6\u9891\u9875",
   noQuality: "\u6ca1\u6709\u53ef\u7528\u6e05\u6670\u5ea6",
   downloading: "\u6b63\u5728\u8bf7\u6c42\u89c6\u9891\u6587\u4ef6...",
+  muxing: "\u6b63\u5728\u5408\u5e76 MP4...",
   downloadStarted: "\u4e0b\u8f7d\u5df2\u5f00\u59cb",
-  dashPartsSaved: "DASH \u89c6\u9891\u548c\u97f3\u9891\u5df2\u5206\u522b\u4fdd\u5b58",
+  dashMuxed: "DASH \u5df2\u5408\u5e76\u4e3a MP4",
   diagnosticCopied: "\u8bca\u65ad\u4fe1\u606f\u5df2\u590d\u5236",
   noDiagnostic: "\u6682\u65e0\u8bca\u65ad\u4fe1\u606f"
 };
@@ -217,19 +218,21 @@ async function downloadSelectedQuality() {
       throw new Error(prepared?.error || "Failed to prepare download.");
     }
 
-    const diagnostics = [];
-    for (const [index, segment] of prepared.payload.segments.entries()) {
-      const role = segment.context?.roleLabel || segment.context?.role || "";
-      const suffix = role ? ` ${index + 1}/${prepared.payload.count} ${role}` : ` ${index + 1}/${prepared.payload.count}`;
-      setStatus(`${TEXT.downloading}${suffix}`);
-      const diagnostic = await downloadSegment(segment);
-      diagnostics.push(diagnostic);
-      state.lastDiagnostic = diagnostic;
+    if (prepared.payload.mode === "dash") {
+      await downloadDashAsMp4(prepared.payload);
+    } else {
+      const diagnostics = [];
+      for (const [index, segment] of prepared.payload.segments.entries()) {
+        const role = segment.context?.roleLabel || segment.context?.role || "";
+        const suffix = role ? ` ${index + 1}/${prepared.payload.count} ${role}` : ` ${index + 1}/${prepared.payload.count}`;
+        setStatus(`${TEXT.downloading}${suffix}`);
+        const diagnostic = await downloadSegment(segment);
+        diagnostics.push(diagnostic);
+        state.lastDiagnostic = diagnostic;
+      }
+      setStatus(`${TEXT.downloadStarted}: ${prepared.payload.count}`);
+      await saveDiagnostic(state.lastDiagnostic);
     }
-    setStatus(prepared.payload.mode === "dash"
-      ? `${TEXT.dashPartsSaved}: ${prepared.payload.count}`
-      : `${TEXT.downloadStarted}: ${prepared.payload.count}`);
-    await saveDiagnostic(state.lastDiagnostic);
   } catch (error) {
     if (error.diagnostic) {
       state.lastDiagnostic = error.diagnostic;
@@ -241,24 +244,77 @@ async function downloadSelectedQuality() {
   }
 }
 
-async function downloadSegment(segment) {
+async function downloadDashAsMp4(prepared) {
+  const downloads = [];
+  for (const [index, segment] of prepared.segments.entries()) {
+    const role = segment.context?.roleLabel || segment.context?.role || "";
+    const suffix = role ? ` ${index + 1}/${prepared.count} ${role}` : ` ${index + 1}/${prepared.count}`;
+    setStatus(`${TEXT.downloading}${suffix}`);
+    const diagnostic = await downloadSegment(segment, { save: false });
+    downloads.push({
+      segment,
+      diagnostic,
+      blob: diagnostic.blob
+    });
+    delete diagnostic.blob;
+    state.lastDiagnostic = diagnostic;
+  }
+
+  const video = downloads.find((item) => item.segment.context?.role === "video");
+  const audio = downloads.find((item) => item.segment.context?.role === "audio");
+  if (!video?.blob || !audio?.blob) {
+    throw new Error("DASH video or audio data was not downloaded.");
+  }
+
+  setStatus(TEXT.muxing);
+  beginMuxProgress(video.blob.size + audio.blob.size);
+  try {
+    const { muxDashToMp4 } = await loadDashMuxer();
+    const merged = await muxDashToMp4({
+      videoBlob: video.blob,
+      audioBlob: audio.blob,
+      outputName: dashOutputFilename(prepared)
+    });
+    const downloadFilename = filenameForPageDownload(merged.filename);
+    saveBlob(merged.blob, downloadFilename);
+    completeProgress({
+      size: merged.blob.size,
+      totalBytes: merged.blob.size,
+      receivedBytes: merged.blob.size
+    });
+    const diagnostic = createMuxDiagnostic(prepared, downloads, merged);
+    state.lastDiagnostic = diagnostic;
+    await saveDiagnostic(diagnostic);
+    setStatus(`${TEXT.dashMuxed}: ${downloadFilename}`);
+  } catch (error) {
+    const diagnostic = createMuxDiagnostic(prepared, downloads, null, error);
+    state.lastDiagnostic = diagnostic;
+    await saveDiagnostic(diagnostic);
+    throw diagnosticError(error.message, diagnostic);
+  }
+}
+
+async function downloadSegment(segment, options = {}) {
   const diagnostic = createPageDiagnostic(segment);
+  const downloadOptions = {
+    save: options.save !== false
+  };
   if (isExtensionFetchPreferred(segment.url)) {
     try {
-      return await downloadViaExtensionBlob(segment, diagnostic, null);
+      return await downloadViaExtensionBlob(segment, diagnostic, null, downloadOptions);
     } catch (error) {
-      return downloadViaPageBlob(segment, diagnostic, error);
+      return downloadViaPageBlob(segment, diagnostic, error, downloadOptions);
     }
   }
 
   try {
-    return await downloadViaPageBlob(segment, diagnostic, null);
+    return await downloadViaPageBlob(segment, diagnostic, null, downloadOptions);
   } catch (error) {
-    return downloadViaExtensionBlob(segment, diagnostic, error);
+    return downloadViaExtensionBlob(segment, diagnostic, error, downloadOptions);
   }
 }
 
-async function downloadViaPageBlob(segment, diagnostic = createPageDiagnostic(segment), previousError = null) {
+async function downloadViaPageBlob(segment, diagnostic = createPageDiagnostic(segment), previousError = null, options = {}) {
   const candidates = readCandidates(segment);
   let lastError = previousError;
 
@@ -292,6 +348,7 @@ async function downloadViaPageBlob(segment, diagnostic = createPageDiagnostic(se
         args: [
           candidate.url,
           filenameForPageDownload(segment.filename),
+          options.save !== false,
           {
             segmentIndex: segment.context?.segmentIndex || 1,
             segmentCount: segment.context?.segmentCount || 1,
@@ -340,8 +397,12 @@ async function downloadViaPageBlob(segment, diagnostic = createPageDiagnostic(se
         mime: result.mime,
         size: result.size,
         method: "page-blob",
-        mode: result.mode
+        mode: result.mode,
+        savedToDisk: result.savedToDisk !== false
       };
+      if (result.blob && options.save === false) {
+        diagnostic.blob = result.blob;
+      }
       await saveDiagnostic(diagnostic);
       return diagnostic;
     } catch (error) {
@@ -367,10 +428,10 @@ async function downloadViaPageBlob(segment, diagnostic = createPageDiagnostic(se
     }
   }
 
-  return downloadViaExtensionBlob(segment, diagnostic, lastError);
+  return downloadViaExtensionBlob(segment, diagnostic, lastError, options);
 }
 
-async function downloadViaExtensionBlob(segment, diagnostic, previousError) {
+async function downloadViaExtensionBlob(segment, diagnostic, previousError, options = {}) {
   const candidates = readCandidates(segment);
   let lastError = previousError;
 
@@ -399,6 +460,7 @@ async function downloadViaExtensionBlob(segment, diagnostic, previousError) {
       const result = await fetchMediaInExtension(
         candidate.url,
         filenameForPageDownload(segment.filename),
+        options.save !== false,
         {
           segmentIndex: segment.context?.segmentIndex || 1,
           segmentCount: segment.context?.segmentCount || 1,
@@ -444,8 +506,12 @@ async function downloadViaExtensionBlob(segment, diagnostic, previousError) {
         mime: result.mime,
         size: result.size,
         method: "extension-blob",
-        mode: result.mode
+        mode: result.mode,
+        savedToDisk: result.savedToDisk !== false
       };
+      if (result.blob && options.save === false) {
+        diagnostic.blob = result.blob;
+      }
       await saveDiagnostic(diagnostic);
       return diagnostic;
     } catch (error) {
@@ -535,6 +601,66 @@ function createPageDiagnostic(segment) {
   };
 }
 
+function createMuxDiagnostic(prepared, downloads, merged = null, error = null) {
+  const firstSegment = prepared.segments?.[0] || {};
+  const diagnostic = {
+    version: 3,
+    createdAt: new Date().toISOString(),
+    phase: error ? "mux-error" : "complete",
+    context: {
+      ...(firstSegment.context || {}),
+      format: "dash-muxed",
+      segmentCount: prepared.count,
+      downloadMethod: "browser-mux"
+    },
+    request: {
+      media: downloads.map((item) => ({
+        role: item.segment.context?.role || "",
+        source: summarizeUrl(item.segment.url),
+        filename: item.segment.filename,
+        size: item.blob?.size || item.diagnostic?.saved?.size || 0
+      })),
+      filename: merged?.filename || dashOutputFilename(prepared)
+    },
+    events: [],
+    dnrMatchedEvents: [],
+    segmentDiagnostics: downloads.map((item) => sanitizeDiagnosticForNested(item.diagnostic)),
+    mux: merged
+      ? {
+          ok: true,
+          video: merged.video,
+          audio: merged.audio,
+          size: merged.blob.size
+        }
+      : {
+          ok: false,
+          error: error?.message || "Mux failed."
+        }
+  };
+
+  if (merged) {
+    diagnostic.saved = {
+      filename: merged.filename,
+      mime: merged.blob.type,
+      size: merged.blob.size,
+      method: "browser-mux",
+      mode: "dash-muxed-mp4"
+    };
+  } else {
+    diagnostic.error = error?.message || "Mux failed.";
+  }
+  return diagnostic;
+}
+
+function sanitizeDiagnosticForNested(diagnostic) {
+  if (!diagnostic) {
+    return null;
+  }
+  const copy = { ...diagnostic };
+  delete copy.blob;
+  return copy;
+}
+
 function pickFetchResult(response) {
   if (!response) {
     return null;
@@ -559,7 +685,8 @@ function pickFetchResult(response) {
     mode: response.mode,
     chunkCount: response.chunkCount,
     concurrency: response.concurrency,
-    fallback: response.fallback
+    fallback: response.fallback,
+    savedToDisk: response.savedToDisk
   };
 }
 
@@ -592,6 +719,22 @@ function filenameForPageDownload(filename) {
   return normalized.split("/").filter(Boolean).pop() || "bili_video.mp4";
 }
 
+function dashOutputFilename(prepared) {
+  const video = prepared.segments?.find((segment) => segment.context?.role === "video") || prepared.segments?.[0];
+  const normalized = String(video?.filename || "BiliDownload/bili_video.mp4")
+    .replace(/\\/g, "/")
+    .replace(/_(video|audio)\.m4s$/i, ".mp4")
+    .replace(/\.m4s$/i, ".mp4");
+  return normalized.endsWith(".mp4") ? normalized : `${normalized}.mp4`;
+}
+
+async function loadDashMuxer() {
+  if (globalThis.__biliDownloadMuxer) {
+    return globalThis.__biliDownloadMuxer;
+  }
+  return import("./dash-muxer.mjs");
+}
+
 function readCandidates(segment) {
   const candidates = Array.isArray(segment?.candidates)
     ? segment.candidates.filter((candidate) => candidate?.url)
@@ -614,7 +757,7 @@ function isExtensionFetchPreferred(value) {
   }
 }
 
-async function downloadMediaInPage(url, filename, progressContext) {
+async function downloadMediaInPage(url, filename, saveToDisk, progressContext) {
   const sendProgress = (payload) => {
     try {
       window.dispatchEvent(new CustomEvent("bili-download-progress", {
@@ -698,17 +841,19 @@ async function downloadMediaInPage(url, filename, progressContext) {
       type: mime
     });
 
-    const blobUrl = URL.createObjectURL(body);
-    try {
-      const anchor = document.createElement("a");
-      anchor.href = blobUrl;
-      anchor.download = filename;
-      anchor.rel = "noopener";
-      document.body.append(anchor);
-      anchor.click();
-      anchor.remove();
-    } finally {
-      setTimeout(() => URL.revokeObjectURL(blobUrl), 30000);
+    if (saveToDisk !== false) {
+      const blobUrl = URL.createObjectURL(body);
+      try {
+        const anchor = document.createElement("a");
+        anchor.href = blobUrl;
+        anchor.download = filename;
+        anchor.rel = "noopener";
+        document.body.append(anchor);
+        anchor.click();
+        anchor.remove();
+      } finally {
+        setTimeout(() => URL.revokeObjectURL(blobUrl), 30000);
+      }
     }
 
     return {
@@ -721,7 +866,9 @@ async function downloadMediaInPage(url, filename, progressContext) {
       totalBytes: contentLength || body.size,
       receivedBytes,
       filename,
-      mode: "page-blob"
+      mode: "page-blob",
+      savedToDisk: saveToDisk !== false,
+      blob: saveToDisk === false ? body : null
     };
   } catch (error) {
     return {
@@ -733,15 +880,15 @@ async function downloadMediaInPage(url, filename, progressContext) {
   }
 }
 
-async function fetchMediaInExtension(url, filename, progressContext) {
+async function fetchMediaInExtension(url, filename, saveToDisk, progressContext) {
   const expectedSize = Number(progressContext?.totalBytes) || 0;
   if (expectedSize >= PARALLEL_RANGE_MIN_BYTES) {
-    const parallelResult = await fetchMediaInExtensionRanges(url, filename, progressContext, expectedSize);
+    const parallelResult = await fetchMediaInExtensionRanges(url, filename, saveToDisk, progressContext, expectedSize);
     if (parallelResult?.ok && parallelResult.responseOk) {
       return parallelResult;
     }
 
-    const singleResult = await fetchMediaInExtensionSingle(url, filename, progressContext);
+    const singleResult = await fetchMediaInExtensionSingle(url, filename, saveToDisk, progressContext);
     if (singleResult) {
       singleResult.fallback = {
         from: "extension-range",
@@ -751,10 +898,10 @@ async function fetchMediaInExtension(url, filename, progressContext) {
     return singleResult;
   }
 
-  return fetchMediaInExtensionSingle(url, filename, progressContext);
+  return fetchMediaInExtensionSingle(url, filename, saveToDisk, progressContext);
 }
 
-async function fetchMediaInExtensionSingle(url, filename, progressContext) {
+async function fetchMediaInExtensionSingle(url, filename, saveToDisk, progressContext) {
   try {
     const response = await fetch(url, {
       credentials: "include",
@@ -831,7 +978,9 @@ async function fetchMediaInExtensionSingle(url, filename, progressContext) {
       type: mime
     });
 
-    saveBlob(body, filename);
+    if (saveToDisk !== false) {
+      saveBlob(body, filename);
+    }
 
     return {
       ok: true,
@@ -843,7 +992,9 @@ async function fetchMediaInExtensionSingle(url, filename, progressContext) {
       totalBytes: contentLength || body.size,
       receivedBytes,
       filename,
-      mode: "extension-single"
+      mode: "extension-single",
+      savedToDisk: saveToDisk !== false,
+      blob: saveToDisk === false ? body : null
     };
   } catch (error) {
     return {
@@ -855,7 +1006,7 @@ async function fetchMediaInExtensionSingle(url, filename, progressContext) {
   }
 }
 
-async function fetchMediaInExtensionRanges(url, filename, progressContext, totalBytes) {
+async function fetchMediaInExtensionRanges(url, filename, saveToDisk, progressContext, totalBytes) {
   const ranges = buildRanges(totalBytes, PARALLEL_RANGE_CHUNK_BYTES);
   const chunks = new Array(ranges.length);
   const rangeProgress = new Array(ranges.length).fill(0);
@@ -902,7 +1053,9 @@ async function fetchMediaInExtensionRanges(url, filename, progressContext, total
     const body = new Blob(chunks, {
       type: "video/mp4"
     });
-    saveBlob(body, filename);
+    if (saveToDisk !== false) {
+      saveBlob(body, filename);
+    }
     return {
       ok: true,
       responseOk: true,
@@ -915,7 +1068,9 @@ async function fetchMediaInExtensionRanges(url, filename, progressContext, total
       filename,
       mode: "extension-range",
       chunkCount: ranges.length,
-      concurrency: workerCount
+      concurrency: workerCount,
+      savedToDisk: saveToDisk !== false,
+      blob: saveToDisk === false ? body : null
     };
   } catch (error) {
     return {
@@ -1026,6 +1181,22 @@ function beginCandidateProgress(context) {
   state.progress.segmentCount = context.segmentCount;
   state.progress.candidateIndex = context.candidateIndex;
   state.progress.candidateCount = context.candidateCount;
+  renderProgress();
+}
+
+function beginMuxProgress(totalBytes) {
+  const size = Number(totalBytes) || 0;
+  state.progress.active = true;
+  state.progress.receivedBytes = size;
+  state.progress.totalBytes = size;
+  state.progress.percent = size ? 100 : 0;
+  state.progress.speedBytesPerSecond = 0;
+  state.progress.startedAt = Date.now();
+  state.progress.lastAt = Date.now();
+  state.progress.segmentIndex = 0;
+  state.progress.segmentCount = 0;
+  state.progress.candidateIndex = 0;
+  state.progress.candidateCount = 0;
   renderProgress();
 }
 

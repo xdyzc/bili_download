@@ -617,6 +617,146 @@ test("background reads browser cookie account and prepares DASH streams", async 
 });
 
 
+test("background falls back to legacy direct streams when DASH lacks selected quality", async () => {
+  const code = await readFile("extension/src/background.js", "utf8");
+  const fetchUrls = [];
+  let messageListener = null;
+
+  const sandbox = {
+    Array,
+    Date,
+    Error,
+    Number,
+    Promise,
+    String,
+    URL,
+    URLSearchParams,
+    clearTimeout,
+    setTimeout,
+    chrome: {
+      runtime: {
+        lastError: null,
+        onMessage: {
+          addListener(listener) {
+            messageListener = listener;
+          }
+        },
+        onConnect: {
+          addListener() {}
+        }
+      },
+      declarativeNetRequest: {
+        onRuleMatchedDebug: {
+          addListener() {}
+        }
+      },
+      storage: {
+        local: {
+          async get() {
+            return {};
+          },
+          async set() {}
+        }
+      }
+    },
+    fetch: async (url) => {
+      const value = String(url);
+      fetchUrls.push(value);
+      if (value.includes("/x/player/playurl") && value.includes("fnval=4048")) {
+        return jsonResponse({
+          code: 0,
+          data: {
+            quality: 64,
+            format: "mp4",
+            accept_quality: [64, 32, 16],
+            accept_description: ["高清 720P", "清晰 480P", "流畅 360P"],
+            durl: [],
+            dash: {
+              video: [
+                {
+                  id: 32,
+                  base_url: "https://video-primary.bilivideo.com/32.m4s",
+                  bandwidth: 800000,
+                  codecs: "avc1.64001f",
+                  mime_type: "video/mp4",
+                  width: 852,
+                  height: 480,
+                  frame_rate: "30.000",
+                  size: 4 * 1024 * 1024
+                },
+                {
+                  id: 16,
+                  base_url: "https://video-primary.bilivideo.com/16.m4s",
+                  bandwidth: 400000,
+                  codecs: "avc1.64001e",
+                  mime_type: "video/mp4",
+                  width: 640,
+                  height: 360,
+                  frame_rate: "30.000",
+                  size: 2 * 1024 * 1024
+                }
+              ],
+              audio: [{
+                id: 30216,
+                base_url: "https://audio-primary.bilivideo.com/audio.m4s",
+                bandwidth: 64000,
+                codecs: "mp4a.40.2",
+                mime_type: "audio/mp4",
+                size: 1024 * 1024
+              }]
+            }
+          }
+        });
+      }
+      if (value.includes("/x/player/playurl") && value.includes("fnval=0")) {
+        return jsonResponse({
+          code: 0,
+          data: {
+            quality: 64,
+            format: "mp4",
+            accept_quality: [64, 32, 16],
+            accept_description: ["高清 720P", "清晰 480P", "流畅 360P"],
+            durl: [{
+              url: "https://legacy.hdslb.test/video-720.mp4",
+              size: 7 * 1024 * 1024,
+              backup_url: ["https://legacy-backup.hdslb.test/video-720.mp4"]
+            }]
+          }
+        });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    }
+  };
+
+  vm.createContext(sandbox);
+  vm.runInContext(code, sandbox);
+
+  const preparedResponse = await sendRuntimeMessage(messageListener, {
+    type: "BILI_DOWNLOAD_PREPARE_DIRECT",
+    payload: {
+      bvid: "BV1MqL96rEGB",
+      cid: 123,
+      quality: 64,
+      title: "No Cookie Video"
+    }
+  });
+
+  assert.equal(preparedResponse.ok, true);
+  assert.equal(preparedResponse.payload.mode, "durl");
+  assert.equal(preparedResponse.payload.segments[0].filename, "BiliDownload/No Cookie Video_64.mp4");
+  assert.equal(preparedResponse.payload.segments[0].context.quality, 64);
+  assert.deepEqual(
+    toPlain(preparedResponse.payload.segments[0].candidates),
+    [
+      { url: "https://legacy.hdslb.test/video-720.mp4", kind: "primary", size: 7 * 1024 * 1024 },
+      { url: "https://legacy-backup.hdslb.test/video-720.mp4", kind: "backup", size: 7 * 1024 * 1024 }
+    ]
+  );
+  assert.ok(fetchUrls.some((url) => url.includes("fnval=4048")));
+  assert.ok(fetchUrls.some((url) => url.includes("fnval=0")));
+});
+
+
 test("popup uses page context blob download before fallback", async () => {
   const code = await readFile("extension/src/popup.js", "utf8");
   const scriptCalls = [];

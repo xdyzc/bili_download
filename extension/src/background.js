@@ -264,16 +264,9 @@ async function prepareDirectDownload(payload) {
   }
 
   const playUrl = await fetchPlayUrl({ bvid, cid, quality });
-  const directSegments = Array.isArray(playUrl.durl)
-    ? playUrl.durl
-        .map((item) => ({
-          source: item,
-          candidates: buildSegmentCandidates(item)
-        }))
-        .filter((item) => item.candidates.length)
-    : [];
+  const directSegments = buildDirectSegmentPlans(playUrl);
 
-  if (playUrl.dashVideos.some((stream) => stream.id === quality)) {
+  if (hasDashQuality(playUrl, quality)) {
     return prepareDashSegments({
       bvid,
       cid,
@@ -287,24 +280,38 @@ async function prepareDirectDownload(payload) {
     return prepareDurlSegments({
       bvid,
       cid,
-      quality,
+      quality: responseQuality(playUrl, quality),
       title,
       playUrl,
       segments: directSegments
     });
   }
 
-  if (playUrl.dashVideos.length) {
-    return prepareDashSegments({
+  const directPlayUrl = await fetchPlayUrl({ bvid, cid, quality, fnval: 0 });
+  const legacyDirectSegments = buildDirectSegmentPlans(directPlayUrl);
+  if (legacyDirectSegments.length) {
+    return prepareDurlSegments({
       bvid,
       cid,
-      quality,
+      quality: responseQuality(directPlayUrl, quality),
       title,
-      playUrl
+      playUrl: directPlayUrl,
+      segments: legacyDirectSegments
     });
   }
 
   throw new Error("Bilibili did not return a downloadable direct or DASH stream.");
+}
+
+function buildDirectSegmentPlans(playUrl) {
+  return Array.isArray(playUrl.durl)
+    ? playUrl.durl
+        .map((item) => ({
+          source: item,
+          candidates: buildSegmentCandidates(item)
+        }))
+        .filter((item) => item.candidates.length)
+    : [];
 }
 
 function prepareDurlSegments({ bvid, cid, quality, title, playUrl, segments }) {
@@ -462,12 +469,12 @@ function readCandidates(segment) {
   return segment?.url ? [{ url: segment.url, kind: "primary" }] : [];
 }
 
-async function fetchPlayUrl({ bvid, cid, quality }) {
+async function fetchPlayUrl({ bvid, cid, quality, fnval = 4048 }) {
   const params = new URLSearchParams({
     bvid,
     cid: String(cid),
     qn: String(quality || 127),
-    fnval: "4048",
+    fnval: String(fnval),
     fnver: "0",
     fourk: "0",
     otype: "json"
@@ -581,6 +588,14 @@ function selectDashVideo(playUrl, requestedQuality) {
   return candidates.reduce((best, stream) => (
     compareDashStreams(stream, best) > 0 ? stream : best
   ));
+}
+
+function hasDashQuality(playUrl, requestedQuality) {
+  return playUrl.dashVideos.some((stream) => stream.id === requestedQuality);
+}
+
+function responseQuality(playUrl, requestedQuality) {
+  return Number(playUrl.quality) || requestedQuality;
 }
 
 function selectDashAudio(playUrl) {

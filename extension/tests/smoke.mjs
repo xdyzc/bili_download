@@ -15,6 +15,7 @@ test("manifest declares a pure browser extension MVP", async () => {
   assert.ok(manifest.permissions.includes("scripting"));
   assert.ok(manifest.permissions.includes("storage"));
   assert.ok(manifest.host_permissions.includes("https://api.bilibili.com/*"));
+  assert.ok(manifest.host_permissions.includes("https://*.edge.mountaintoys.cn/*"));
   assert.equal(
     manifest.declarative_net_request.rule_resources[0].path,
     "rules/bili-media-headers.json"
@@ -29,7 +30,7 @@ test("media header rules use declarative request modification", async () => {
 
   assert.deepEqual(
     rules.map((item) => item.condition.urlFilter),
-    ["||bilivideo.com/", "||bilivideo.cn/", "||hdslb.com/"]
+    ["||bilivideo.com/", "||bilivideo.cn/", "||hdslb.com/", "||edge.mountaintoys.cn/"]
   );
   assert.equal(rule.action.type, "modifyHeaders");
   assert.ok(rule.condition.resourceTypes.includes("main_frame"));
@@ -1008,11 +1009,15 @@ test("popup uses parallel extension range download for bilivideo media", async (
               payload: {
                 count: 1,
                 segments: [{
-                  url: "https://upos-sz-test.bilivideo.com/video.mp4",
+                  url: "https://b-baaa4h67d1y5abm4cgw1bs90ek6ss.edge.mountaintoys.cn:4483/video.mp4",
                   filename: "BiliDownload/Smoke Video_64.mp4",
                   size: totalSize,
                   candidates: [
-                    { url: "https://upos-sz-test.bilivideo.com/video.mp4", kind: "primary", size: totalSize }
+                    {
+                      url: "https://b-baaa4h67d1y5abm4cgw1bs90ek6ss.edge.mountaintoys.cn:4483/video.mp4",
+                      kind: "primary",
+                      size: totalSize
+                    }
                   ],
                   context: {
                     bvid: "BV1KGj36QEG3",

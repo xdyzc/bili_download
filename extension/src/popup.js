@@ -579,7 +579,8 @@ function isExtensionFetchPreferred(value) {
     const host = new URL(value).hostname;
     return host.endsWith(".bilivideo.com") ||
       host.endsWith(".bilivideo.cn") ||
-      host.endsWith(".hdslb.com");
+      host.endsWith(".hdslb.com") ||
+      host.endsWith(".edge.mountaintoys.cn");
   } catch (_error) {
     return false;
   }

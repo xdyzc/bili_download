@@ -91,5 +91,36 @@
         "other"
       ]
     }
+  },
+  {
+    "id": 4,
+    "priority": 1,
+    "action": {
+      "type": "modifyHeaders",
+      "requestHeaders": [
+        {
+          "header": "Referer",
+          "operation": "set",
+          "value": "https://www.bilibili.com/"
+        },
+        {
+          "header": "Origin",
+          "operation": "set",
+          "value": "https://www.bilibili.com"
+        }
+      ]
+    },
+    "condition": {
+      "urlFilter": "||edge.mountaintoys.cn/",
+      "resourceTypes": [
+        "main_frame",
+        "sub_frame",
+        "xmlhttprequest",
+        "media",
+        "image",
+        "object",
+        "other"
+      ]
+    }
   }
 ]

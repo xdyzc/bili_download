@@ -45,6 +45,7 @@
     "https://m.bilibili.com/*",
     "https://*.bilivideo.com/*",
     "https://*.bilivideo.cn/*",
-    "https://*.hdslb.com/*"
+    "https://*.hdslb.com/*",
+    "https://*.edge.mountaintoys.cn/*"
   ]
 }

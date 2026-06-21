@@ -842,6 +842,242 @@ test("popup falls back to extension blob without navigating when page fetch fail
   assert.equal(savedDiagnostic.extensionCandidateAttempts.length, 1);
   assert.equal(savedDiagnostic.extensionCandidateAttempts[0].fetch.responseOk, true);
   assert.equal(savedDiagnostic.saved.method, "extension-blob");
+  assert.equal(savedDiagnostic.saved.mode, "extension-single");
+});
+
+
+test("popup uses parallel extension range download for bilivideo media", async () => {
+  const code = await readFile("extension/src/popup.js", "utf8");
+  const runtimeMessages = [];
+  const scriptCalls = [];
+  const fetchCalls = [];
+  const statusElement = textElement();
+  const qualitySelect = selectElement();
+  const progressPanel = panelElement();
+  const progressPercent = textElement();
+  const progressBar = styleElement();
+  const progressSize = textElement();
+  const progressSpeed = textElement();
+  const savedAnchors = [];
+  const objectUrls = [];
+  const totalSize = 12 * 1024 * 1024;
+  class TestURL extends URL {
+    static createObjectURL(blob) {
+      const value = `blob:range-test/${objectUrls.length + 1}`;
+      objectUrls.push({ value, blob });
+      return value;
+    }
+
+    static revokeObjectURL() {}
+  }
+
+  const sandbox = {
+    Blob,
+    Date,
+    Error,
+    RegExp,
+    String,
+    URL: TestURL,
+    console,
+    async fetch(url, options = {}) {
+      fetchCalls.push({ url, headers: options.headers || {} });
+      const rangeHeader = options.headers?.Range || options.headers?.range;
+      assert.ok(rangeHeader, "parallel download should use Range requests");
+      const match = String(rangeHeader).match(/bytes=(\d+)-(\d+)/);
+      assert.ok(match, `invalid range header: ${rangeHeader}`);
+      const start = Number(match[1]);
+      const end = Number(match[2]);
+      const length = end - start + 1;
+      return {
+        ok: true,
+        status: 206,
+        statusText: "Partial Content",
+        headers: {
+          get(name) {
+            if (name.toLowerCase() === "content-type") {
+              return "video/mp4";
+            }
+            if (name.toLowerCase() === "content-length") {
+              return String(length);
+            }
+            return null;
+          }
+        },
+        async blob() {
+          return new Blob([new Uint8Array(length)], { type: "video/mp4" });
+        }
+      };
+    },
+    navigator: {
+      clipboard: {
+        async writeText() {}
+      }
+    },
+    setTimeout(callback) {
+      callback();
+      return 1;
+    },
+    document: {
+      addEventListener() {},
+      body: {
+        append() {}
+      },
+      createElement(tagName) {
+        if (tagName === "a") {
+          return {
+            href: "",
+            download: "",
+            rel: "",
+            click() {
+              savedAnchors.push({
+                href: this.href,
+                download: this.download,
+                rel: this.rel
+              });
+            },
+            remove() {}
+          };
+        }
+        return optionElement();
+      },
+      querySelector(selector) {
+        return {
+          "#status": statusElement,
+          "#bvid": textElement(),
+          "#title": textElement(),
+          "#quality": qualitySelect,
+          "#copy": buttonElement(),
+          "#download": buttonElement(),
+          "#diagnostic": buttonElement(),
+          "#progress": progressPanel,
+          "#progress-percent": progressPercent,
+          "#progress-bar": progressBar,
+          "#progress-size": progressSize,
+          "#progress-speed": progressSpeed
+        }[selector];
+      }
+    },
+    chrome: {
+      tabs: {
+        async query() {
+          return [{
+            id: 99,
+            url: "https://www.bilibili.com/video/BV1KGj36QEG3/",
+            title: "Smoke Video"
+          }];
+        },
+        async sendMessage() {
+          return {
+            bvid: "BV1KGj36QEG3",
+            title: "Smoke Video",
+            url: "https://www.bilibili.com/video/BV1KGj36QEG3/"
+          };
+        }
+      },
+      runtime: {
+        connect() {
+          return {
+            onMessage: {
+              addListener() {}
+            }
+          };
+        },
+        onMessage: {
+          addListener() {}
+        },
+        async sendMessage(message) {
+          runtimeMessages.push(message);
+          if (message.type === "BILI_DOWNLOAD_GET_DIAGNOSTIC") {
+            return { ok: true, payload: null };
+          }
+          if (message.type === "BILI_DOWNLOAD_LOAD_VIDEO") {
+            return {
+              ok: true,
+              payload: {
+                bvid: "BV1KGj36QEG3",
+                title: "Smoke Video",
+                page: { cid: 123 },
+                currentQuality: 64,
+                qualities: [{ code: 64, label: "64 - 720P" }]
+              }
+            };
+          }
+          if (message.type === "BILI_DOWNLOAD_PREPARE_DIRECT") {
+            return {
+              ok: true,
+              payload: {
+                count: 1,
+                segments: [{
+                  url: "https://upos-sz-test.bilivideo.com/video.mp4",
+                  filename: "BiliDownload/Smoke Video_64.mp4",
+                  size: totalSize,
+                  candidates: [
+                    { url: "https://upos-sz-test.bilivideo.com/video.mp4", kind: "primary", size: totalSize }
+                  ],
+                  context: {
+                    bvid: "BV1KGj36QEG3",
+                    cid: 123,
+                    quality: 64,
+                    title: "Smoke Video",
+                    segmentIndex: 1,
+                    segmentCount: 1,
+                    format: "mp4",
+                    downloadMethod: "page-blob"
+                  }
+                }]
+              }
+            };
+          }
+          if (message.type === "BILI_DOWNLOAD_SAVE_DIAGNOSTIC") {
+            return { ok: true };
+          }
+          throw new Error(`unexpected runtime message: ${message.type}`);
+        }
+      },
+      scripting: {
+        async executeScript(call) {
+          scriptCalls.push(call);
+          return [{ result: { ok: false, error: "page path should not run" } }];
+        }
+      }
+    }
+  };
+
+  vm.createContext(sandbox);
+  vm.runInContext(code, sandbox);
+
+  await sandbox.initialize();
+  qualitySelect.value = "64";
+  await sandbox.downloadSelectedQuality();
+
+  assert.equal(scriptCalls.length, 0);
+  assert.equal(fetchCalls.length, 3);
+  assert.deepEqual(
+    fetchCalls.map((call) => call.headers.Range),
+    [
+      "bytes=0-4194303",
+      "bytes=4194304-8388607",
+      "bytes=8388608-12582911"
+    ]
+  );
+  assert.equal(savedAnchors.length, 1);
+  assert.match(savedAnchors[0].href, /^blob:range-test\//);
+  assert.equal(savedAnchors[0].download, "Smoke Video_64.mp4");
+  assert.equal(progressPanel.hidden, false);
+  assert.equal(progressPercent.textContent, "100%");
+  assert.equal(progressBar.style.width, "100%");
+  assert.match(progressSize.textContent, /12\.0 MB \/ 12\.0 MB/);
+  const savedDiagnostic = runtimeMessages
+    .filter((message) => message.type === "BILI_DOWNLOAD_SAVE_DIAGNOSTIC")
+    .at(-1).payload;
+  assert.equal(savedDiagnostic.phase, "complete");
+  assert.equal(savedDiagnostic.candidateAttempts.length, 0);
+  assert.equal(savedDiagnostic.extensionCandidateAttempts.length, 1);
+  assert.equal(savedDiagnostic.extensionCandidateAttempts[0].fetch.mode, "extension-range");
+  assert.equal(savedDiagnostic.extensionCandidateAttempts[0].fetch.chunkCount, 3);
+  assert.equal(savedDiagnostic.extensionCandidateAttempts[0].fetch.concurrency, 3);
+  assert.equal(savedDiagnostic.saved.method, "extension-blob");
+  assert.equal(savedDiagnostic.saved.mode, "extension-range");
 });
 
 

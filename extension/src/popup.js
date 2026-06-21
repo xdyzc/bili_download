@@ -14,6 +14,9 @@ const TEXT = {
 
 const PROGRESS_MESSAGE_TYPE = "BILI_DOWNLOAD_PAGE_PROGRESS";
 const PROGRESS_PORT_NAME = "BILI_DOWNLOAD_PROGRESS_PORT";
+const PARALLEL_RANGE_MIN_BYTES = 8 * 1024 * 1024;
+const PARALLEL_RANGE_CHUNK_BYTES = 4 * 1024 * 1024;
+const PARALLEL_RANGE_CONCURRENCY = 4;
 
 const state = {
   tabId: null,
@@ -193,7 +196,7 @@ async function downloadSelectedQuality() {
     const diagnostics = [];
     for (const [index, segment] of prepared.payload.segments.entries()) {
       setStatus(`${TEXT.downloading} ${index + 1}/${prepared.payload.count}`);
-      const diagnostic = await downloadViaPageBlob(segment);
+      const diagnostic = await downloadSegment(segment);
       diagnostics.push(diagnostic);
       state.lastDiagnostic = diagnostic;
     }
@@ -210,10 +213,26 @@ async function downloadSelectedQuality() {
   }
 }
 
-async function downloadViaPageBlob(segment) {
+async function downloadSegment(segment) {
   const diagnostic = createPageDiagnostic(segment);
+  if (isExtensionFetchPreferred(segment.url)) {
+    try {
+      return await downloadViaExtensionBlob(segment, diagnostic, null);
+    } catch (error) {
+      return downloadViaPageBlob(segment, diagnostic, error);
+    }
+  }
+
+  try {
+    return await downloadViaPageBlob(segment, diagnostic, null);
+  } catch (error) {
+    return downloadViaExtensionBlob(segment, diagnostic, error);
+  }
+}
+
+async function downloadViaPageBlob(segment, diagnostic = createPageDiagnostic(segment), previousError = null) {
   const candidates = readCandidates(segment);
-  let lastError = null;
+  let lastError = previousError;
 
   for (const [index, candidate] of candidates.entries()) {
     diagnostic.phase = "fetching-page-blob";
@@ -291,7 +310,9 @@ async function downloadViaPageBlob(segment) {
       diagnostic.saved = {
         filename: result.filename,
         mime: result.mime,
-        size: result.size
+        size: result.size,
+        method: "page-blob",
+        mode: result.mode
       };
       await saveDiagnostic(diagnostic);
       return diagnostic;
@@ -394,7 +415,8 @@ async function downloadViaExtensionBlob(segment, diagnostic, previousError) {
         filename: result.filename,
         mime: result.mime,
         size: result.size,
-        method: "extension-blob"
+        method: "extension-blob",
+        mode: result.mode
       };
       await saveDiagnostic(diagnostic);
       return diagnostic;
@@ -505,7 +527,11 @@ function pickFetchResult(response) {
     mime: response.mime,
     size: response.size,
     totalBytes: response.totalBytes,
-    receivedBytes: response.receivedBytes
+    receivedBytes: response.receivedBytes,
+    mode: response.mode,
+    chunkCount: response.chunkCount,
+    concurrency: response.concurrency,
+    fallback: response.fallback
   };
 }
 
@@ -546,6 +572,17 @@ function readCandidates(segment) {
     return candidates;
   }
   return segment?.url ? [{ url: segment.url, kind: "primary" }] : [];
+}
+
+function isExtensionFetchPreferred(value) {
+  try {
+    const host = new URL(value).hostname;
+    return host.endsWith(".bilivideo.com") ||
+      host.endsWith(".bilivideo.cn") ||
+      host.endsWith(".hdslb.com");
+  } catch (_error) {
+    return false;
+  }
 }
 
 async function downloadMediaInPage(url, filename, progressContext) {
@@ -654,18 +691,41 @@ async function downloadMediaInPage(url, filename, progressContext) {
       size: body.size,
       totalBytes: contentLength || body.size,
       receivedBytes,
-      filename
+      filename,
+      mode: "page-blob"
     };
   } catch (error) {
     return {
       ok: false,
       error: error.message,
-      filename
+      filename,
+      mode: "page-blob"
     };
   }
 }
 
 async function fetchMediaInExtension(url, filename, progressContext) {
+  const expectedSize = Number(progressContext?.totalBytes) || 0;
+  if (expectedSize >= PARALLEL_RANGE_MIN_BYTES) {
+    const parallelResult = await fetchMediaInExtensionRanges(url, filename, progressContext, expectedSize);
+    if (parallelResult?.ok && parallelResult.responseOk) {
+      return parallelResult;
+    }
+
+    const singleResult = await fetchMediaInExtensionSingle(url, filename, progressContext);
+    if (singleResult) {
+      singleResult.fallback = {
+        from: "extension-range",
+        error: parallelResult?.error || "Parallel range download failed."
+      };
+    }
+    return singleResult;
+  }
+
+  return fetchMediaInExtensionSingle(url, filename, progressContext);
+}
+
+async function fetchMediaInExtensionSingle(url, filename, progressContext) {
   try {
     const response = await fetch(url, {
       credentials: "include",
@@ -742,18 +802,7 @@ async function fetchMediaInExtension(url, filename, progressContext) {
       type: mime
     });
 
-    const blobUrl = URL.createObjectURL(body);
-    try {
-      const anchor = document.createElement("a");
-      anchor.href = blobUrl;
-      anchor.download = filename;
-      anchor.rel = "noopener";
-      document.body.append(anchor);
-      anchor.click();
-      anchor.remove();
-    } finally {
-      setTimeout(() => URL.revokeObjectURL(blobUrl), 30000);
-    }
+    saveBlob(body, filename);
 
     return {
       ok: true,
@@ -764,14 +813,158 @@ async function fetchMediaInExtension(url, filename, progressContext) {
       size: body.size,
       totalBytes: contentLength || body.size,
       receivedBytes,
-      filename
+      filename,
+      mode: "extension-single"
     };
   } catch (error) {
     return {
       ok: false,
       error: error.message,
-      filename
+      filename,
+      mode: "extension-single"
     };
+  }
+}
+
+async function fetchMediaInExtensionRanges(url, filename, progressContext, totalBytes) {
+  const ranges = buildRanges(totalBytes, PARALLEL_RANGE_CHUNK_BYTES);
+  const chunks = new Array(ranges.length);
+  const rangeProgress = new Array(ranges.length).fill(0);
+  let lastProgressAt = 0;
+
+  const emitRangeProgress = () => {
+    const now = Date.now();
+    if (now - lastProgressAt <= 180) {
+      return;
+    }
+    lastProgressAt = now;
+    updateProgress({
+      ...progressContext,
+      receivedBytes: rangeProgress.reduce((sum, value) => sum + value, 0),
+      totalBytes,
+      done: false
+    });
+  };
+
+  try {
+    let nextIndex = 0;
+    const worker = async () => {
+      while (nextIndex < ranges.length) {
+        const rangeIndex = nextIndex;
+        nextIndex += 1;
+        chunks[rangeIndex] = await fetchRangeChunk(url, ranges[rangeIndex], (loadedBytes) => {
+          rangeProgress[rangeIndex] = loadedBytes;
+          emitRangeProgress();
+        });
+        rangeProgress[rangeIndex] = ranges[rangeIndex].end - ranges[rangeIndex].start + 1;
+        emitRangeProgress();
+      }
+    };
+
+    const workerCount = Math.min(PARALLEL_RANGE_CONCURRENCY, ranges.length);
+    await Promise.all(Array.from({ length: workerCount }, () => worker()));
+    updateProgress({
+      ...progressContext,
+      receivedBytes: totalBytes,
+      totalBytes,
+      done: true
+    });
+
+    const body = new Blob(chunks, {
+      type: "video/mp4"
+    });
+    saveBlob(body, filename);
+    return {
+      ok: true,
+      responseOk: true,
+      status: 206,
+      statusText: "Partial Content",
+      mime: body.type,
+      size: body.size,
+      totalBytes,
+      receivedBytes: totalBytes,
+      filename,
+      mode: "extension-range",
+      chunkCount: ranges.length,
+      concurrency: workerCount
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error: error.message,
+      filename,
+      mode: "extension-range"
+    };
+  }
+}
+
+async function fetchRangeChunk(url, range, onProgress) {
+  const response = await fetch(url, {
+    credentials: "include",
+    headers: {
+      "Accept": "video/*,*/*;q=0.8",
+      "Range": `bytes=${range.start}-${range.end}`
+    },
+    cache: "no-store"
+  });
+
+  if (response.status !== 206) {
+    throw new Error(`Range request returned HTTP ${response.status || "unknown"}.`);
+  }
+
+  const reader = response.body?.getReader();
+  if (!reader) {
+    const body = await response.blob();
+    onProgress(body.size);
+    return body;
+  }
+
+  const chunks = [];
+  let receivedBytes = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+
+    chunks.push(value);
+    receivedBytes += value.byteLength;
+    onProgress(receivedBytes);
+  }
+
+  const expectedBytes = range.end - range.start + 1;
+  if (receivedBytes !== expectedBytes) {
+    throw new Error(`Range chunk size mismatch: ${receivedBytes}/${expectedBytes}.`);
+  }
+
+  return new Blob(chunks, {
+    type: response.headers.get("content-type") || "video/mp4"
+  });
+}
+
+function buildRanges(totalBytes, chunkBytes) {
+  const ranges = [];
+  for (let start = 0; start < totalBytes; start += chunkBytes) {
+    ranges.push({
+      start,
+      end: Math.min(start + chunkBytes - 1, totalBytes - 1)
+    });
+  }
+  return ranges;
+}
+
+function saveBlob(blob, filename) {
+  const blobUrl = URL.createObjectURL(blob);
+  try {
+    const anchor = document.createElement("a");
+    anchor.href = blobUrl;
+    anchor.download = filename;
+    anchor.rel = "noopener";
+    document.body.append(anchor);
+    anchor.click();
+    anchor.remove();
+  } finally {
+    setTimeout(() => URL.revokeObjectURL(blobUrl), 30000);
   }
 }
 

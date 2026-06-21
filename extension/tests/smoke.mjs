@@ -7,15 +7,17 @@ const { Muxer, ArrayBufferTarget } = await import("../vendor/mp4-muxer/mp4-muxer
 const MP4Box = await import("../vendor/mp4box/mp4box.all.mjs");
 
 
-test("manifest declares a pure browser extension MVP", async () => {
+test("manifest declares a pure browser side panel extension", async () => {
   const manifest = JSON.parse(await readFile("extension/manifest.json", "utf8"));
 
   assert.equal(manifest.manifest_version, 3);
-  assert.equal(manifest.action.default_popup, "src/popup.html");
+  assert.equal(manifest.action.default_popup, undefined);
+  assert.equal(manifest.side_panel.default_path, "src/popup.html");
   assert.ok(manifest.permissions.includes("downloads"));
   assert.ok(manifest.permissions.includes("declarativeNetRequest"));
   assert.ok(manifest.permissions.includes("declarativeNetRequestFeedback"));
   assert.ok(manifest.permissions.includes("scripting"));
+  assert.ok(manifest.permissions.includes("sidePanel"));
   assert.ok(manifest.permissions.includes("storage"));
   assert.ok(manifest.host_permissions.includes("https://api.bilibili.com/*"));
   assert.ok(manifest.host_permissions.includes("https://*.edge.mountaintoys.cn/*"));
@@ -24,6 +26,85 @@ test("manifest declares a pure browser extension MVP", async () => {
     "rules/bili-media-headers.json"
   );
   assert.ok(!manifest.host_permissions.some((item) => item.includes("127.0.0.1")));
+});
+
+
+test("background opens the side panel from the toolbar action", async () => {
+  const code = await readFile("extension/src/background.js", "utf8");
+  const panelBehaviors = [];
+  const openedPanels = [];
+  let installedListener = null;
+  let actionListener = null;
+
+  const sandbox = {
+    Array,
+    Date,
+    Error,
+    Number,
+    Promise,
+    String,
+    URL,
+    URLSearchParams,
+    chrome: {
+      runtime: {
+        lastError: null,
+        onInstalled: {
+          addListener(listener) {
+            installedListener = listener;
+          }
+        },
+        onMessage: {
+          addListener() {}
+        },
+        onConnect: {
+          addListener() {}
+        }
+      },
+      action: {
+        onClicked: {
+          addListener(listener) {
+            actionListener = listener;
+          }
+        }
+      },
+      sidePanel: {
+        async setPanelBehavior(options) {
+          panelBehaviors.push(options);
+        },
+        async open(options) {
+          openedPanels.push(options);
+        }
+      },
+      declarativeNetRequest: {
+        onRuleMatchedDebug: {
+          addListener() {}
+        }
+      },
+      storage: {
+        local: {
+          async get() {
+            return {};
+          },
+          async set() {}
+        }
+      }
+    }
+  };
+
+  vm.createContext(sandbox);
+  vm.runInContext(code, sandbox);
+
+  assert.equal(typeof installedListener, "function");
+  assert.equal(typeof actionListener, "function");
+  assert.deepEqual(toPlain(panelBehaviors), [{ openPanelOnActionClick: true }]);
+  await installedListener();
+  await actionListener({ windowId: 7 });
+
+  assert.deepEqual(toPlain(panelBehaviors), [
+    { openPanelOnActionClick: true },
+    { openPanelOnActionClick: true }
+  ]);
+  assert.deepEqual(toPlain(openedPanels), [{ windowId: 7 }]);
 });
 
 
@@ -2373,6 +2454,10 @@ test("popup cancels an active extension download without saving", async () => {
 
   assert.equal(statusElement.textContent, "\u5df2\u53d6\u6d88\u4e0b\u8f7d");
   assert.equal(downloadControls.hidden, true);
+  assert.equal(progressPanel.hidden, true);
+  assert.equal(progressPercent.textContent, "--");
+  assert.equal(progressBar.style.width, "0%");
+  assert.equal(progressSize.textContent, "0 B / --");
   assert.equal(savedAnchors.length, 0);
   assert.equal(fetchCalls.length, 1);
   assert.equal(fetchCalls[0].signal.aborted, true);

@@ -7,6 +7,26 @@ const PROGRESS_PORT_NAME = "BILI_DOWNLOAD_PROGRESS_PORT";
 let lastDiagnostic = null;
 const progressPorts = new Set();
 
+configureSidePanelBehavior();
+chrome.runtime.onInstalled?.addListener(configureSidePanelBehavior);
+
+function configureSidePanelBehavior() {
+  const behaviorPromise = chrome.sidePanel?.setPanelBehavior?.({
+    openPanelOnActionClick: true
+  });
+  behaviorPromise?.catch?.(() => {});
+}
+
+chrome.action?.onClicked?.addListener((tab) => {
+  if (!chrome.sidePanel?.open || !tab?.windowId) {
+    return;
+  }
+  const openPromise = chrome.sidePanel.open({
+    windowId: tab.windowId
+  });
+  openPromise?.catch?.(() => {});
+});
+
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === "BILI_DOWNLOAD_LOAD_VIDEO") {
     loadVideo(message.payload)

@@ -102,8 +102,25 @@ progressPort.onMessage.addListener((message) => {
 
   updateProgress(message.payload);
 });
+chrome.tabs?.onActivated?.addListener(() => {
+  refreshFromActiveTab();
+});
+chrome.tabs?.onUpdated?.addListener((tabId, changeInfo) => {
+  if (tabId !== state.tabId || !changeInfo.url) {
+    return;
+  }
+  refreshFromActiveTab();
+});
 
 async function initialize() {
+  await refreshFromActiveTab({ force: true });
+}
+
+async function refreshFromActiveTab(options = {}) {
+  if (state.busy && !options.force) {
+    return;
+  }
+
   setBusy(true);
   setStatus(TEXT.checking);
 
@@ -988,12 +1005,13 @@ function cancelDownload() {
 
   control.canceled = true;
   control.paused = false;
-  setStatus(TEXT.canceling);
   for (const abortController of control.abortControllers) {
     abortController.abort();
   }
   resumeDownloadWaiters(control);
   notifyPageDownloadControl();
+  clearProgress();
+  setStatus(TEXT.canceled);
   renderDownloadControls();
 }
 
@@ -1619,6 +1637,23 @@ function resetProgress() {
   renderProgress();
 }
 
+function clearProgress() {
+  state.progress = {
+    active: false,
+    receivedBytes: 0,
+    totalBytes: 0,
+    percent: 0,
+    speedBytesPerSecond: 0,
+    startedAt: 0,
+    lastAt: 0,
+    segmentIndex: 0,
+    segmentCount: 0,
+    candidateIndex: 0,
+    candidateCount: 0
+  };
+  renderProgress();
+}
+
 function beginCandidateProgress(context) {
   state.progress.active = true;
   state.progress.receivedBytes = 0;
@@ -1651,7 +1686,7 @@ function beginMuxProgress(totalBytes) {
 }
 
 function updateProgress(payload) {
-  if (!state.busy || !payload) {
+  if (!state.busy || state.downloadControl?.canceled || !payload) {
     return;
   }
 

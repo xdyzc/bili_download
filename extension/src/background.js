@@ -150,6 +150,10 @@ if (chrome.declarativeNetRequest?.onRuleMatchedDebug) {
 }
 
 async function loadVideo(page) {
+  if (isBangumiPage(page)) {
+    return loadBangumi(page);
+  }
+
   const bvid = normalizeBvid(page?.bvid);
   if (!bvid) {
     throw new Error("No BV id was found on this page.");
@@ -196,6 +200,69 @@ async function loadVideo(page) {
       cid: videoPage.cid,
       title: videoPage.title || videoPage.part || ""
     },
+    pages,
+    account,
+    currentQuality: selectDefaultQuality(qualities, playUrl.quality),
+    directAvailable: qualities.some((quality) => quality.available && quality.mode === "direct"),
+    dashAvailable: qualities.some((quality) => quality.available && quality.mode === "dash"),
+    qualities
+  };
+}
+
+async function loadBangumi(page) {
+  const seasonId = normalizeId(page?.seasonId) || extractSeasonId(page?.url);
+  const epId = normalizeId(page?.epId) || extractEpId(page?.url);
+  const tabId = normalizeTabId(page?.tabId);
+  if (!seasonId && !epId) {
+    throw new Error("No Bangumi season or episode id was found on this page.");
+  }
+
+  const [seasonPayload, account] = await Promise.all([
+    fetchBangumiSeason({ seasonId, epId, tabId }),
+    fetchAccountStatus().catch((error) => ({
+      isLogin: false,
+      username: "",
+      userId: null,
+      vipLabel: "",
+      error: error.message
+    }))
+  ]);
+  const season = expectResult(seasonPayload);
+  const pages = normalizeBangumiEpisodes(season.episodes || []);
+  const episode = selectBangumiEpisode(pages, { epId, pageUrl: page?.url, season });
+
+  if (!episode?.cid || !episode?.epId) {
+    throw new Error("Could not find a playable Bangumi episode.");
+  }
+
+  const playUrl = await fetchPgcPlayUrl({
+    epId: episode.epId,
+    cid: episode.cid,
+    tabId
+  });
+  assertPlayablePgc(playUrl);
+
+  const availability = await buildQualityAvailability({
+    bvid: episode.bvid,
+    epId: episode.epId,
+    cid: episode.cid,
+    playUrl,
+    account,
+    source: "bangumi",
+    tabId
+  });
+  const qualities = buildQualityOptions(playUrl, availability);
+  const title = page?.title || buildBangumiTitle(season, episode);
+
+  return {
+    source: "bangumi",
+    bvid: episode.bvid || `ep${episode.epId}`,
+    aid: episode.aid || null,
+    seasonId: Number(season.season_id || seasonId) || null,
+    epId: episode.epId,
+    title,
+    ownerName: season.up_info?.uname || season.season_title || "",
+    page: episode,
     pages,
     account,
     currentQuality: selectDefaultQuality(qualities, playUrl.quality),
@@ -290,23 +357,31 @@ async function startDirectDownload(payload) {
 
 async function prepareDirectDownload(payload) {
   const bvid = normalizeBvid(payload?.bvid);
+  const epId = normalizeId(payload?.epId);
+  const tabId = normalizeTabId(payload?.tabId);
+  const source = epId ? "bangumi" : "video";
   const cid = Number(payload?.cid);
   const quality = Number(payload?.quality);
-  const title = payload?.title || bvid;
+  const title = payload?.title || bvid || (epId ? `ep${epId}` : "");
 
-  if (!bvid || !cid || !quality) {
+  if ((!bvid && !epId) || !cid || !quality) {
     throw new Error("Missing video, cid, or quality.");
   }
 
-  const playUrl = await fetchPlayUrl({ bvid, cid, quality });
+  const playUrl = await fetchMediaPlayUrl({ bvid, epId, cid, quality, tabId });
+  if (source === "bangumi") {
+    assertPlayablePgc(playUrl);
+  }
 
   if (hasDashQuality(playUrl, quality)) {
     return prepareDashSegments({
       bvid,
+      epId,
       cid,
       quality,
       title,
-      playUrl
+      playUrl,
+      source
     });
   }
 
@@ -314,24 +389,31 @@ async function prepareDirectDownload(payload) {
     const directSegments = buildDirectSegmentPlans(playUrl);
     return prepareDurlSegments({
       bvid,
+      epId,
       cid,
       quality: responseQuality(playUrl) || quality,
       title,
       playUrl,
-      segments: directSegments
+      segments: directSegments,
+      source
     });
   }
 
-  const directPlayUrl = await fetchPlayUrl({ bvid, cid, quality, fnval: 0 });
+  const directPlayUrl = await fetchMediaPlayUrl({ bvid, epId, cid, quality, fnval: 0, tabId });
+  if (source === "bangumi") {
+    assertPlayablePgc(directPlayUrl);
+  }
   if (hasExactDirectQuality(directPlayUrl, quality)) {
     const legacyDirectSegments = buildDirectSegmentPlans(directPlayUrl);
     return prepareDurlSegments({
       bvid,
+      epId,
       cid,
       quality: responseQuality(directPlayUrl) || quality,
       title,
       playUrl: directPlayUrl,
-      segments: legacyDirectSegments
+      segments: legacyDirectSegments,
+      source
     });
   }
 
@@ -340,16 +422,22 @@ async function prepareDirectDownload(payload) {
 
 async function prepareAudioDownload(payload) {
   const bvid = normalizeBvid(payload?.bvid);
+  const epId = normalizeId(payload?.epId);
+  const tabId = normalizeTabId(payload?.tabId);
   const cid = Number(payload?.cid);
-  const title = payload?.title || bvid;
+  const title = payload?.title || bvid || (epId ? `ep${epId}` : "");
 
-  if (!bvid || !cid) {
+  if ((!bvid && !epId) || !cid) {
     throw new Error("Missing video or cid.");
   }
 
-  const playUrl = await fetchPlayUrl({ bvid, cid });
+  const playUrl = await fetchMediaPlayUrl({ bvid, epId, cid, tabId });
+  if (epId) {
+    assertPlayablePgc(playUrl);
+  }
   return prepareAudioSegment({
     bvid,
+    epId,
     cid,
     title,
     playUrl
@@ -367,7 +455,7 @@ function buildDirectSegmentPlans(playUrl) {
     : [];
 }
 
-function prepareDurlSegments({ bvid, cid, quality, title, playUrl, segments }) {
+function prepareDurlSegments({ bvid, epId = null, cid, quality, title, playUrl, segments, source = "video" }) {
   const extension = extensionFor(playUrl.format);
   const baseName = safeFilename(`${title}_${quality}`);
   const preparedSegments = [];
@@ -377,9 +465,11 @@ function prepareDurlSegments({ bvid, cid, quality, title, playUrl, segments }) {
     const filename = `BiliDownload/${baseName}${suffix}${extension}`;
     const context = {
       bvid,
+      epId,
       cid,
       quality,
       title,
+      source,
       segmentIndex: index + 1,
       segmentCount: segments.length,
       format: playUrl.format
@@ -404,7 +494,7 @@ function prepareDurlSegments({ bvid, cid, quality, title, playUrl, segments }) {
   };
 }
 
-function prepareDashSegments({ bvid, cid, quality, title, playUrl }) {
+function prepareDashSegments({ bvid, epId = null, cid, quality, title, playUrl, source = "video" }) {
   const videoStream = selectDashVideo(playUrl, quality);
   const audioStream = selectDashAudio(playUrl);
   if (!audioStream) {
@@ -440,9 +530,11 @@ function prepareDashSegments({ bvid, cid, quality, title, playUrl }) {
       candidates,
       context: {
         bvid,
+        epId,
         cid,
         quality: videoStream.id || quality,
         title,
+        source,
         segmentIndex: index + 1,
         segmentCount: streams.length,
         role: item.role,
@@ -537,6 +629,97 @@ async function fetchPlayUrl({ bvid, cid, quality, fnval = 4048 }) {
   return normalizePlayUrl(expectData(payload));
 }
 
+async function fetchMediaPlayUrl({ bvid, epId, cid, quality, fnval = 4048, tabId = null }) {
+  if (epId) {
+    return fetchPgcPlayUrl({ epId, cid, quality, fnval, tabId });
+  }
+  return fetchPlayUrl({ bvid, cid, quality, fnval });
+}
+
+async function fetchBangumiSeason({ seasonId, epId, tabId = null }) {
+  const params = new URLSearchParams();
+  if (seasonId) {
+    params.set("season_id", String(seasonId));
+  } else {
+    params.set("ep_id", String(epId));
+  }
+  return fetchJsonPreferPage(`${API_BASE}/pgc/view/web/season?${params.toString()}`, tabId);
+}
+
+async function fetchPgcPlayUrl({ epId, cid, quality, fnval = 4048, tabId = null }) {
+  const params = new URLSearchParams({
+    ep_id: String(epId),
+    cid: String(cid),
+    qn: String(quality || 127),
+    fnval: String(fnval),
+    fnver: "0",
+    fourk: "1",
+    platform: "pc",
+    from_client: "BROWSER",
+    otype: "json"
+  });
+
+  const payload = await fetchJsonPreferPage(`${API_BASE}/pgc/player/web/playurl?${params.toString()}`, tabId);
+  return normalizePlayUrl(expectResult(payload));
+}
+
+async function fetchJsonPreferPage(url, tabId) {
+  const numericTabId = normalizeTabId(tabId);
+  if (numericTabId && chrome.scripting?.executeScript) {
+    try {
+      return await fetchJsonFromPage(url, numericTabId);
+    } catch (_error) {
+      // Page-origin requests preserve Bilibili's player context. Fall back to the
+      // service worker path so older pages and tests still have a best-effort route.
+    }
+  }
+  return fetchJson(url);
+}
+
+async function fetchJsonFromPage(url, tabId) {
+  const [injection] = await chrome.scripting.executeScript({
+    target: {
+      tabId
+    },
+    world: "MAIN",
+    func: fetchJsonInPage,
+    args: [url]
+  });
+  const result = injection?.result;
+  if (!result?.ok) {
+    throw new Error(result?.error || "Page API fetch failed.");
+  }
+  if (!result.responseOk) {
+    throw new Error(`Bilibili API returned HTTP ${result.status || "unknown"}.`);
+  }
+  return result.payload;
+}
+
+async function fetchJsonInPage(url) {
+  try {
+    const response = await fetch(url, {
+      credentials: "include",
+      headers: {
+        "Accept": "application/json, text/plain, */*"
+      },
+      referrer: location.href,
+      referrerPolicy: "strict-origin-when-cross-origin",
+      cache: "no-store"
+    });
+    return {
+      ok: true,
+      responseOk: response.ok,
+      status: response.status,
+      payload: await response.json()
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error: error.message
+    };
+  }
+}
+
 async function fetchJson(url) {
   const response = await fetch(url, {
     credentials: "include",
@@ -564,7 +747,19 @@ function expectData(payload) {
   return payload.data;
 }
 
-async function buildQualityAvailability({ bvid, cid, playUrl, account }) {
+function expectResult(payload) {
+  if (Number(payload?.code) !== 0) {
+    throw new Error(payload?.message || payload?.msg || "Bilibili API returned an error.");
+  }
+
+  if (!payload?.result || typeof payload.result !== "object") {
+    throw new Error("Bilibili API response did not include result.");
+  }
+
+  return payload.result;
+}
+
+async function buildQualityAvailability({ bvid, epId = null, cid, playUrl, account, source = "video", tabId = null }) {
   const availability = new Map();
   const requestedCodes = Array.isArray(playUrl.accept_quality) ? playUrl.accept_quality : [];
 
@@ -581,7 +776,17 @@ async function buildQualityAvailability({ bvid, cid, playUrl, account }) {
     .filter((code) => Number.isFinite(code) && !availability.get(code)?.available);
   await Promise.all(missingCodes.map(async (code) => {
     try {
-      const directPlayUrl = await fetchPlayUrl({ bvid, cid, quality: code, fnval: 0 });
+      const dashPlayUrl = await fetchMediaPlayUrl({ bvid, epId, cid, quality: code, fnval: 4048, tabId });
+      if (hasDashQuality(dashPlayUrl, code)) {
+        markQualityAvailable(availability, code, "dash");
+        return;
+      }
+      if (hasExactDirectQuality(dashPlayUrl, code)) {
+        markQualityAvailable(availability, code, "direct");
+        return;
+      }
+
+      const directPlayUrl = await fetchMediaPlayUrl({ bvid, epId, cid, quality: code, fnval: 0, tabId });
       if (hasExactDirectQuality(directPlayUrl, code)) {
         markQualityAvailable(availability, code, "direct");
       }
@@ -595,7 +800,7 @@ async function buildQualityAvailability({ bvid, cid, playUrl, account }) {
     if (!Number.isFinite(numericCode) || availability.has(numericCode)) {
       continue;
     }
-    availability.set(numericCode, unavailableQualityInfo(account));
+    availability.set(numericCode, unavailableQualityInfo(account, qualityRequirement(playUrl, numericCode, source)));
   }
 
   return availability;
@@ -617,7 +822,23 @@ function markQualityAvailable(availability, code, mode) {
   });
 }
 
-function unavailableQualityInfo(account) {
+function unavailableQualityInfo(account, requirement = null) {
+  if (requirement?.needVip) {
+    return {
+      available: false,
+      mode: "",
+      reason: "vip-required"
+    };
+  }
+
+  if (requirement?.needLogin) {
+    return {
+      available: false,
+      mode: "",
+      reason: "login-required"
+    };
+  }
+
   return {
     available: false,
     mode: "",
@@ -625,7 +846,7 @@ function unavailableQualityInfo(account) {
   };
 }
 
-function prepareAudioSegment({ bvid, cid, title, playUrl }) {
+function prepareAudioSegment({ bvid, epId = null, cid, title, playUrl }) {
   const audioStream = selectDashAudio(playUrl);
   if (!audioStream) {
     throw new Error("DASH response did not include an audio stream.");
@@ -644,9 +865,11 @@ function prepareAudioSegment({ bvid, cid, title, playUrl }) {
     candidates,
     context: {
       bvid,
+      epId,
       cid,
       quality: Number(audioStream.id) || 0,
       title,
+      source: epId ? "bangumi" : "video",
       segmentIndex: 1,
       segmentCount: 1,
       role: "audio",
@@ -670,6 +893,10 @@ function prepareAudioSegment({ bvid, cid, title, playUrl }) {
 function buildQualityOptions(playUrl, availability = new Map()) {
   const qualities = Array.isArray(playUrl.accept_quality) ? playUrl.accept_quality : [];
   const descriptions = Array.isArray(playUrl.accept_description) ? playUrl.accept_description : [];
+  const supportByQuality = new Map((playUrl.supportFormats || []).map((item) => [
+    Number(item.quality),
+    item
+  ]));
   const dashByQuality = new Map();
 
   for (const stream of playUrl.dashVideos || []) {
@@ -684,7 +911,11 @@ function buildQualityOptions(playUrl, availability = new Map()) {
     const info = availability.get(numericCode) || unavailableQualityInfo(null);
     return {
       code: numericCode,
-      label: buildQualityLabel(numericCode, descriptions[index], dashByQuality.get(numericCode)),
+      label: buildQualityLabel(
+        numericCode,
+        descriptions[index] || supportByQuality.get(numericCode)?.description || supportByQuality.get(numericCode)?.newDescription,
+        dashByQuality.get(numericCode)
+      ),
       available: info.available,
       mode: info.mode || "",
       reason: info.reason || ""
@@ -712,9 +943,14 @@ function normalizePlayUrl(data) {
   const dash = data.dash || {};
   return {
     ...data,
-    durl: Array.isArray(data.durl) ? data.durl : [],
+    durl: Array.isArray(data.durl) ? data.durl : (Array.isArray(data.durls) ? data.durls : []),
     accept_quality: Array.isArray(data.accept_quality) ? data.accept_quality.map((item) => Number(item)) : [],
     accept_description: Array.isArray(data.accept_description) ? data.accept_description : [],
+    supportFormats: normalizeSupportFormats(data.support_formats),
+    isDrm: Boolean(data.is_drm),
+    isPreview: Boolean(Number(data.is_preview)),
+    canWatchReason: Number(data.can_watch_reason) || 0,
+    status: Number(data.status) || 0,
     dashVideos: (Array.isArray(dash.video) ? dash.video : [])
       .map(parseDashMedia)
       .filter((item) => item.url),
@@ -722,6 +958,42 @@ function normalizePlayUrl(data) {
       .map(parseDashMedia)
       .filter((item) => item.url)
   };
+}
+
+function normalizeSupportFormats(items) {
+  return (Array.isArray(items) ? items : [])
+    .map((item) => ({
+      quality: Number(item?.quality) || 0,
+      description: String(item?.description || ""),
+      newDescription: String(item?.new_description || item?.display_desc || ""),
+      needLogin: Boolean(item?.need_login),
+      needVip: Boolean(item?.need_vip),
+      hasPreview: Boolean(item?.has_preview),
+      canWatchReason: Number(item?.can_watch_qn_reason) || 0
+    }))
+    .filter((item) => item.quality);
+}
+
+function qualityRequirement(playUrl, quality, source) {
+  if (source !== "bangumi") {
+    return null;
+  }
+  return (playUrl.supportFormats || []).find((item) => Number(item.quality) === Number(quality)) || null;
+}
+
+function assertPlayablePgc(playUrl) {
+  const code = Number(playUrl.code);
+  if (Number.isFinite(code) && code !== 0) {
+    throw new Error(playUrl.message || "PGC playurl returned an error.");
+  }
+
+  if (playUrl.isDrm) {
+    throw new Error("\u8be5\u756a\u5267\u4f7f\u7528 DRM \u4fdd\u62a4\uff0c\u5f53\u524d\u63d2\u4ef6\u4e0d\u80fd\u4e0b\u8f7d\u3002");
+  }
+
+  if (playUrl.isPreview || playUrl.canWatchReason) {
+    throw new Error(playUrl.message || "\u5f53\u524d\u8d26\u53f7\u65e0\u6cd5\u5b8c\u6574\u89c2\u770b\u8fd9\u4e00\u96c6\uff0c\u4e0d\u80fd\u4e0b\u8f7d\u3002");
+  }
 }
 
 function parseDashMedia(item) {
@@ -774,12 +1046,16 @@ function selectDefaultQuality(qualities, responseQualityValue) {
   const responseOption = qualities.find((quality) => (
     quality.available && quality.code === responseCode
   ));
-  if (responseOption) {
+  const firstAvailable = qualities.find((quality) => quality.available);
+  if (!firstAvailable) {
+    return null;
+  }
+
+  if (responseOption && responseOption.code >= firstAvailable.code) {
     return responseOption.code;
   }
 
-  const firstAvailable = qualities.find((quality) => quality.available);
-  return firstAvailable?.code || null;
+  return firstAvailable.code;
 }
 
 function unavailableQualityError(quality) {
@@ -877,6 +1153,66 @@ function normalizeVideoPages(pages) {
     .filter((item) => item.cid);
 }
 
+function normalizeBangumiEpisodes(episodes) {
+  return (Array.isArray(episodes) ? episodes : [])
+    .map((item, index) => {
+      const pageIndex = index + 1;
+      const epId = Number(item?.ep_id || item?.id) || 0;
+      const title = bangumiEpisodeTitle(item, pageIndex);
+      return {
+        index: pageIndex,
+        page: pageIndex,
+        cid: Number(item?.cid) || 0,
+        aid: Number(item?.aid) || 0,
+        bvid: normalizeBvid(item?.bvid),
+        epId,
+        title,
+        part: title
+      };
+    })
+    .filter((item) => item.cid && item.epId);
+}
+
+function bangumiEpisodeTitle(item, pageIndex) {
+  const showTitle = String(item?.show_title || "").trim();
+  if (showTitle) {
+    return showTitle;
+  }
+
+  const episodeNumber = String(item?.title || "").trim();
+  const longTitle = String(item?.long_title || "").trim();
+  if (episodeNumber && longTitle) {
+    return `第${episodeNumber}话 ${longTitle}`;
+  }
+  if (longTitle) {
+    return longTitle;
+  }
+  if (episodeNumber) {
+    return `第${episodeNumber}话`;
+  }
+  return `第${pageIndex}集`;
+}
+
+function selectBangumiEpisode(pages, { epId, pageUrl, season }) {
+  const currentEpId = normalizeId(epId) || extractEpId(pageUrl);
+  if (currentEpId) {
+    const byEp = pages.find((item) => item.epId === currentEpId);
+    if (byEp) {
+      return byEp;
+    }
+  }
+
+  return pages[0] || null;
+}
+
+function buildBangumiTitle(season, episode) {
+  const seasonTitle = String(season?.season_title || season?.title || "").trim();
+  if (seasonTitle && episode?.title) {
+    return `${seasonTitle}_${episode.title}`;
+  }
+  return seasonTitle || episode?.title || `ep${episode?.epId || ""}`;
+}
+
 function readPageNumber(url) {
   try {
     const value = new URL(url || "").searchParams.get("p");
@@ -889,6 +1225,30 @@ function readPageNumber(url) {
 function normalizeBvid(value) {
   const match = String(value || "").match(/BV[0-9A-Za-z]{10}/);
   return match ? match[0] : "";
+}
+
+function normalizeId(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+function normalizeTabId(value) {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
+function extractSeasonId(value) {
+  const match = String(value || "").match(/\/bangumi\/play\/ss(\d+)/);
+  return match ? Number(match[1]) : null;
+}
+
+function extractEpId(value) {
+  const match = String(value || "").match(/\/bangumi\/play\/ep(\d+)/);
+  return match ? Number(match[1]) : null;
+}
+
+function isBangumiPage(page) {
+  return page?.type === "bangumi" || /:\/\/www\.bilibili\.com\/bangumi\/play\//.test(String(page?.url || ""));
 }
 
 function extensionFor(format) {

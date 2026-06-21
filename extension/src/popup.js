@@ -3,8 +3,8 @@ const TEXT = {
   loading: "\u6b63\u5728\u8bfb\u53d6\u89c6\u9891\u4fe1\u606f...",
   ready: "\u53ef\u9009\u62e9\u6e05\u6670\u5ea6\u4e0b\u8f7d",
   collectionReady: "\u68c0\u6d4b\u5230\u591a\u4e2a\u5206 P\uff0c\u53ef\u9009\u62e9\u8981\u4e0b\u8f7d\u7684\u5206 P",
-  copied: "BV \u53f7\u5df2\u590d\u5236",
-  noVideo: "\u5f53\u524d\u9875\u9762\u4e0d\u662f Bilibili \u89c6\u9891\u9875",
+  copied: "\u89c6\u9891 ID \u5df2\u590d\u5236",
+  noVideo: "\u5f53\u524d\u9875\u9762\u4e0d\u662f\u652f\u6301\u7684 Bilibili \u89c6\u9891\u6216\u756a\u5267\u9875",
   noQuality: "\u6ca1\u6709\u53ef\u7528\u6e05\u6670\u5ea6",
   qualityUnavailable: "\u8be5\u6e05\u6670\u5ea6\u9700\u8981 Cookie \u767b\u5f55\u540e\u624d\u80fd\u4e0b\u8f7d",
   noSelectedPages: "\u8bf7\u5148\u9009\u62e9\u8981\u4e0b\u8f7d\u7684\u5206 P",
@@ -36,7 +36,10 @@ const PARALLEL_RANGE_CONCURRENCY = 4;
 const state = {
   tabId: null,
   page: {
+    type: "",
     bvid: "",
+    seasonId: null,
+    epId: null,
     title: "",
     url: ""
   },
@@ -136,9 +139,10 @@ async function refreshFromActiveTab(options = {}) {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     state.tabId = tab?.id || null;
     state.page = await readPage(tab);
+    state.page.tabId = state.tabId;
     await loadLastDiagnostic();
 
-    if (!state.page.bvid) {
+    if (!hasSupportedPageId(state.page)) {
       setStatus(TEXT.noVideo);
       render();
       return;
@@ -156,7 +160,10 @@ async function refreshFromActiveTab(options = {}) {
 
     state.video = response.payload;
     state.account = response.payload.account || null;
+    state.page.type = state.video.source || state.page.type || "video";
     state.page.bvid = state.video.bvid;
+    state.page.seasonId = state.video.seasonId || state.page.seasonId || null;
+    state.page.epId = state.video.epId || state.page.epId || null;
     state.page.title = state.video.title;
     state.selectedPageCids = null;
     render();
@@ -173,12 +180,16 @@ async function refreshFromActiveTab(options = {}) {
 
 async function readPage(tab) {
   const fromUrl = {
+    type: pageTypeFromUrl(tab?.url || ""),
     bvid: extractBvid(tab?.url || ""),
+    seasonId: extractSeasonId(tab?.url || ""),
+    epId: extractEpId(tab?.url || ""),
     title: tab?.title || "",
-    url: tab?.url || ""
+    url: tab?.url || "",
+    tabId: tab?.id || null
   };
 
-  if (!tab?.id || !isBilibiliVideoUrl(tab.url)) {
+  if (!tab?.id || !isSupportedBilibiliUrl(tab.url)) {
     return fromUrl;
   }
 
@@ -187,9 +198,13 @@ async function readPage(tab) {
       type: "BILI_DOWNLOAD_GET_PAGE"
     });
     return {
+      type: page?.type || fromUrl.type,
       bvid: page?.bvid || fromUrl.bvid,
+      seasonId: page?.seasonId || fromUrl.seasonId,
+      epId: page?.epId || fromUrl.epId,
       title: page?.title || fromUrl.title,
-      url: page?.url || fromUrl.url
+      url: page?.url || fromUrl.url,
+      tabId: fromUrl.tabId
     };
   } catch (_error) {
     return fromUrl;
@@ -197,7 +212,7 @@ async function readPage(tab) {
 }
 
 function render() {
-  bvidInput.value = state.page.bvid;
+  bvidInput.value = displayPageId(state.page);
   titleInput.value = state.page.title;
   renderAccount();
   renderQualities();
@@ -257,7 +272,9 @@ function displayQualityLabel(quality) {
 
   const suffix = quality.reason === "login-required"
     ? "\u9700\u8981 Cookie"
-    : "\u5f53\u524d\u4e0d\u53ef\u7528";
+    : quality.reason === "vip-required"
+      ? "\u9700\u8981\u5927\u4f1a\u5458"
+      : "\u5f53\u524d\u4e0d\u53ef\u7528";
   return `${quality.label}\uff08${suffix}\uff09`;
 }
 
@@ -355,11 +372,12 @@ function syncSelectedPageCids() {
 }
 
 async function copyBvid() {
-  if (!state.page.bvid) {
+  const pageId = displayPageId(state.page);
+  if (!pageId) {
     return;
   }
 
-  await navigator.clipboard.writeText(state.page.bvid);
+  await navigator.clipboard.writeText(pageId);
   setStatus(TEXT.copied);
 }
 
@@ -382,7 +400,7 @@ async function downloadSelectedQuality() {
 
   try {
     const prepared = await preparePageDownload({
-      cid: state.video.page.cid
+      ...state.video.page
     }, Number(qualitySelect.value), state.video.title);
     await downloadPreparedPayload(prepared);
     if (prepared.mode !== "dash") {
@@ -419,7 +437,7 @@ async function downloadCurrentAudio() {
 
   try {
     const prepared = await prepareAudioDownload({
-      cid: state.video.page.cid
+      ...state.video.page
     }, audioDownloadTitle(state.video.title, state.video.page));
     await downloadPreparedPayload(prepared, TEXT.downloadingAudio);
     setStatus(`${TEXT.audioDownloaded}: ${prepared.count}`);
@@ -545,7 +563,9 @@ async function preparePageDownload(page, quality, title) {
     type: "BILI_DOWNLOAD_PREPARE_DIRECT",
     payload: {
       bvid: state.video.bvid,
+      epId: page.epId || state.video.epId || null,
       cid: Number(page.cid),
+      tabId: state.tabId,
       quality,
       title
     }
@@ -564,7 +584,9 @@ async function prepareAudioDownload(page, title) {
     type: "BILI_DOWNLOAD_PREPARE_AUDIO",
     payload: {
       bvid: state.video.bvid,
+      epId: page.epId || state.video.epId || null,
       cid: Number(page.cid),
+      tabId: state.tabId,
       title
     }
   });
@@ -1880,15 +1902,15 @@ function formatBytes(bytes) {
 }
 
 function updateControls() {
-  const hasBvid = Boolean(state.page.bvid);
+  const hasVideoId = hasSupportedPageId(state.page);
   const hasQuality = Boolean(state.video?.qualities?.length);
   const hasAvailableQuality = Boolean(availableQualityOptions().length);
   const hasMultiplePages = videoHasMultiplePages(state.video);
   const hasSelectedPages = Boolean(selectedPages().length);
-  copyButton.disabled = state.busy || !hasBvid;
-  downloadButton.disabled = state.busy || !hasBvid || !hasAvailableQuality || !selectedQualityAvailable();
+  copyButton.disabled = state.busy || !hasVideoId;
+  downloadButton.disabled = state.busy || !hasVideoId || !hasAvailableQuality || !selectedQualityAvailable();
   if (downloadAudioButton) {
-    downloadAudioButton.disabled = state.busy || !hasBvid || !state.video?.page?.cid;
+    downloadAudioButton.disabled = state.busy || !hasVideoId || !state.video?.page?.cid;
   }
   qualitySelect.disabled = state.busy || !hasQuality;
   if (pagePickerToggle) {
@@ -1899,7 +1921,7 @@ function updateControls() {
   }
   if (downloadSelectedPagesButton) {
     downloadSelectedPagesButton.disabled = state.busy ||
-      !hasBvid ||
+      !hasVideoId ||
       !hasMultiplePages ||
       !hasAvailableQuality ||
       !selectedQualityAvailable() ||
@@ -1907,7 +1929,7 @@ function updateControls() {
   }
   if (downloadSelectedPageAudioButton) {
     downloadSelectedPageAudioButton.disabled = state.busy ||
-      !hasBvid ||
+      !hasVideoId ||
       !hasMultiplePages ||
       !hasSelectedPages;
   }
@@ -1960,11 +1982,50 @@ function setStatus(text) {
   statusElement.textContent = text;
 }
 
+function isSupportedBilibiliUrl(value) {
+  return isBilibiliVideoUrl(value) || isBangumiUrl(value);
+}
+
 function isBilibiliVideoUrl(value) {
   return /^https:\/\/(www|m)\.bilibili\.com\/video\//.test(String(value));
+}
+
+function isBangumiUrl(value) {
+  return /^https:\/\/www\.bilibili\.com\/bangumi\/play\//.test(String(value));
+}
+
+function pageTypeFromUrl(value) {
+  return isBangumiUrl(value) ? "bangumi" : isBilibiliVideoUrl(value) ? "video" : "";
+}
+
+function hasSupportedPageId(page) {
+  return Boolean(page?.bvid || page?.epId || page?.seasonId);
+}
+
+function displayPageId(page) {
+  if (page?.bvid) {
+    return page.bvid;
+  }
+  if (page?.epId) {
+    return `ep${page.epId}`;
+  }
+  if (page?.seasonId) {
+    return `ss${page.seasonId}`;
+  }
+  return "";
 }
 
 function extractBvid(value) {
   const match = String(value).match(/BV[0-9A-Za-z]{10}/);
   return match ? match[0] : "";
+}
+
+function extractSeasonId(value) {
+  const match = String(value || "").match(/\/bangumi\/play\/ss(\d+)/);
+  return match ? Number(match[1]) : null;
+}
+
+function extractEpId(value) {
+  const match = String(value || "").match(/\/bangumi\/play\/ep(\d+)/);
+  return match ? Number(match[1]) : null;
 }

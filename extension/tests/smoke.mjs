@@ -21,6 +21,7 @@ test("manifest declares a pure browser side panel extension", async () => {
   assert.ok(manifest.permissions.includes("storage"));
   assert.ok(manifest.host_permissions.includes("https://api.bilibili.com/*"));
   assert.ok(manifest.host_permissions.includes("https://*.edge.mountaintoys.cn/*"));
+  assert.ok(manifest.content_scripts[0].matches.includes("https://www.bilibili.com/bangumi/play/*"));
   assert.equal(
     manifest.declarative_net_request.rule_resources[0].path,
     "rules/bili-media-headers.json"
@@ -235,12 +236,15 @@ test("content script forwards page progress events", async () => {
   const code = await readFile("extension/src/content.js", "utf8");
   const runtimeMessages = [];
   const listeners = {};
+  let messageListener = null;
 
   const sandbox = {
     chrome: {
       runtime: {
         onMessage: {
-          addListener() {}
+          addListener(listener) {
+            messageListener = listener;
+          }
         },
         async sendMessage(message) {
           runtimeMessages.push(message);
@@ -267,6 +271,37 @@ test("content script forwards page progress events", async () => {
   vm.createContext(sandbox);
   vm.runInContext(code, sandbox);
 
+  assert.deepEqual(toPlain(sandbox.readPage()), {
+    type: "video",
+    bvid: "BV1KGj36QEG3",
+    seasonId: null,
+    epId: null,
+    title: "Smoke Video",
+    url: "https://www.bilibili.com/video/BV1KGj36QEG3/"
+  });
+
+  sandbox.location.href = "https://www.bilibili.com/bangumi/play/ss1512";
+  sandbox.document.title = "Bangumi Season_bilibili";
+  assert.deepEqual(toPlain(sandbox.readPage()), {
+    type: "bangumi",
+    bvid: "",
+    seasonId: 1512,
+    epId: null,
+    title: "Bangumi Season",
+    url: "https://www.bilibili.com/bangumi/play/ss1512"
+  });
+
+  sandbox.location.href = "https://www.bilibili.com/bangumi/play/ep28160";
+  let pageMessageResponse = null;
+  const pageMessageResult = messageListener({
+    type: "BILI_DOWNLOAD_GET_PAGE"
+  }, {}, (payload) => {
+    pageMessageResponse = payload;
+  });
+  assert.equal(pageMessageResult, false);
+  assert.equal(pageMessageResponse.type, "bangumi");
+  assert.equal(pageMessageResponse.epId, 28160);
+
   listeners["bili-download-progress"]({
     detail: {
       receivedBytes: 5,
@@ -289,6 +324,381 @@ test("content script forwards page progress events", async () => {
       done: false
     }
   }]);
+});
+
+
+test("background loads Bangumi episodes and prepares PGC DASH downloads", async () => {
+  const code = await readFile("extension/src/background.js", "utf8");
+  const fetchUrls = [];
+  let messageListener = null;
+
+  const pgcPlayUrl = {
+    code: 0,
+    message: "Success",
+    quality: 64,
+    format: "dash",
+    accept_quality: [80, 64, 32],
+    accept_description: ["1080P", "720P", "480P"],
+    support_formats: [
+      { quality: 80, description: "1080P", need_login: true, need_vip: false },
+      { quality: 64, description: "720P", need_login: false, need_vip: false },
+      { quality: 32, description: "480P", need_login: false, need_vip: false }
+    ],
+    durls: [],
+    dash: {
+      video: [
+        {
+          id: 64,
+          base_url: "https://video-primary.bilivideo.com/pgc-64.m4s",
+          backup_url: ["https://video-backup.bilivideo.com/pgc-64.m4s"],
+          bandwidth: 1200000,
+          codecs: "avc1.640028",
+          mime_type: "video/mp4",
+          width: 1280,
+          height: 720,
+          frame_rate: "30.000",
+          size: 8 * 1024 * 1024
+        },
+        {
+          id: 32,
+          base_url: "https://video-primary.bilivideo.com/pgc-32.m4s",
+          bandwidth: 800000,
+          codecs: "avc1.64001F",
+          mime_type: "video/mp4",
+          width: 852,
+          height: 480,
+          frame_rate: "30.000",
+          size: 4 * 1024 * 1024
+        }
+      ],
+      audio: [{
+        id: 30280,
+        base_url: "https://audio-primary.bilivideo.com/pgc-audio.m4s",
+        backup_url: ["https://audio-backup.bilivideo.com/pgc-audio.m4s"],
+        bandwidth: 192000,
+        codecs: "mp4a.40.2",
+        mime_type: "audio/mp4",
+        size: 1024 * 1024
+      }]
+    },
+    is_drm: false,
+    is_preview: 0,
+    can_watch_reason: 0
+  };
+
+  const sandbox = {
+    Array,
+    Date,
+    Error,
+    Number,
+    Promise,
+    String,
+    URL,
+    URLSearchParams,
+    clearTimeout,
+    setTimeout,
+    chrome: {
+      runtime: {
+        lastError: null,
+        onMessage: {
+          addListener(listener) {
+            messageListener = listener;
+          }
+        },
+        onConnect: {
+          addListener() {}
+        }
+      },
+      declarativeNetRequest: {
+        onRuleMatchedDebug: {
+          addListener() {}
+        }
+      },
+      storage: {
+        local: {
+          async get() {
+            return {};
+          },
+          async set() {}
+        }
+      }
+    },
+    fetch: async (url) => {
+      const value = String(url);
+      fetchUrls.push(value);
+      if (value.includes("/x/web-interface/nav")) {
+        return jsonResponse({
+          code: 0,
+          data: {
+            isLogin: false,
+            uname: "",
+            mid: 0,
+            vipInfo: {}
+          }
+        });
+      }
+      if (value.includes("/pgc/view/web/season")) {
+        return jsonResponse({
+          code: 0,
+          result: {
+            season_id: 1512,
+            season_title: "Bangumi Season",
+            episodes: [
+              {
+                aid: 1871363,
+                bvid: "BV1dx411w7kp",
+                cid: 49052509,
+                ep_id: 28160,
+                title: "0",
+                show_title: "Episode Zero",
+                long_title: "Zero"
+              },
+              {
+                aid: 1871364,
+                bvid: "BV1dx411w7kq",
+                cid: 49052510,
+                ep_id: 28161,
+                title: "1",
+                show_title: "Episode One",
+                long_title: "One"
+              }
+            ]
+          }
+        });
+      }
+      if (value.includes("/pgc/player/web/playurl")) {
+        return jsonResponse({
+          code: 0,
+          result: pgcPlayUrl
+        });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    }
+  };
+
+  vm.createContext(sandbox);
+  vm.runInContext(code, sandbox);
+
+  const video = await sandbox.loadVideo({
+    type: "bangumi",
+    seasonId: 1512,
+    title: "Bangumi Season",
+    url: "https://www.bilibili.com/bangumi/play/ss1512"
+  });
+
+  assert.equal(video.source, "bangumi");
+  assert.equal(video.seasonId, 1512);
+  assert.equal(video.epId, 28160);
+  assert.equal(video.page.cid, 49052509);
+  assert.equal(video.page.title, "Episode Zero");
+  assert.deepEqual(video.pages.map((page) => [page.index, page.cid, page.epId, page.title]), [
+    [1, 49052509, 28160, "Episode Zero"],
+    [2, 49052510, 28161, "Episode One"]
+  ]);
+  assert.deepEqual(video.qualities.map((quality) => [quality.code, quality.available, quality.reason]), [
+    [80, false, "login-required"],
+    [64, true, ""],
+    [32, true, ""]
+  ]);
+  assert.ok(fetchUrls.some((url) => url.includes("/pgc/view/web/season?season_id=1512")));
+  assert.ok(fetchUrls.some((url) => url.includes("/pgc/player/web/playurl") && url.includes("ep_id=28160")));
+
+  const preparedResponse = await sendRuntimeMessage(messageListener, {
+    type: "BILI_DOWNLOAD_PREPARE_DIRECT",
+    payload: {
+      bvid: "BV1dx411w7kp",
+      epId: 28160,
+      cid: 49052509,
+      quality: 64,
+      title: "Bangumi Season_Episode Zero"
+    }
+  });
+
+  assert.equal(preparedResponse.ok, true);
+  assert.equal(preparedResponse.payload.mode, "dash");
+  assert.equal(preparedResponse.payload.count, 2);
+  assert.equal(preparedResponse.payload.segments[0].context.source, "bangumi");
+  assert.equal(preparedResponse.payload.segments[0].context.epId, 28160);
+  assert.equal(preparedResponse.payload.segments[0].filename, "BiliDownload/Bangumi Season_Episode Zero_64_video.m4s");
+
+  const audioResponse = await sendRuntimeMessage(messageListener, {
+    type: "BILI_DOWNLOAD_PREPARE_AUDIO",
+    payload: {
+      bvid: "BV1dx411w7kp",
+      epId: 28161,
+      cid: 49052510,
+      title: "Bangumi Season_Episode One_audio"
+    }
+  });
+
+  assert.equal(audioResponse.ok, true);
+  assert.equal(audioResponse.payload.mode, "audio");
+  assert.equal(audioResponse.payload.segments[0].context.source, "bangumi");
+  assert.equal(audioResponse.payload.segments[0].context.epId, 28161);
+  assert.equal(audioResponse.payload.segments[0].filename, "BiliDownload/Bangumi Season_Episode One_audio.m4a");
+  assert.ok(fetchUrls.some((url) => url.includes("ep_id=28161")));
+});
+
+
+test("background unlocks Bangumi high qualities by probing PGC DASH per quality", async () => {
+  const code = await readFile("extension/src/background.js", "utf8");
+  const fetchUrls = [];
+
+  const sandbox = {
+    Array,
+    Date,
+    Error,
+    Number,
+    Promise,
+    String,
+    URL,
+    URLSearchParams,
+    clearTimeout,
+    setTimeout,
+    chrome: {
+      runtime: {
+        lastError: null,
+        onMessage: {
+          addListener() {}
+        },
+        onConnect: {
+          addListener() {}
+        }
+      },
+      declarativeNetRequest: {
+        onRuleMatchedDebug: {
+          addListener() {}
+        }
+      },
+      storage: {
+        local: {
+          async get() {
+            return {};
+          },
+          async set() {}
+        }
+      }
+    },
+    fetch: async (url) => {
+      const value = String(url);
+      fetchUrls.push(value);
+      if (value.includes("/x/web-interface/nav")) {
+        return jsonResponse({
+          code: 0,
+          data: {
+            isLogin: true,
+            uname: "vip-user",
+            mid: 42,
+            vipInfo: {
+              label: {
+                text: "大会员"
+              }
+            }
+          }
+        });
+      }
+      if (value.includes("/pgc/view/web/season")) {
+        return jsonResponse({
+          code: 0,
+          result: {
+            season_id: 1512,
+            season_title: "Bangumi Season",
+            episodes: [{
+              aid: 1871363,
+              bvid: "BV1dx411w7kp",
+              cid: 49052509,
+              ep_id: 28160,
+              title: "1",
+              show_title: "Episode One"
+            }]
+          }
+        });
+      }
+      if (value.includes("/pgc/player/web/playurl")) {
+        const qn = new URL(value).searchParams.get("qn");
+        const dashVideos = qn === "80"
+          ? [{
+            id: 80,
+            base_url: "https://video-primary.bilivideo.com/pgc-80.m4s",
+            bandwidth: 2200000,
+            codecs: "avc1.640028",
+            mime_type: "video/mp4",
+            width: 1920,
+            height: 1080,
+            frame_rate: "30.000",
+            size: 16 * 1024 * 1024
+          }, {
+            id: 32,
+            base_url: "https://video-primary.bilivideo.com/pgc-32.m4s",
+            bandwidth: 800000,
+            codecs: "avc1.64001F",
+            mime_type: "video/mp4",
+            width: 852,
+            height: 480,
+            frame_rate: "30.000",
+            size: 4 * 1024 * 1024
+          }]
+          : [{
+            id: 32,
+            base_url: "https://video-primary.bilivideo.com/pgc-32.m4s",
+            bandwidth: 800000,
+            codecs: "avc1.64001F",
+            mime_type: "video/mp4",
+            width: 852,
+            height: 480,
+            frame_rate: "30.000",
+            size: 4 * 1024 * 1024
+          }];
+        return jsonResponse({
+          code: 0,
+          result: {
+            code: 0,
+            message: "Success",
+            quality: qn === "80" ? 80 : 32,
+            format: "dash",
+            accept_quality: [80, 32],
+            accept_description: ["1080P", "480P"],
+            support_formats: [
+              { quality: 80, description: "1080P", need_login: true, need_vip: false },
+              { quality: 32, description: "480P", need_login: false, need_vip: false }
+            ],
+            durls: [],
+            dash: {
+              video: dashVideos,
+              audio: [{
+                id: 30280,
+                base_url: "https://audio-primary.bilivideo.com/pgc-audio.m4s",
+                bandwidth: 192000,
+                codecs: "mp4a.40.2",
+                mime_type: "audio/mp4",
+                size: 1024 * 1024
+              }]
+            },
+            is_drm: false,
+            is_preview: 0,
+            can_watch_reason: 0
+          }
+        });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    }
+  };
+
+  vm.createContext(sandbox);
+  vm.runInContext(code, sandbox);
+
+  const video = await sandbox.loadVideo({
+    type: "bangumi",
+    seasonId: 1512,
+    title: "Bangumi Season",
+    url: "https://www.bilibili.com/bangumi/play/ss1512"
+  });
+
+  const quality80 = video.qualities.find((quality) => quality.code === 80);
+  assert.equal(quality80.available, true);
+  assert.equal(quality80.mode, "dash");
+  assert.equal(video.currentQuality, 80);
+  assert.ok(fetchUrls.some((url) => url.includes("/pgc/player/web/playurl") && url.includes("qn=80") && url.includes("fnval=4048")));
 });
 
 
@@ -1665,6 +2075,243 @@ test("popup lets users choose specific multi-page videos to download", async () 
   assert.equal(scriptCalls[0].args[1], "Multi Page Video_P01_Opening_audio.m4a");
   assert.equal(scriptCalls[1].args[1], "Multi Page Video_P03_Ending_audio.m4a");
   assert.match(statusElement.textContent, /2$/);
+});
+
+
+test("popup sends Bangumi episode ids for selected episode downloads", async () => {
+  const code = await readFile("extension/src/popup.js", "utf8");
+  const runtimeMessages = [];
+  const scriptCalls = [];
+  const statusElement = textElement();
+  const qualitySelect = selectElement();
+  const bvidInput = textElement();
+  const pagePickerToggle = buttonElement();
+  const pagePicker = panelElement();
+  const pageList = containerElement();
+  const pageSelectAllButton = buttonElement();
+
+  const sandbox = {
+    Blob,
+    Date,
+    Error,
+    RegExp,
+    String,
+    URL,
+    console,
+    navigator: {
+      clipboard: {
+        async writeText() {}
+      }
+    },
+    setTimeout(callback) {
+      callback();
+      return 1;
+    },
+    document: {
+      addEventListener() {},
+      body: {
+        append() {}
+      },
+      createElement(tagName) {
+        if (tagName === "label") {
+          return containerElement();
+        }
+        if (tagName === "input") {
+          return inputElement();
+        }
+        if (tagName === "span") {
+          return textElement();
+        }
+        return optionElement();
+      },
+      querySelector(selector) {
+        return {
+          "#status": statusElement,
+          "#account": textElement(),
+          "#bvid": bvidInput,
+          "#title": textElement(),
+          "#quality": qualitySelect,
+          "#copy": buttonElement(),
+          "#download": buttonElement(),
+          "#download-audio": buttonElement(),
+          "#page-picker-toggle": pagePickerToggle,
+          "#page-picker": pagePicker,
+          "#page-list": pageList,
+          "#page-select-all": pageSelectAllButton,
+          "#download-selected-pages": buttonElement(),
+          "#download-selected-page-audio": buttonElement(),
+          "#diagnostic": buttonElement(),
+          "#progress": panelElement(),
+          "#progress-percent": textElement(),
+          "#progress-bar": styleElement(),
+          "#progress-size": textElement(),
+          "#progress-speed": textElement(),
+          "#download-controls": panelElement(),
+          "#pause": buttonElement(),
+          "#cancel": buttonElement()
+        }[selector];
+      }
+    },
+    chrome: {
+      tabs: {
+        async query() {
+          return [{
+            id: 99,
+            url: "https://www.bilibili.com/bangumi/play/ss1512",
+            title: "Bangumi Season"
+          }];
+        },
+        async sendMessage() {
+          return {
+            type: "bangumi",
+            seasonId: 1512,
+            title: "Bangumi Season",
+            url: "https://www.bilibili.com/bangumi/play/ss1512"
+          };
+        }
+      },
+      runtime: {
+        connect() {
+          return {
+            onMessage: {
+              addListener() {}
+            }
+          };
+        },
+        async sendMessage(message) {
+          runtimeMessages.push(message);
+          if (message.type === "BILI_DOWNLOAD_GET_DIAGNOSTIC") {
+            return { ok: true, payload: null };
+          }
+          if (message.type === "BILI_DOWNLOAD_LOAD_VIDEO") {
+            return {
+              ok: true,
+              payload: {
+                source: "bangumi",
+                bvid: "BV1dx411w7kp",
+                seasonId: 1512,
+                epId: 28160,
+                title: "Bangumi Season",
+                page: { index: 1, cid: 49052509, epId: 28160, title: "Episode Zero" },
+                currentQuality: 64,
+                qualities: [{ code: 64, label: "64 - 720P", available: true, mode: "dash" }],
+                pages: [
+                  { index: 1, page: 1, cid: 49052509, epId: 28160, title: "Episode Zero", part: "Episode Zero" },
+                  { index: 2, page: 2, cid: 49052510, epId: 28161, title: "Episode One", part: "Episode One" }
+                ]
+              }
+            };
+          }
+          if (message.type === "BILI_DOWNLOAD_PREPARE_DIRECT") {
+            return {
+              ok: true,
+              payload: {
+                count: 1,
+                mode: "durl",
+                segments: [{
+                  url: `https://primary.hdslb.test/${message.payload.epId}.mp4`,
+                  filename: `BiliDownload/${message.payload.title}_64.mp4`,
+                  size: 1024,
+                  candidates: [{ url: `https://primary.hdslb.test/${message.payload.epId}.mp4`, kind: "primary", size: 1024 }],
+                  context: {
+                    bvid: message.payload.bvid,
+                    epId: message.payload.epId,
+                    cid: message.payload.cid,
+                    quality: message.payload.quality,
+                    title: message.payload.title,
+                    source: "bangumi",
+                    segmentIndex: 1,
+                    segmentCount: 1,
+                    format: "mp4",
+                    downloadMethod: "page-blob"
+                  }
+                }]
+              }
+            };
+          }
+          if (message.type === "BILI_DOWNLOAD_PREPARE_AUDIO") {
+            return {
+              ok: true,
+              payload: {
+                count: 1,
+                mode: "audio",
+                segments: [{
+                  url: `https://audio.hdslb.test/${message.payload.epId}.m4s`,
+                  filename: `BiliDownload/${message.payload.title}.m4a`,
+                  size: 512,
+                  candidates: [{ url: `https://audio.hdslb.test/${message.payload.epId}.m4s`, kind: "primary", size: 512 }],
+                  context: {
+                    bvid: message.payload.bvid,
+                    epId: message.payload.epId,
+                    cid: message.payload.cid,
+                    quality: 30280,
+                    title: message.payload.title,
+                    source: "bangumi",
+                    segmentIndex: 1,
+                    segmentCount: 1,
+                    role: "audio",
+                    roleLabel: "audio",
+                    format: "audio",
+                    downloadMethod: "page-blob"
+                  }
+                }]
+              }
+            };
+          }
+          if (message.type === "BILI_DOWNLOAD_SAVE_DIAGNOSTIC") {
+            return { ok: true };
+          }
+          throw new Error(`unexpected runtime message: ${message.type}`);
+        }
+      },
+      scripting: {
+        async executeScript(call) {
+          scriptCalls.push(call);
+          return [{
+            result: {
+              ok: true,
+              responseOk: true,
+              status: 200,
+              statusText: "OK",
+              mime: "video/mp4",
+              size: 1024,
+              totalBytes: 1024,
+              receivedBytes: 1024,
+              filename: call.args[1]
+            }
+          }];
+        }
+      }
+    }
+  };
+
+  vm.createContext(sandbox);
+  vm.runInContext(code, sandbox);
+
+  await sandbox.initialize();
+  assert.equal(bvidInput.value, "BV1dx411w7kp");
+  assert.equal(pagePickerToggle.hidden, false);
+
+  sandbox.togglePagePicker();
+  const checkboxes = pageList.querySelectorAll("input[type=\"checkbox\"]");
+  checkboxes[0].checked = false;
+  checkboxes[1].checked = true;
+  checkboxes[1].dispatchEvent("change");
+
+  qualitySelect.value = "64";
+  await sandbox.downloadSelectedPages();
+  await sandbox.downloadSelectedPageAudio();
+
+  const videoPayload = runtimeMessages.find((message) => message.type === "BILI_DOWNLOAD_PREPARE_DIRECT").payload;
+  const audioPayload = runtimeMessages.find((message) => message.type === "BILI_DOWNLOAD_PREPARE_AUDIO").payload;
+  assert.equal(videoPayload.epId, 28161);
+  assert.equal(videoPayload.cid, 49052510);
+  assert.equal(videoPayload.title, "Bangumi Season_P02_Episode One");
+  assert.equal(audioPayload.epId, 28161);
+  assert.equal(audioPayload.cid, 49052510);
+  assert.equal(audioPayload.title, "Bangumi Season_P02_Episode One_audio");
+  assert.equal(scriptCalls[0].args[1], "Bangumi Season_P02_Episode One_64.mp4");
+  assert.equal(scriptCalls[1].args[1], "Bangumi Season_P02_Episode One_audio.m4a");
 });
 
 

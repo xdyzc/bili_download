@@ -1,6 +1,6 @@
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === "BILI_DOWNLOAD_GET_PAGE") {
-    sendResponse(readVideoPage());
+    sendResponse(readPage());
     return false;
   }
 
@@ -31,9 +31,12 @@ function normalizeProgressPayload(value) {
   };
 }
 
-function readVideoPage() {
+function readPage() {
   return {
+    type: isBangumiPage(location.href) ? "bangumi" : "video",
     bvid: extractBvid(location.href),
+    seasonId: extractSeasonId(location.href),
+    epId: extractEpId(location.href),
     title: readTitle(),
     url: location.href
   };
@@ -52,4 +55,18 @@ function readTitle() {
 function extractBvid(value) {
   const match = String(value).match(/BV[0-9A-Za-z]{10}/);
   return match ? match[0] : "";
+}
+
+function extractSeasonId(value) {
+  const match = String(value || "").match(/\/bangumi\/play\/ss(\d+)/);
+  return match ? Number(match[1]) : null;
+}
+
+function extractEpId(value) {
+  const match = String(value || "").match(/\/bangumi\/play\/ep(\d+)/);
+  return match ? Number(match[1]) : null;
+}
+
+function isBangumiPage(value) {
+  return /:\/\/www\.bilibili\.com\/bangumi\/play\//.test(String(value || ""));
 }

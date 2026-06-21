@@ -96,6 +96,43 @@ test("DASH muxer combines video and audio into a parseable MP4", async () => {
 });
 
 
+test("DASH muxer reads input blobs in slices", async () => {
+  const { muxDashToMp4 } = await import("../src/dash-muxer.mjs");
+  const videoBlob = trackingBlob(new Blob([makeFragmentedVideoTrack()], { type: "video/mp4" }));
+  const audioBlob = trackingBlob(new Blob([makeFragmentedAudioTrack()], { type: "audio/mp4" }));
+
+  const result = await muxDashToMp4({
+    videoBlob,
+    audioBlob,
+    outputName: "Sliced Smoke.mp4"
+  });
+
+  assert.equal(result.filename, "Sliced Smoke.mp4");
+  assert.ok(result.blob.size > 0);
+  assert.equal(videoBlob.fullArrayBufferCalls, 0);
+  assert.equal(audioBlob.fullArrayBufferCalls, 0);
+  assert.ok(videoBlob.sliceCalls > 0);
+  assert.ok(audioBlob.sliceCalls > 0);
+});
+
+
+test("DASH muxer composes rewritten output chunks", async () => {
+  const { composeOutputChunksForTest } = await import("../src/dash-muxer.mjs");
+  const prefix = new Uint8Array([1, 1, 1, 1, 1, 1, 1, 1]);
+  const rewrite = new Uint8Array([9, 9]);
+  const suffix = new Uint8Array([2, 2, 2, 2]);
+
+  const chunks = composeOutputChunksForTest([
+    { position: 0, size: prefix.byteLength, blob: new Blob([prefix]) },
+    { position: 3, size: rewrite.byteLength, blob: new Blob([rewrite]) },
+    { position: 8, size: suffix.byteLength, blob: new Blob([suffix]) }
+  ]);
+  const bytes = new Uint8Array(await new Blob(chunks.map((chunk) => chunk.blob)).arrayBuffer());
+
+  assert.deepEqual([...bytes], [1, 1, 1, 9, 9, 1, 1, 1, 2, 2, 2, 2]);
+});
+
+
 test("DASH muxer normalizes near-integer video frame rates", async () => {
   const { normalizeVideoFrameRate } = await import("../src/dash-muxer.mjs");
 
@@ -2750,6 +2787,28 @@ function styleElement() {
   return {
     style: {
       width: ""
+    }
+  };
+}
+
+
+function trackingBlob(blob) {
+  return {
+    get size() {
+      return blob.size;
+    },
+    get type() {
+      return blob.type;
+    },
+    fullArrayBufferCalls: 0,
+    sliceCalls: 0,
+    async arrayBuffer() {
+      this.fullArrayBufferCalls += 1;
+      return blob.arrayBuffer();
+    },
+    slice(start, end) {
+      this.sliceCalls += 1;
+      return blob.slice(start, end);
     }
   };
 }

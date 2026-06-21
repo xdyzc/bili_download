@@ -1,18 +1,31 @@
 import * as MP4Box from "../vendor/mp4box/mp4box.all.mjs";
-import { ArrayBufferTarget, Muxer } from "../vendor/mp4-muxer/mp4-muxer.mjs";
+import { StreamTarget, Muxer } from "../vendor/mp4-muxer/mp4-muxer.mjs";
 
 const MICROSECONDS_PER_SECOND = 1_000_000;
 const FRAME_RATE_INTEGER_EPSILON = 0.01;
+const MP4BOX_PARSE_CHUNK_BYTES = 8 * 1024 * 1024;
+const MUXER_STREAM_CHUNK_BYTES = 8 * 1024 * 1024;
 
 export async function muxDashToMp4({ videoBlob, audioBlob, outputName = "bili_video.mp4" }) {
   const [videoTrack, audioTrack] = await Promise.all([
-    parseSingleTrack(videoBlob, "video"),
-    parseSingleTrack(audioBlob, "audio")
+    parseSingleTrackInfo(videoBlob, "video"),
+    parseSingleTrackInfo(audioBlob, "audio")
   ]);
 
   const videoCodec = muxerVideoCodec(videoTrack.info.codec);
   const audioCodec = muxerAudioCodec(audioTrack.info.codec);
-  const target = new ArrayBufferTarget();
+  const outputChunks = [];
+  const target = new StreamTarget({
+    onData(data, position) {
+      outputChunks.push({
+        blob: new Blob([data]),
+        position,
+        size: data.byteLength
+      });
+    },
+    chunked: true,
+    chunkSize: MUXER_STREAM_CHUNK_BYTES
+  });
   const muxer = new Muxer({
     target,
     video: {
@@ -26,24 +39,24 @@ export async function muxDashToMp4({ videoBlob, audioBlob, outputName = "bili_vi
       sampleRate: audioTrack.info.audio?.sample_rate || audioTrack.info.timescale || 48000,
       numberOfChannels: audioTrack.info.audio?.channel_count || 2
     },
-    fastStart: "in-memory",
+    fastStart: false,
     firstTimestampBehavior: "offset"
   });
 
   const videoMeta = {
     decoderConfig: {
       codec: videoTrack.info.codec,
-      description: extractVideoDecoderDescription(videoTrack.samples[0], videoCodec)
+      description: extractVideoDecoderDescription(videoTrack.firstSample, videoCodec)
     }
   };
   const audioMeta = {
     decoderConfig: {
       codec: audioTrack.info.codec,
-      description: extractAudioDecoderDescription(audioTrack.samples[0], audioTrack.info)
+      description: extractAudioDecoderDescription(audioTrack.firstSample, audioTrack.info)
     }
   };
 
-  for (const sample of videoTrack.samples) {
+  await addSamplesFromBlob(videoBlob, videoTrack.info.id, (sample) => {
     muxer.addVideoChunkRaw(
       sampleBytes(sample),
       sample.is_sync ? "key" : "delta",
@@ -52,9 +65,9 @@ export async function muxDashToMp4({ videoBlob, audioBlob, outputName = "bili_vi
       videoMeta,
       sampleTimeUs(sample.cts - sample.dts, sample.timescale)
     );
-  }
+  });
 
-  for (const sample of audioTrack.samples) {
+  await addSamplesFromBlob(audioBlob, audioTrack.info.id, (sample) => {
     muxer.addAudioChunkRaw(
       sampleBytes(sample),
       "key",
@@ -62,10 +75,10 @@ export async function muxDashToMp4({ videoBlob, audioBlob, outputName = "bili_vi
       sampleDurationUs(sample.duration, sample.timescale),
       audioMeta
     );
-  }
+  });
 
   muxer.finalize();
-  const blob = new Blob([target.buffer], { type: "video/mp4" });
+  const blob = new Blob(composeOutputChunks(outputChunks).map((chunk) => chunk.blob), { type: "video/mp4" });
   return {
     blob,
     filename: outputName.endsWith(".mp4") ? outputName : `${outputName}.mp4`,
@@ -74,27 +87,27 @@ export async function muxDashToMp4({ videoBlob, audioBlob, outputName = "bili_vi
   };
 }
 
-async function parseSingleTrack(blob, expectedType) {
-  const buffer = await blob.arrayBuffer();
-  const parsed = await parseMp4Samples(buffer);
+async function parseSingleTrackInfo(blob, expectedType) {
+  const parsed = await parseMp4Metadata(blob);
   const track = parsed.info.tracks.find((item) => Boolean(item[expectedType])) || parsed.info.tracks[0];
   if (!track) {
     throw new Error(`DASH ${expectedType} file did not contain a track.`);
   }
 
-  const samples = parsed.samplesByTrack.get(track.id) || [];
-  if (!samples.length) {
+  const firstSample = parsed.firstSamplesByTrack.get(track.id);
+  if (!firstSample) {
     throw new Error(`DASH ${expectedType} track did not contain samples.`);
   }
 
-  return { info: track, samples };
+  return { info: track, firstSample };
 }
 
-function parseMp4Samples(buffer) {
+async function parseMp4Metadata(blob) {
   return new Promise((resolve, reject) => {
     const mp4boxFile = MP4Box.createFile();
-    const samplesByTrack = new Map();
+    const firstSamplesByTrack = new Map();
     let infoPayload = null;
+    let resolved = false;
 
     mp4boxFile.onError = (error) => {
       reject(error instanceof Error ? error : new Error(String(error)));
@@ -102,30 +115,92 @@ function parseMp4Samples(buffer) {
     mp4boxFile.onReady = (info) => {
       infoPayload = info;
       for (const track of info.tracks || []) {
-        samplesByTrack.set(track.id, []);
         mp4boxFile.setExtractionOptions(track.id, null, {
-          nbSamples: 1000,
+          nbSamples: 1,
           rapAlignement: false
         });
       }
       mp4boxFile.start();
     };
     mp4boxFile.onSamples = (trackId, _user, samples) => {
-      const current = samplesByTrack.get(trackId) || [];
-      current.push(...samples);
-      samplesByTrack.set(trackId, current);
+      if (samples[0] && !firstSamplesByTrack.has(trackId)) {
+        firstSamplesByTrack.set(trackId, samples[0]);
+      }
+      if (mp4boxFile.releaseUsedSamples) {
+        mp4boxFile.releaseUsedSamples(trackId, samples.at(-1).number + 1);
+      }
     };
 
-    buffer.fileStart = 0;
-    mp4boxFile.appendBuffer(buffer);
-    mp4boxFile.flush();
-
-    if (!infoPayload) {
-      reject(new Error("Could not parse DASH MP4 metadata."));
-      return;
-    }
-    resolve({ info: infoPayload, samplesByTrack });
+    appendBlobToMp4Box(blob, mp4boxFile)
+      .then(() => {
+        if (!infoPayload) {
+          reject(new Error("Could not parse DASH MP4 metadata."));
+          return;
+        }
+        resolved = true;
+        resolve({ info: infoPayload, firstSamplesByTrack });
+      })
+      .catch((error) => {
+        if (!resolved) {
+          reject(error);
+        }
+      });
   });
+}
+
+async function addSamplesFromBlob(blob, trackId, onSample) {
+  return new Promise((resolve, reject) => {
+    const mp4boxFile = MP4Box.createFile();
+    let sampleCount = 0;
+
+    mp4boxFile.onError = (error) => {
+      reject(error instanceof Error ? error : new Error(String(error)));
+    };
+    mp4boxFile.onReady = (info) => {
+      const track = info.tracks.find((item) => item.id === trackId) || info.tracks[0];
+      if (!track) {
+        reject(new Error("DASH MP4 file did not contain a track."));
+        return;
+      }
+      mp4boxFile.setExtractionOptions(track.id, null, {
+        nbSamples: 256,
+        rapAlignement: false
+      });
+      mp4boxFile.start();
+    };
+    mp4boxFile.onSamples = (id, _user, samples) => {
+      for (const sample of samples) {
+        onSample(sample);
+        sampleCount += 1;
+      }
+      if (mp4boxFile.releaseUsedSamples && samples.length) {
+        mp4boxFile.releaseUsedSamples(id, samples.at(-1).number + 1);
+      }
+    };
+
+    appendBlobToMp4Box(blob, mp4boxFile)
+      .then(() => {
+        if (!sampleCount) {
+          reject(new Error("DASH MP4 track did not contain samples."));
+          return;
+        }
+        resolve();
+      })
+      .catch(reject);
+  });
+}
+
+async function appendBlobToMp4Box(blob, mp4boxFile) {
+  let offset = 0;
+  while (offset < blob.size) {
+    const chunk = await blob
+      .slice(offset, Math.min(offset + MP4BOX_PARSE_CHUNK_BYTES, blob.size))
+      .arrayBuffer();
+    chunk.fileStart = offset;
+    mp4boxFile.appendBuffer(chunk, offset + chunk.byteLength >= blob.size);
+    offset += chunk.byteLength;
+  }
+  mp4boxFile.flush();
 }
 
 function muxerVideoCodec(codec) {
@@ -208,15 +283,12 @@ function buildAacLcConfig(sampleRate, channels) {
 }
 
 function frameRateFromTrack(track) {
-  const durations = track.samples
-    .map((sample) => Number(sample.duration) || 0)
-    .filter(Boolean);
-  if (!durations.length || !track.samples[0]?.timescale) {
+  const sampleDuration = Number(track.firstSample?.duration) || 0;
+  if (!sampleDuration || !track.firstSample?.timescale) {
     return undefined;
   }
 
-  const averageDuration = durations.reduce((sum, value) => sum + value, 0) / durations.length;
-  return normalizeVideoFrameRate(track.samples[0].timescale / averageDuration);
+  return normalizeVideoFrameRate(track.firstSample.timescale / sampleDuration);
 }
 
 export function normalizeVideoFrameRate(value) {
@@ -249,13 +321,71 @@ function summarizeTrack(track) {
   return {
     id: track.info.id,
     codec: track.info.codec,
-    samples: track.samples.length,
-    duration: track.samples.reduce((sum, sample) => sum + (Number(sample.duration) || 0), 0),
-    timescale: track.samples[0]?.timescale || track.info.timescale || 0
+    samples: Number(track.info.nb_samples) || 0,
+    duration: Number(track.info.duration) || 0,
+    timescale: track.firstSample?.timescale || track.info.timescale || 0
   };
 }
 
 function copyBytes(value) {
   const bytes = value instanceof Uint8Array ? value : new Uint8Array(value);
   return new Uint8Array(bytes);
+}
+
+export function composeOutputChunksForTest(chunks) {
+  return composeOutputChunks(chunks);
+}
+
+function composeOutputChunks(chunks) {
+  const segments = [];
+  for (const chunk of chunks) {
+    writeOutputSegment(segments, {
+      start: chunk.position,
+      end: chunk.position + chunk.size,
+      blob: chunk.blob
+    });
+  }
+
+  const sorted = segments.sort((left, right) => left.start - right.start);
+  let expectedPosition = 0;
+  for (const segment of sorted) {
+    if (segment.start !== expectedPosition) {
+      throw new Error(`MP4 muxer output has a gap at ${expectedPosition}; next chunk starts at ${segment.start}.`);
+    }
+    expectedPosition = segment.end;
+  }
+  return sorted;
+}
+
+function writeOutputSegment(segments, incoming) {
+  if (incoming.end <= incoming.start) {
+    return;
+  }
+
+  const nextSegments = [];
+  for (const segment of segments) {
+    if (segment.end <= incoming.start || segment.start >= incoming.end) {
+      nextSegments.push(segment);
+      continue;
+    }
+
+    if (segment.start < incoming.start) {
+      nextSegments.push({
+        start: segment.start,
+        end: incoming.start,
+        blob: segment.blob.slice(0, incoming.start - segment.start)
+      });
+    }
+
+    if (segment.end > incoming.end) {
+      nextSegments.push({
+        start: incoming.end,
+        end: segment.end,
+        blob: segment.blob.slice(incoming.end - segment.start)
+      });
+    }
+  }
+
+  nextSegments.push(incoming);
+  segments.splice(0, segments.length, ...nextSegments);
 }

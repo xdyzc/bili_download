@@ -2,11 +2,15 @@ const TEXT = {
   checking: "\u68c0\u67e5\u5f53\u524d\u9875\u9762...",
   loading: "\u6b63\u5728\u8bfb\u53d6\u89c6\u9891\u4fe1\u606f...",
   ready: "\u53ef\u9009\u62e9\u6e05\u6670\u5ea6\u4e0b\u8f7d",
+  collectionReady: "\u68c0\u6d4b\u5230\u591a\u4e2a\u5206 P\uff0c\u53ef\u9009\u62e9\u8981\u4e0b\u8f7d\u7684\u5206 P",
   copied: "BV \u53f7\u5df2\u590d\u5236",
   noVideo: "\u5f53\u524d\u9875\u9762\u4e0d\u662f Bilibili \u89c6\u9891\u9875",
   noQuality: "\u6ca1\u6709\u53ef\u7528\u6e05\u6670\u5ea6",
   qualityUnavailable: "\u8be5\u6e05\u6670\u5ea6\u9700\u8981 Cookie \u767b\u5f55\u540e\u624d\u80fd\u4e0b\u8f7d",
+  noSelectedPages: "\u8bf7\u5148\u9009\u62e9\u8981\u4e0b\u8f7d\u7684\u5206 P",
   downloading: "\u6b63\u5728\u8bf7\u6c42\u89c6\u9891\u6587\u4ef6...",
+  downloadingPages: "\u6b63\u5728\u4e0b\u8f7d\u9009\u4e2d\u5206 P...",
+  pagesDownloaded: "\u5df2\u4e0b\u8f7d\u9009\u4e2d\u5206 P",
   muxing: "\u6b63\u5728\u5408\u5e76 MP4...",
   downloadStarted: "\u4e0b\u8f7d\u5df2\u5f00\u59cb",
   dashMuxed: "DASH \u5df2\u5408\u5e76\u4e3a MP4",
@@ -49,7 +53,9 @@ const state = {
     candidateCount: 0
   },
   busy: false,
-  downloadControl: null
+  downloadControl: null,
+  pagePickerOpen: false,
+  selectedPageCids: null
 };
 
 const statusElement = document.querySelector("#status");
@@ -59,6 +65,11 @@ const titleInput = document.querySelector("#title");
 const qualitySelect = document.querySelector("#quality");
 const copyButton = document.querySelector("#copy");
 const downloadButton = document.querySelector("#download");
+const pagePickerToggle = document.querySelector("#page-picker-toggle");
+const pagePicker = document.querySelector("#page-picker");
+const pageList = document.querySelector("#page-list");
+const pageSelectAllButton = document.querySelector("#page-select-all");
+const downloadSelectedPagesButton = document.querySelector("#download-selected-pages");
 const diagnosticButton = document.querySelector("#diagnostic");
 const progressPanel = document.querySelector("#progress");
 const progressPercent = document.querySelector("#progress-percent");
@@ -72,6 +83,9 @@ const cancelButton = document.querySelector("#cancel");
 document.addEventListener("DOMContentLoaded", initialize);
 copyButton.addEventListener("click", copyBvid);
 downloadButton.addEventListener("click", downloadSelectedQuality);
+pagePickerToggle?.addEventListener("click", togglePagePicker);
+pageSelectAllButton?.addEventListener("click", toggleAllPages);
+downloadSelectedPagesButton?.addEventListener("click", downloadSelectedPages);
 diagnosticButton.addEventListener("click", copyDiagnostic);
 qualitySelect.addEventListener?.("change", updateControls);
 pauseButton?.addEventListener("click", togglePauseDownload);
@@ -119,8 +133,11 @@ async function initialize() {
     state.account = response.payload.account || null;
     state.page.bvid = state.video.bvid;
     state.page.title = state.video.title;
+    state.selectedPageCids = null;
     render();
-    setStatus(videoHasAvailableQuality(state.video) ? TEXT.ready : TEXT.noQuality);
+    setStatus(videoHasAvailableQuality(state.video)
+      ? (videoHasMultiplePages(state.video) ? TEXT.collectionReady : TEXT.ready)
+      : TEXT.noQuality);
   } catch (error) {
     setStatus(error.message);
     render();
@@ -159,6 +176,7 @@ function render() {
   titleInput.value = state.page.title;
   renderAccount();
   renderQualities();
+  renderPages();
   updateControls();
 }
 
@@ -218,6 +236,99 @@ function displayQualityLabel(quality) {
   return `${quality.label}\uff08${suffix}\uff09`;
 }
 
+function renderPages() {
+  if (!pagePicker || !pageList || !pagePickerToggle) {
+    return;
+  }
+
+  const pages = state.video?.pages || [];
+  const hasMultiplePages = pages.length > 1;
+  const selectedCids = state.selectedPageCids;
+  pagePickerToggle.hidden = !hasMultiplePages;
+  pagePicker.hidden = !hasMultiplePages || !state.pagePickerOpen;
+  pageList.replaceChildren();
+
+  if (!hasMultiplePages) {
+    return;
+  }
+
+  for (const page of pages) {
+    const row = document.createElement("label");
+    row.className = "page-option";
+    row.title = page.title || "";
+
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.value = String(page.cid);
+    checkbox.dataset.pageIndex = String(page.index);
+    checkbox.checked = selectedCids
+      ? selectedCids.has(Number(page.cid))
+      : Number(page.cid) === Number(state.video.page?.cid);
+    checkbox.addEventListener?.("change", () => {
+      syncSelectedPageCids();
+      updateControls();
+    });
+
+    const index = document.createElement("span");
+    index.className = "page-index";
+    index.textContent = `P${String(page.index).padStart(2, "0")}`;
+
+    const title = document.createElement("span");
+    title.className = "page-title";
+    title.textContent = page.title || `P${page.index}`;
+
+    row.append(checkbox, index, title);
+    pageList.append(row);
+  }
+
+  updatePageSelectionAction();
+}
+
+function togglePagePicker() {
+  state.pagePickerOpen = !state.pagePickerOpen;
+  renderPages();
+  updateControls();
+}
+
+function toggleAllPages() {
+  const checkboxes = pageCheckboxes();
+  const shouldSelectAll = checkboxes.some((checkbox) => !checkbox.checked);
+  for (const checkbox of checkboxes) {
+    checkbox.checked = shouldSelectAll;
+  }
+  syncSelectedPageCids();
+  updatePageSelectionAction();
+  updateControls();
+}
+
+function updatePageSelectionAction() {
+  if (!pageSelectAllButton) {
+    return;
+  }
+  const checkboxes = pageCheckboxes();
+  const allSelected = Boolean(checkboxes.length) && checkboxes.every((checkbox) => checkbox.checked);
+  pageSelectAllButton.textContent = allSelected ? "\u6e05\u7a7a" : "\u5168\u9009";
+}
+
+function pageCheckboxes() {
+  return pageList && typeof pageList.querySelectorAll === "function"
+    ? Array.from(pageList.querySelectorAll("input[type=\"checkbox\"]"))
+    : [];
+}
+
+function selectedPages() {
+  const selectedCids = new Set(pageCheckboxes()
+    .filter((checkbox) => checkbox.checked)
+    .map((checkbox) => Number(checkbox.value)));
+  return (state.video?.pages || []).filter((page) => selectedCids.has(Number(page.cid)));
+}
+
+function syncSelectedPageCids() {
+  state.selectedPageCids = new Set(pageCheckboxes()
+    .filter((checkbox) => checkbox.checked)
+    .map((checkbox) => Number(checkbox.value)));
+}
+
 async function copyBvid() {
   if (!state.page.bvid) {
     return;
@@ -245,37 +356,12 @@ async function downloadSelectedQuality() {
   setStatus(TEXT.downloading);
 
   try {
-    const prepared = await chrome.runtime.sendMessage({
-      type: "BILI_DOWNLOAD_PREPARE_DIRECT",
-      payload: {
-        bvid: state.video.bvid,
-        cid: state.video.page.cid,
-        quality: Number(qualitySelect.value),
-        title: state.video.title
-      }
-    });
-
-    if (!prepared?.ok) {
-      state.lastDiagnostic = prepared?.diagnostic || state.lastDiagnostic;
-      throw new Error(prepared?.error || "Failed to prepare download.");
-    }
-
-    if (prepared.payload.mode === "dash") {
-      await downloadDashAsMp4(prepared.payload);
-    } else {
-      const diagnostics = [];
-      for (const [index, segment] of prepared.payload.segments.entries()) {
-        await waitForDownloadControl();
-        throwIfDownloadCanceled();
-        const role = segment.context?.roleLabel || segment.context?.role || "";
-        const suffix = role ? ` ${index + 1}/${prepared.payload.count} ${role}` : ` ${index + 1}/${prepared.payload.count}`;
-        setStatus(`${TEXT.downloading}${suffix}`);
-        const diagnostic = await downloadSegment(segment);
-        diagnostics.push(diagnostic);
-        state.lastDiagnostic = diagnostic;
-      }
-      setStatus(`${TEXT.downloadStarted}: ${prepared.payload.count}`);
-      await saveDiagnostic(state.lastDiagnostic);
+    const prepared = await preparePageDownload({
+      cid: state.video.page.cid
+    }, Number(qualitySelect.value), state.video.title);
+    await downloadPreparedPayload(prepared);
+    if (prepared.mode !== "dash") {
+      setStatus(`${TEXT.downloadStarted}: ${prepared.count}`);
     }
   } catch (error) {
     if (isDownloadCanceledError(error)) {
@@ -293,6 +379,96 @@ async function downloadSelectedQuality() {
     }
     setBusy(false);
   }
+}
+
+async function downloadSelectedPages() {
+  if (!state.video || !qualitySelect.value) {
+    return;
+  }
+
+  if (!selectedQualityAvailable()) {
+    setStatus(TEXT.qualityUnavailable);
+    updateControls();
+    return;
+  }
+
+  const pages = selectedPages();
+  if (!pages.length) {
+    setStatus(TEXT.noSelectedPages);
+    updateControls();
+    return;
+  }
+
+  const control = createDownloadControl();
+  state.downloadControl = control;
+  setBusy(true);
+  resetProgress();
+  setStatus(TEXT.downloadingPages);
+
+  try {
+    const quality = Number(qualitySelect.value);
+    for (const [index, page] of pages.entries()) {
+      await waitForDownloadControl();
+      throwIfDownloadCanceled();
+      const pageIndex = Number(page.index || page.page) || index + 1;
+      setStatus(`${TEXT.downloadingPages} ${index + 1}/${pages.length} P${String(pageIndex).padStart(2, "0")}`);
+      const prepared = await preparePageDownload(page, quality, pageDownloadTitle(state.video.title, page));
+      await downloadPreparedPayload(prepared);
+    }
+    setStatus(`${TEXT.pagesDownloaded}: ${pages.length}`);
+  } catch (error) {
+    if (isDownloadCanceledError(error)) {
+      setStatus(TEXT.canceled);
+      return;
+    }
+    if (error.diagnostic) {
+      state.lastDiagnostic = error.diagnostic;
+      await saveDiagnostic(error.diagnostic);
+    }
+    setStatus(error.message);
+  } finally {
+    if (state.downloadControl === control) {
+      state.downloadControl = null;
+    }
+    setBusy(false);
+  }
+}
+
+async function preparePageDownload(page, quality, title) {
+  const prepared = await chrome.runtime.sendMessage({
+    type: "BILI_DOWNLOAD_PREPARE_DIRECT",
+    payload: {
+      bvid: state.video.bvid,
+      cid: Number(page.cid),
+      quality,
+      title
+    }
+  });
+
+  if (!prepared?.ok) {
+    state.lastDiagnostic = prepared?.diagnostic || state.lastDiagnostic;
+    throw new Error(prepared?.error || "Failed to prepare download.");
+  }
+
+  return prepared.payload;
+}
+
+async function downloadPreparedPayload(prepared) {
+  if (prepared.mode === "dash") {
+    await downloadDashAsMp4(prepared);
+    return;
+  }
+
+  for (const [index, segment] of prepared.segments.entries()) {
+    await waitForDownloadControl();
+    throwIfDownloadCanceled();
+    const role = segment.context?.roleLabel || segment.context?.role || "";
+    const suffix = role ? ` ${index + 1}/${prepared.count} ${role}` : ` ${index + 1}/${prepared.count}`;
+    setStatus(`${TEXT.downloading}${suffix}`);
+    const diagnostic = await downloadSegment(segment);
+    state.lastDiagnostic = diagnostic;
+  }
+  await saveDiagnostic(state.lastDiagnostic);
 }
 
 async function downloadDashAsMp4(prepared) {
@@ -1565,9 +1741,26 @@ function updateControls() {
   const hasBvid = Boolean(state.page.bvid);
   const hasQuality = Boolean(state.video?.qualities?.length);
   const hasAvailableQuality = Boolean(availableQualityOptions().length);
+  const hasMultiplePages = videoHasMultiplePages(state.video);
+  const hasSelectedPages = Boolean(selectedPages().length);
   copyButton.disabled = state.busy || !hasBvid;
   downloadButton.disabled = state.busy || !hasBvid || !hasAvailableQuality || !selectedQualityAvailable();
   qualitySelect.disabled = state.busy || !hasQuality;
+  if (pagePickerToggle) {
+    pagePickerToggle.disabled = state.busy || !hasMultiplePages;
+  }
+  if (pageSelectAllButton) {
+    pageSelectAllButton.disabled = state.busy || !hasMultiplePages;
+  }
+  if (downloadSelectedPagesButton) {
+    downloadSelectedPagesButton.disabled = state.busy ||
+      !hasBvid ||
+      !hasMultiplePages ||
+      !hasAvailableQuality ||
+      !selectedQualityAvailable() ||
+      !hasSelectedPages;
+  }
+  updatePageSelectionAction();
   diagnosticButton.disabled = state.busy || !state.lastDiagnostic;
   renderDownloadControls();
 }
@@ -1587,6 +1780,16 @@ function selectedQualityOption() {
 function selectedQualityAvailable() {
   const option = selectedQualityOption();
   return Boolean(option && !option.disabled);
+}
+
+function videoHasMultiplePages(video) {
+  return Boolean(video?.pages?.length > 1);
+}
+
+function pageDownloadTitle(videoTitle, page) {
+  const pageIndex = Number(page?.index || page?.page) || 1;
+  const partTitle = page?.title ? `_${page.title}` : "";
+  return `${videoTitle}_P${String(pageIndex).padStart(2, "0")}${partTitle}`;
 }
 
 function setBusy(value) {

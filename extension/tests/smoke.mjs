@@ -60,6 +60,11 @@ test("popup contains MVP controls", async () => {
     "title",
     "quality",
     "download",
+    "page-picker-toggle",
+    "page-picker",
+    "page-list",
+    "page-select-all",
+    "download-selected-pages",
     "diagnostic",
     "progress",
     "progress-percent",
@@ -464,6 +469,115 @@ test("background loads qualities and starts direct browser downloads", async () 
       tabId: 0
     }
   }]);
+});
+
+
+test("background returns normalized multi-page metadata for the current URL page", async () => {
+  const code = await readFile("extension/src/background.js", "utf8");
+  const fetchUrls = [];
+
+  const sandbox = {
+    Array,
+    Date,
+    Error,
+    Number,
+    Promise,
+    String,
+    URL,
+    URLSearchParams,
+    clearTimeout,
+    setTimeout,
+    chrome: {
+      runtime: {
+        lastError: null,
+        onMessage: {
+          addListener() {}
+        },
+        onConnect: {
+          addListener() {}
+        }
+      },
+      declarativeNetRequest: {
+        onRuleMatchedDebug: {
+          addListener() {}
+        }
+      },
+      storage: {
+        local: {
+          async get() {
+            return {};
+          },
+          async set() {}
+        }
+      }
+    },
+    fetch: async (url) => {
+      const value = String(url);
+      fetchUrls.push(value);
+      if (value.includes("/x/web-interface/nav")) {
+        return jsonResponse({
+          code: 0,
+          data: {
+            isLogin: true,
+            uname: "multi-user",
+            mid: 42,
+            vipInfo: {}
+          }
+        });
+      }
+      if (value.includes("/x/web-interface/view")) {
+        return jsonResponse({
+          code: 0,
+          data: {
+            aid: 100,
+            bvid: "BV1KGj36QEG3",
+            title: "Multi Page Video",
+            owner: { name: "tester" },
+            pages: [
+              { page: 1, cid: 101, part: "Opening" },
+              { page: 2, cid: 202, part: "Middle" },
+              { page: 3, cid: 303, part: "Ending" }
+            ]
+          }
+        });
+      }
+      if (value.includes("/x/player/playurl")) {
+        return jsonResponse({
+          code: 0,
+          data: {
+            quality: 64,
+            format: "mp4",
+            accept_quality: [64],
+            accept_description: ["720P"],
+            durl: [{
+              url: "https://primary.hdslb.test/page.mp4",
+              size: 1024
+            }]
+          }
+        });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    }
+  };
+
+  vm.createContext(sandbox);
+  vm.runInContext(code, sandbox);
+
+  const video = await sandbox.loadVideo({
+    bvid: "BV1KGj36QEG3",
+    title: "Multi Page Video",
+    url: "https://www.bilibili.com/video/BV1KGj36QEG3/?p=2"
+  });
+
+  assert.equal(video.page.index, 2);
+  assert.equal(video.page.cid, 202);
+  assert.equal(video.page.title, "Middle");
+  assert.deepEqual(video.pages.map((page) => [page.index, page.cid, page.title]), [
+    [1, 101, "Opening"],
+    [2, 202, "Middle"],
+    [3, 303, "Ending"]
+  ]);
+  assert.ok(fetchUrls.some((url) => url.includes("cid=202")));
 });
 
 
@@ -1093,6 +1207,220 @@ test("popup disables login-only quality options", async () => {
   await sandbox.downloadSelectedQuality();
   assert.match(statusElement.textContent, /Cookie/);
   assert.equal(prepareMessages, 0);
+});
+
+
+test("popup lets users choose specific multi-page videos to download", async () => {
+  const code = await readFile("extension/src/popup.js", "utf8");
+  const runtimeMessages = [];
+  const scriptCalls = [];
+  const statusElement = textElement();
+  const accountElement = textElement();
+  const qualitySelect = selectElement();
+  const pagePickerToggle = buttonElement();
+  const pagePicker = panelElement();
+  const pageList = containerElement();
+  const pageSelectAllButton = buttonElement();
+  const downloadSelectedPagesButton = buttonElement();
+
+  const sandbox = {
+    Blob,
+    Date,
+    Error,
+    RegExp,
+    String,
+    URL,
+    console,
+    navigator: {
+      clipboard: {
+        async writeText() {}
+      }
+    },
+    setTimeout(callback) {
+      callback();
+      return 1;
+    },
+    document: {
+      addEventListener() {},
+      body: {
+        append() {}
+      },
+      createElement(tagName) {
+        if (tagName === "label") {
+          return containerElement();
+        }
+        if (tagName === "input") {
+          return inputElement();
+        }
+        if (tagName === "span") {
+          return textElement();
+        }
+        return optionElement();
+      },
+      querySelector(selector) {
+        return {
+          "#status": statusElement,
+          "#account": accountElement,
+          "#bvid": textElement(),
+          "#title": textElement(),
+          "#quality": qualitySelect,
+          "#copy": buttonElement(),
+          "#download": buttonElement(),
+          "#page-picker-toggle": pagePickerToggle,
+          "#page-picker": pagePicker,
+          "#page-list": pageList,
+          "#page-select-all": pageSelectAllButton,
+          "#download-selected-pages": downloadSelectedPagesButton,
+          "#diagnostic": buttonElement(),
+          "#progress": panelElement(),
+          "#progress-percent": textElement(),
+          "#progress-bar": styleElement(),
+          "#progress-size": textElement(),
+          "#progress-speed": textElement(),
+          "#download-controls": panelElement(),
+          "#pause": buttonElement(),
+          "#cancel": buttonElement()
+        }[selector];
+      }
+    },
+    chrome: {
+      tabs: {
+        async query() {
+          return [{
+            id: 99,
+            url: "https://www.bilibili.com/video/BV1KGj36QEG3/?p=2",
+            title: "Multi Page Video"
+          }];
+        },
+        async sendMessage() {
+          return {
+            bvid: "BV1KGj36QEG3",
+            title: "Multi Page Video",
+            url: "https://www.bilibili.com/video/BV1KGj36QEG3/?p=2"
+          };
+        }
+      },
+      runtime: {
+        connect() {
+          return {
+            onMessage: {
+              addListener() {}
+            }
+          };
+        },
+        async sendMessage(message) {
+          runtimeMessages.push(message);
+          if (message.type === "BILI_DOWNLOAD_GET_DIAGNOSTIC") {
+            return { ok: true, payload: null };
+          }
+          if (message.type === "BILI_DOWNLOAD_LOAD_VIDEO") {
+            return {
+              ok: true,
+              payload: {
+                bvid: "BV1KGj36QEG3",
+                title: "Multi Page Video",
+                page: { index: 2, cid: 202, title: "Middle" },
+                currentQuality: 64,
+                qualities: [{ code: 64, label: "64 - 720P", available: true, mode: "direct" }],
+                pages: [
+                  { index: 1, page: 1, cid: 101, title: "Opening", part: "Opening" },
+                  { index: 2, page: 2, cid: 202, title: "Middle", part: "Middle" },
+                  { index: 3, page: 3, cid: 303, title: "Ending", part: "Ending" }
+                ]
+              }
+            };
+          }
+          if (message.type === "BILI_DOWNLOAD_PREPARE_DIRECT") {
+            return {
+              ok: true,
+              payload: {
+                count: 1,
+                mode: "durl",
+                segments: [{
+                  url: `https://primary.hdslb.test/${message.payload.cid}.mp4`,
+                  filename: `BiliDownload/${message.payload.title}_64.mp4`,
+                  size: 1024,
+                  candidates: [{ url: `https://primary.hdslb.test/${message.payload.cid}.mp4`, kind: "primary", size: 1024 }],
+                  context: {
+                    bvid: message.payload.bvid,
+                    cid: message.payload.cid,
+                    quality: message.payload.quality,
+                    title: message.payload.title,
+                    segmentIndex: 1,
+                    segmentCount: 1,
+                    format: "mp4",
+                    downloadMethod: "page-blob"
+                  }
+                }]
+              }
+            };
+          }
+          if (message.type === "BILI_DOWNLOAD_SAVE_DIAGNOSTIC") {
+            return { ok: true };
+          }
+          throw new Error(`unexpected runtime message: ${message.type}`);
+        }
+      },
+      scripting: {
+        async executeScript(call) {
+          scriptCalls.push(call);
+          return [{
+            result: {
+              ok: true,
+              responseOk: true,
+              status: 200,
+              statusText: "OK",
+              mime: "video/mp4",
+              size: 1024,
+              totalBytes: 1024,
+              receivedBytes: 1024,
+              filename: call.args[1]
+            }
+          }];
+        }
+      }
+    }
+  };
+
+  vm.createContext(sandbox);
+  vm.runInContext(code, sandbox);
+
+  await sandbox.initialize();
+  assert.equal(pagePickerToggle.hidden, false);
+  assert.equal(pagePicker.hidden, true);
+  assert.match(statusElement.textContent, /\u5206 P/);
+
+  sandbox.togglePagePicker();
+  assert.equal(pagePicker.hidden, false);
+  assert.equal(pageList.children.length, 3);
+  let checkboxes = pageList.querySelectorAll("input[type=\"checkbox\"]");
+  assert.deepEqual(checkboxes.map((checkbox) => checkbox.checked), [false, true, false]);
+  assert.equal(downloadSelectedPagesButton.disabled, false);
+
+  sandbox.toggleAllPages();
+  checkboxes = pageList.querySelectorAll("input[type=\"checkbox\"]");
+  assert.deepEqual(checkboxes.map((checkbox) => checkbox.checked), [true, true, true]);
+  assert.equal(pageSelectAllButton.textContent, "\u6e05\u7a7a");
+
+  checkboxes[1].checked = false;
+  checkboxes[1].dispatchEvent("change");
+  assert.deepEqual(pageList.querySelectorAll("input[type=\"checkbox\"]").map((checkbox) => checkbox.checked), [true, false, true]);
+
+  qualitySelect.value = "64";
+  await sandbox.downloadSelectedPages();
+
+  const preparePayloads = runtimeMessages
+    .filter((message) => message.type === "BILI_DOWNLOAD_PREPARE_DIRECT")
+    .map((message) => message.payload);
+  assert.deepEqual(preparePayloads.map((payload) => payload.cid), [101, 303]);
+  assert.deepEqual(preparePayloads.map((payload) => payload.title), [
+    "Multi Page Video_P01_Opening",
+    "Multi Page Video_P03_Ending"
+  ]);
+  assert.equal(scriptCalls.length, 2);
+  assert.equal(scriptCalls[0].args[1], "Multi Page Video_P01_Opening_64.mp4");
+  assert.equal(scriptCalls[1].args[1], "Multi Page Video_P03_Ending_64.mp4");
+  assert.match(statusElement.textContent, /2$/);
 });
 
 
@@ -2734,6 +3062,8 @@ function textElement() {
     value: "",
     textContent: "",
     disabled: false,
+    className: "",
+    title: "",
     addEventListener() {}
   };
 }
@@ -2742,6 +3072,8 @@ function textElement() {
 function buttonElement() {
   return {
     disabled: false,
+    hidden: false,
+    textContent: "",
     addEventListener() {}
   };
 }
@@ -2771,14 +3103,77 @@ function optionElement() {
     value: "",
     textContent: "",
     disabled: false,
-    selected: false
+    selected: false,
+    className: "",
+    title: ""
   };
 }
 
 
 function panelElement() {
   return {
-    hidden: true
+    hidden: true,
+    disabled: false
+  };
+}
+
+
+function inputElement() {
+  const listeners = {};
+  return {
+    type: "",
+    value: "",
+    checked: false,
+    disabled: false,
+    className: "",
+    title: "",
+    dataset: {},
+    addEventListener(type, listener) {
+      listeners[type] = listener;
+    },
+    dispatchEvent(type) {
+      listeners[type]?.({ target: this });
+    }
+  };
+}
+
+
+function containerElement() {
+  return {
+    children: [],
+    hidden: false,
+    disabled: false,
+    className: "",
+    title: "",
+    dataset: {},
+    append(...items) {
+      this.children.push(...items);
+    },
+    replaceChildren(...items) {
+      this.children = [...items];
+    },
+    querySelectorAll(selector) {
+      if (selector !== "input[type=\"checkbox\"]") {
+        return [];
+      }
+      const results = [];
+      const visit = (node) => {
+        if (!node) {
+          return;
+        }
+        if (node.type === "checkbox") {
+          results.push(node);
+        }
+        for (const child of node.children || []) {
+          visit(child);
+        }
+      };
+      for (const child of this.children) {
+        visit(child);
+      }
+      return results;
+    },
+    addEventListener() {}
   };
 }
 

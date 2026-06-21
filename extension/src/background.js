@@ -139,8 +139,9 @@ async function loadVideo(page) {
     }))
   ]);
   const info = expectData(infoPayload);
+  const pages = normalizeVideoPages(info.pages || []);
   const pageNumber = readPageNumber(page?.url);
-  const videoPage = selectVideoPage(info.pages || [], pageNumber);
+  const videoPage = selectVideoPage(pages, pageNumber);
 
   if (!videoPage?.cid) {
     throw new Error("Could not find the video cid.");
@@ -164,10 +165,11 @@ async function loadVideo(page) {
     title: page?.title || info.title || bvid,
     ownerName: info.owner?.name || "",
     page: {
-      index: videoPage.page || 1,
+      index: videoPage.index || videoPage.page || 1,
       cid: videoPage.cid,
-      title: videoPage.part || ""
+      title: videoPage.title || videoPage.part || ""
     },
+    pages,
     account,
     currentQuality: selectDefaultQuality(qualities, playUrl.quality),
     directAvailable: qualities.some((quality) => quality.available && quality.mode === "direct"),
@@ -769,7 +771,23 @@ function pickDashStream(stream) {
 }
 
 function selectVideoPage(pages, pageNumber) {
-  return pages.find((item) => Number(item.page) === pageNumber) || pages[0] || null;
+  return pages.find((item) => Number(item.index || item.page) === pageNumber) || pages[0] || null;
+}
+
+function normalizeVideoPages(pages) {
+  return (Array.isArray(pages) ? pages : [])
+    .map((item, index) => {
+      const pageIndex = Number(item?.page) || index + 1;
+      const title = String(item?.part || item?.title || `P${pageIndex}`);
+      return {
+        index: pageIndex,
+        page: pageIndex,
+        cid: Number(item?.cid) || 0,
+        title,
+        part: title
+      };
+    })
+    .filter((item) => item.cid);
 }
 
 function readPageNumber(url) {

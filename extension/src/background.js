@@ -15,6 +15,13 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
 
+  if (message?.type === "BILI_DOWNLOAD_GET_ACCOUNT") {
+    fetchAccountStatus()
+      .then((payload) => sendResponse({ ok: true, payload }))
+      .catch((error) => sendResponse(errorResponse(error)));
+    return true;
+  }
+
   if (message?.type === "BILI_DOWNLOAD_START_DIRECT") {
     startDirectDownload(message.payload)
       .then((payload) => sendResponse({ ok: true, payload }))
@@ -121,7 +128,16 @@ async function loadVideo(page) {
     throw new Error("No BV id was found on this page.");
   }
 
-  const infoPayload = await fetchJson(`${API_BASE}/x/web-interface/view?bvid=${encodeURIComponent(bvid)}`);
+  const [infoPayload, account] = await Promise.all([
+    fetchJson(`${API_BASE}/x/web-interface/view?bvid=${encodeURIComponent(bvid)}`),
+    fetchAccountStatus().catch((error) => ({
+      isLogin: false,
+      username: "",
+      userId: null,
+      vipLabel: "",
+      error: error.message
+    }))
+  ]);
   const info = expectData(infoPayload);
   const pageNumber = readPageNumber(page?.url);
   const videoPage = selectVideoPage(info.pages || [], pageNumber);
@@ -146,9 +162,28 @@ async function loadVideo(page) {
       cid: videoPage.cid,
       title: videoPage.part || ""
     },
+    account,
     currentQuality: playUrl.quality || null,
     directAvailable: Array.isArray(playUrl.durl) && playUrl.durl.length > 0,
+    dashAvailable: playUrl.dashVideos.length > 0,
     qualities
+  };
+}
+
+async function fetchAccountStatus() {
+  const payload = await fetchJson(`${API_BASE}/x/web-interface/nav`);
+  const data = expectData(payload);
+  const vipInfo = data.vipInfo || {};
+  const vipLabel = vipInfo.label || {};
+  const labelText = typeof vipLabel === "object" ? vipLabel.text : "";
+  const userId = Number(data.mid);
+
+  return {
+    isLogin: Boolean(data.isLogin),
+    username: String(data.uname || ""),
+    userId: Number.isFinite(userId) && userId > 0 ? userId : null,
+    vipLabel: String(labelText || ""),
+    source: "browser-cookie"
   };
 }
 
@@ -229,7 +264,7 @@ async function prepareDirectDownload(payload) {
   }
 
   const playUrl = await fetchPlayUrl({ bvid, cid, quality });
-  const segments = Array.isArray(playUrl.durl)
+  const directSegments = Array.isArray(playUrl.durl)
     ? playUrl.durl
         .map((item) => ({
           source: item,
@@ -238,10 +273,41 @@ async function prepareDirectDownload(payload) {
         .filter((item) => item.candidates.length)
     : [];
 
-  if (!segments.length) {
-    throw new Error("This stream is DASH-only. DASH support is the next milestone.");
+  if (playUrl.dashVideos.some((stream) => stream.id === quality)) {
+    return prepareDashSegments({
+      bvid,
+      cid,
+      quality,
+      title,
+      playUrl
+    });
   }
 
+  if (directSegments.length) {
+    return prepareDurlSegments({
+      bvid,
+      cid,
+      quality,
+      title,
+      playUrl,
+      segments: directSegments
+    });
+  }
+
+  if (playUrl.dashVideos.length) {
+    return prepareDashSegments({
+      bvid,
+      cid,
+      quality,
+      title,
+      playUrl
+    });
+  }
+
+  throw new Error("Bilibili did not return a downloadable direct or DASH stream.");
+}
+
+function prepareDurlSegments({ bvid, cid, quality, title, playUrl, segments }) {
   const extension = extensionFor(playUrl.format);
   const baseName = safeFilename(`${title}_${quality}`);
   const preparedSegments = [];
@@ -273,7 +339,71 @@ async function prepareDirectDownload(payload) {
   return {
     count: preparedSegments.length,
     segments: preparedSegments,
-    format: playUrl.format
+    format: playUrl.format,
+    mode: "durl"
+  };
+}
+
+function prepareDashSegments({ bvid, cid, quality, title, playUrl }) {
+  const videoStream = selectDashVideo(playUrl, quality);
+  const audioStream = selectDashAudio(playUrl);
+  if (!audioStream) {
+    throw new Error("DASH response did not include an audio stream.");
+  }
+
+  const baseName = safeFilename(`${title}_${videoStream.id || quality}`);
+  const streams = [
+    {
+      role: "video",
+      label: "\u89c6\u9891",
+      stream: videoStream,
+      filename: `BiliDownload/${baseName}_video.m4s`
+    },
+    {
+      role: "audio",
+      label: "\u97f3\u9891",
+      stream: audioStream,
+      filename: `BiliDownload/${baseName}_audio.m4s`
+    }
+  ];
+
+  const preparedSegments = streams.map((item, index) => {
+    const candidates = buildDashCandidates(item.stream);
+    if (!candidates.length) {
+      throw new Error(`DASH ${item.role} stream did not include a media URL.`);
+    }
+
+    return {
+      url: candidates[0].url,
+      filename: item.filename,
+      size: Number(item.stream.size) || 0,
+      candidates,
+      context: {
+        bvid,
+        cid,
+        quality: videoStream.id || quality,
+        title,
+        segmentIndex: index + 1,
+        segmentCount: streams.length,
+        role: item.role,
+        roleLabel: item.label,
+        format: "dash",
+        codecs: item.stream.codecs || "",
+        mimeType: item.stream.mimeType || "",
+        downloadMethod: "page-blob"
+      }
+    };
+  });
+
+  return {
+    count: preparedSegments.length,
+    segments: preparedSegments,
+    format: "dash",
+    mode: "dash",
+    dash: {
+      video: pickDashStream(videoStream),
+      audio: pickDashStream(audioStream)
+    }
   };
 }
 
@@ -300,6 +430,28 @@ function buildSegmentCandidates(segment) {
     }));
 }
 
+function buildDashCandidates(stream) {
+  const urls = [
+    stream?.url,
+    ...(Array.isArray(stream?.backupUrls) ? stream.backupUrls : [])
+  ];
+  const seen = new Set();
+  return urls
+    .filter((url) => typeof url === "string" && url)
+    .filter((url) => {
+      if (seen.has(url)) {
+        return false;
+      }
+      seen.add(url);
+      return true;
+    })
+    .map((url, index) => ({
+      url,
+      kind: index === 0 ? "primary" : "backup",
+      size: Number(stream?.size) || 0
+    }));
+}
+
 function readCandidates(segment) {
   const candidates = Array.isArray(segment?.candidates)
     ? segment.candidates.filter((candidate) => candidate?.url)
@@ -315,14 +467,14 @@ async function fetchPlayUrl({ bvid, cid, quality }) {
     bvid,
     cid: String(cid),
     qn: String(quality || 127),
-    fnval: "0",
+    fnval: "4048",
     fnver: "0",
     fourk: "0",
     otype: "json"
   });
 
   const payload = await fetchJson(`${API_BASE}/x/player/playurl?${params.toString()}`);
-  return expectData(payload);
+  return normalizePlayUrl(expectData(payload));
 }
 
 async function fetchJson(url) {
@@ -355,11 +507,151 @@ function expectData(payload) {
 function buildQualityOptions(playUrl) {
   const qualities = Array.isArray(playUrl.accept_quality) ? playUrl.accept_quality : [];
   const descriptions = Array.isArray(playUrl.accept_description) ? playUrl.accept_description : [];
+  const dashByQuality = new Map();
+
+  for (const stream of playUrl.dashVideos || []) {
+    const current = dashByQuality.get(stream.id);
+    if (!current || compareDashStreams(stream, current) > 0) {
+      dashByQuality.set(stream.id, stream);
+    }
+  }
 
   return qualities.map((code, index) => ({
     code: Number(code),
-    label: `${code} - ${descriptions[index] || "Unknown"}`
+    label: buildQualityLabel(Number(code), descriptions[index], dashByQuality.get(Number(code)))
   }));
+}
+
+function buildQualityLabel(code, description, stream) {
+  const detail = [];
+  if (stream?.height) {
+    detail.push(`${stream.height}p`);
+  }
+  if (stream?.frameRate) {
+    detail.push(`${stream.frameRate}fps`);
+  }
+  if (stream?.codecs) {
+    detail.push(stream.codecs);
+  }
+
+  const suffix = detail.length ? ` (${detail.join(" ")})` : "";
+  return `${code} - ${description || "Unknown"}${suffix}`;
+}
+
+function normalizePlayUrl(data) {
+  const dash = data.dash || {};
+  return {
+    ...data,
+    durl: Array.isArray(data.durl) ? data.durl : [],
+    accept_quality: Array.isArray(data.accept_quality) ? data.accept_quality.map((item) => Number(item)) : [],
+    accept_description: Array.isArray(data.accept_description) ? data.accept_description : [],
+    dashVideos: (Array.isArray(dash.video) ? dash.video : [])
+      .map(parseDashMedia)
+      .filter((item) => item.url),
+    dashAudios: (Array.isArray(dash.audio) ? dash.audio : [])
+      .map(parseDashMedia)
+      .filter((item) => item.url)
+  };
+}
+
+function parseDashMedia(item) {
+  const id = Number(item?.id);
+  const backupUrls = item?.backup_url || item?.backupUrl || item?.backup_urls || [];
+  return {
+    id: Number.isFinite(id) ? id : 0,
+    url: String(item?.base_url || item?.baseUrl || ""),
+    backupUrls: Array.isArray(backupUrls) ? backupUrls.map((url) => String(url)).filter(Boolean) : [],
+    bandwidth: optionalNumber(item?.bandwidth),
+    codecs: String(item?.codecs || ""),
+    mimeType: String(item?.mime_type || item?.mimeType || ""),
+    width: optionalNumber(item?.width),
+    height: optionalNumber(item?.height),
+    frameRate: String(item?.frame_rate || item?.frameRate || ""),
+    size: optionalNumber(item?.size) || 0
+  };
+}
+
+function selectDashVideo(playUrl, requestedQuality) {
+  let candidates = playUrl.dashVideos.filter((stream) => stream.id === requestedQuality);
+  if (!candidates.length) {
+    const available = uniqueDashQualities(playUrl).map((stream) => stream.id).join(", ");
+    throw new Error(`Quality ${requestedQuality} was not found in DASH streams. Available qualities: ${available}`);
+  }
+
+  return candidates.reduce((best, stream) => (
+    compareDashStreams(stream, best) > 0 ? stream : best
+  ));
+}
+
+function selectDashAudio(playUrl) {
+  const audios = playUrl.dashAudios || [];
+  if (!audios.length) {
+    return null;
+  }
+
+  return audios.reduce((best, stream) => (
+    (stream.bandwidth || 0) > (best.bandwidth || 0) ? stream : best
+  ));
+}
+
+function uniqueDashQualities(playUrl) {
+  const result = [];
+  const seen = new Set();
+  for (const stream of [...(playUrl.dashVideos || [])].sort((left, right) => right.id - left.id)) {
+    if (seen.has(stream.id)) {
+      continue;
+    }
+    seen.add(stream.id);
+    result.push(stream);
+  }
+  return result;
+}
+
+function compareDashStreams(left, right) {
+  const leftScore = dashScore(left);
+  const rightScore = dashScore(right);
+  for (let index = 0; index < leftScore.length; index += 1) {
+    if (leftScore[index] !== rightScore[index]) {
+      return leftScore[index] - rightScore[index];
+    }
+  }
+  return 0;
+}
+
+function dashScore(stream) {
+  const codecScore = String(stream?.codecs || "").startsWith("av01") ? 0 : 1;
+  return [
+    Number(stream?.id) || 0,
+    frameRateNumber(stream?.frameRate),
+    Number(stream?.bandwidth) || 0,
+    codecScore
+  ];
+}
+
+function frameRateNumber(value) {
+  const parsed = Number.parseFloat(String(value || ""));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function optionalNumber(value) {
+  if (value === null || value === undefined || value === "") {
+    return null;
+  }
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function pickDashStream(stream) {
+  return {
+    id: stream.id,
+    bandwidth: stream.bandwidth,
+    codecs: stream.codecs,
+    mimeType: stream.mimeType,
+    width: stream.width,
+    height: stream.height,
+    frameRate: stream.frameRate,
+    size: stream.size
+  };
 }
 
 function selectVideoPage(pages, pageNumber) {

@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Bili Download",
-  "version": "0.2.0",
-  "description": "Download directly available Bilibili video streams from the current page.",
+  "version": "0.3.0",
+  "description": "Download Bilibili direct and DASH streams with the current browser login.",
   "action": {
     "default_popup": "src/popup.html",
     "default_title": "Bili Download"

@@ -7,7 +7,7 @@ const TEXT = {
   noQuality: "\u6ca1\u6709\u53ef\u7528\u6e05\u6670\u5ea6",
   downloading: "\u6b63\u5728\u8bf7\u6c42\u89c6\u9891\u6587\u4ef6...",
   downloadStarted: "\u4e0b\u8f7d\u5df2\u5f00\u59cb",
-  dashOnly: "\u8fd9\u4e2a\u6e05\u6670\u5ea6\u9700\u8981 DASH\uff0c\u4e0b\u4e00\u6b65\u652f\u6301",
+  dashPartsSaved: "DASH \u89c6\u9891\u548c\u97f3\u9891\u5df2\u5206\u522b\u4fdd\u5b58",
   diagnosticCopied: "\u8bca\u65ad\u4fe1\u606f\u5df2\u590d\u5236",
   noDiagnostic: "\u6682\u65e0\u8bca\u65ad\u4fe1\u606f"
 };
@@ -26,6 +26,7 @@ const state = {
     url: ""
   },
   video: null,
+  account: null,
   lastDiagnostic: null,
   progress: {
     active: false,
@@ -44,6 +45,7 @@ const state = {
 };
 
 const statusElement = document.querySelector("#status");
+const accountElement = document.querySelector("#account");
 const bvidInput = document.querySelector("#bvid");
 const titleInput = document.querySelector("#title");
 const qualitySelect = document.querySelector("#quality");
@@ -100,6 +102,7 @@ async function initialize() {
     }
 
     state.video = response.payload;
+    state.account = response.payload.account || null;
     state.page.bvid = state.video.bvid;
     state.page.title = state.video.title;
     render();
@@ -140,8 +143,29 @@ async function readPage(tab) {
 function render() {
   bvidInput.value = state.page.bvid;
   titleInput.value = state.page.title;
+  renderAccount();
   renderQualities();
   updateControls();
+}
+
+function renderAccount() {
+  if (!accountElement) {
+    return;
+  }
+
+  const account = state.account;
+  if (!account) {
+    accountElement.textContent = "\u672a\u9a8c\u8bc1";
+    return;
+  }
+
+  if (account.isLogin) {
+    const vip = account.vipLabel ? ` - ${account.vipLabel}` : "";
+    accountElement.textContent = `${account.username || "\u5df2\u767b\u5f55"}${vip}`;
+    return;
+  }
+
+  accountElement.textContent = account.error ? "\u9a8c\u8bc1\u5931\u8d25" : "\u672a\u767b\u5f55";
 }
 
 function renderQualities() {
@@ -190,17 +214,21 @@ async function downloadSelectedQuality() {
 
     if (!prepared?.ok) {
       state.lastDiagnostic = prepared?.diagnostic || state.lastDiagnostic;
-      throw new Error(prepared?.error || TEXT.dashOnly);
+      throw new Error(prepared?.error || "Failed to prepare download.");
     }
 
     const diagnostics = [];
     for (const [index, segment] of prepared.payload.segments.entries()) {
-      setStatus(`${TEXT.downloading} ${index + 1}/${prepared.payload.count}`);
+      const role = segment.context?.roleLabel || segment.context?.role || "";
+      const suffix = role ? ` ${index + 1}/${prepared.payload.count} ${role}` : ` ${index + 1}/${prepared.payload.count}`;
+      setStatus(`${TEXT.downloading}${suffix}`);
       const diagnostic = await downloadSegment(segment);
       diagnostics.push(diagnostic);
       state.lastDiagnostic = diagnostic;
     }
-    setStatus(`${TEXT.downloadStarted}: ${prepared.payload.count}`);
+    setStatus(prepared.payload.mode === "dash"
+      ? `${TEXT.dashPartsSaved}: ${prepared.payload.count}`
+      : `${TEXT.downloadStarted}: ${prepared.payload.count}`);
     await saveDiagnostic(state.lastDiagnostic);
   } catch (error) {
     if (error.diagnostic) {

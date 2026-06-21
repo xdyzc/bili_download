@@ -51,6 +51,7 @@ test("popup contains MVP controls", async () => {
 
   for (const id of [
     "status",
+    "account",
     "bvid",
     "copy",
     "title",
@@ -251,6 +252,21 @@ test("background loads qualities and starts direct browser downloads", async () 
           }
         });
       }
+      if (String(url).includes("/x/web-interface/nav")) {
+        return jsonResponse({
+          code: 0,
+          data: {
+            isLogin: true,
+            uname: "cookie-user",
+            mid: 11701066,
+            vipInfo: {
+              label: {
+                text: "年度大会员"
+              }
+            }
+          }
+        });
+      }
       if (String(url).includes("/x/player/playurl")) {
         return jsonResponse({
           code: 0,
@@ -294,6 +310,9 @@ test("background loads qualities and starts direct browser downloads", async () 
   });
   assert.equal(video.bvid, "BV1KGj36QEG3");
   assert.equal(video.page.cid, 123);
+  assert.equal(video.account.isLogin, true);
+  assert.equal(video.account.username, "cookie-user");
+  assert.equal(video.account.vipLabel, "年度大会员");
   assert.deepEqual(video.qualities.map((item) => item.label), ["80 - 1080P", "64 - 720P"]);
 
   const result = await sandbox.startDirectDownload({
@@ -315,7 +334,8 @@ test("background loads qualities and starts direct browser downloads", async () 
   assert.deepEqual(toPlain(result.diagnostics[0].dnr.checks[0].matchedRules), [
     { ruleId: 3, rulesetId: "bili_media_headers" }
   ]);
-  assert.ok(fetchUrls.some((url) => url.includes("fnval=0")));
+  assert.ok(fetchUrls.some((url) => url.includes("/x/web-interface/nav")));
+  assert.ok(fetchUrls.some((url) => url.includes("fnval=4048")));
 
   const diagnosticResponse = await sendRuntimeMessage(messageListener, {
     type: "BILI_DOWNLOAD_GET_DIAGNOSTIC"
@@ -334,6 +354,7 @@ test("background loads qualities and starts direct browser downloads", async () 
   });
   assert.equal(preparedResponse.ok, true);
   assert.equal(preparedResponse.payload.count, 1);
+  assert.equal(preparedResponse.payload.mode, "durl");
   assert.equal(preparedResponse.payload.segments[0].context.downloadMethod, "page-blob");
   assert.deepEqual(
     toPlain(preparedResponse.payload.segments[0].candidates),
@@ -369,6 +390,193 @@ test("background loads qualities and starts direct browser downloads", async () 
       tabId: 0
     }
   }]);
+});
+
+
+test("background reads browser cookie account and prepares DASH streams", async () => {
+  const code = await readFile("extension/src/background.js", "utf8");
+  const fetchUrls = [];
+  let messageListener = null;
+
+  const sandbox = {
+    Array,
+    Date,
+    Error,
+    Number,
+    Promise,
+    String,
+    URL,
+    URLSearchParams,
+    clearTimeout,
+    setTimeout,
+    chrome: {
+      runtime: {
+        lastError: null,
+        onMessage: {
+          addListener(listener) {
+            messageListener = listener;
+          }
+        },
+        onConnect: {
+          addListener() {}
+        }
+      },
+      declarativeNetRequest: {
+        onRuleMatchedDebug: {
+          addListener() {}
+        }
+      },
+      storage: {
+        local: {
+          async get() {
+            return {};
+          },
+          async set() {}
+        }
+      }
+    },
+    fetch: async (url) => {
+      fetchUrls.push(String(url));
+      if (String(url).includes("/x/web-interface/nav")) {
+        return jsonResponse({
+          code: 0,
+          data: {
+            isLogin: true,
+            uname: "dash-user",
+            mid: 42,
+            vipInfo: {
+              label: {
+                text: "大会员"
+              }
+            }
+          }
+        });
+      }
+      if (String(url).includes("/x/web-interface/view")) {
+        return jsonResponse({
+          code: 0,
+          data: {
+            aid: 100,
+            bvid: "BV1KGj36QEG3",
+            title: "Dash Video",
+            owner: { name: "tester" },
+            pages: [{ page: 1, cid: 456, part: "P1" }]
+          }
+        });
+      }
+      if (String(url).includes("/x/player/playurl")) {
+        return jsonResponse({
+          code: 0,
+          data: {
+            quality: 116,
+            format: "flv",
+            accept_quality: [116, 80, 64],
+            accept_description: ["1080P60", "1080P", "720P"],
+            durl: [],
+            dash: {
+              video: [
+                {
+                  id: 116,
+                  base_url: "https://video-primary.bilivideo.com/116.m4s",
+                  backup_url: ["https://video-backup.bilivideo.com/116.m4s"],
+                  bandwidth: 2600000,
+                  codecs: "avc1.640032",
+                  mime_type: "video/mp4",
+                  width: 1920,
+                  height: 1080,
+                  frame_rate: "60.000",
+                  size: 20 * 1024 * 1024
+                },
+                {
+                  id: 80,
+                  base_url: "https://video-primary.bilivideo.com/80.m4s",
+                  bandwidth: 1500000,
+                  codecs: "avc1.640028",
+                  mime_type: "video/mp4",
+                  width: 1920,
+                  height: 1080,
+                  frame_rate: "30.000",
+                  size: 12 * 1024 * 1024
+                }
+              ],
+              audio: [
+                {
+                  id: 30216,
+                  baseUrl: "https://audio-primary.bilivideo.com/audio-low.m4s",
+                  bandwidth: 64000,
+                  codecs: "mp4a.40.2",
+                  mimeType: "audio/mp4",
+                  size: 1024 * 1024
+                },
+                {
+                  id: 30280,
+                  baseUrl: "https://audio-primary.bilivideo.com/audio-high.m4s",
+                  backupUrl: ["https://audio-backup.bilivideo.com/audio-high.m4s"],
+                  bandwidth: 192000,
+                  codecs: "mp4a.40.2",
+                  mimeType: "audio/mp4",
+                  size: 2 * 1024 * 1024
+                }
+              ]
+            }
+          }
+        });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    }
+  };
+
+  vm.createContext(sandbox);
+  vm.runInContext(code, sandbox);
+
+  const accountResponse = await sendRuntimeMessage(messageListener, {
+    type: "BILI_DOWNLOAD_GET_ACCOUNT"
+  });
+  assert.equal(accountResponse.ok, true);
+  assert.equal(accountResponse.payload.username, "dash-user");
+  assert.equal(accountResponse.payload.vipLabel, "大会员");
+
+  const video = await sandbox.loadVideo({
+    bvid: "BV1KGj36QEG3",
+    title: "Dash Video",
+    url: "https://www.bilibili.com/video/BV1KGj36QEG3/"
+  });
+  assert.equal(video.dashAvailable, true);
+  assert.equal(video.directAvailable, false);
+  assert.deepEqual(video.qualities.map((item) => item.label), [
+    "116 - 1080P60 (1080p 60.000fps avc1.640032)",
+    "80 - 1080P (1080p 30.000fps avc1.640028)",
+    "64 - 720P"
+  ]);
+
+  const preparedResponse = await sendRuntimeMessage(messageListener, {
+    type: "BILI_DOWNLOAD_PREPARE_DIRECT",
+    payload: {
+      bvid: "BV1KGj36QEG3",
+      cid: 456,
+      quality: 116,
+      title: "Dash Video"
+    }
+  });
+
+  assert.equal(preparedResponse.ok, true);
+  assert.equal(preparedResponse.payload.mode, "dash");
+  assert.equal(preparedResponse.payload.count, 2);
+  assert.equal(preparedResponse.payload.segments[0].filename, "BiliDownload/Dash Video_116_video.m4s");
+  assert.equal(preparedResponse.payload.segments[1].filename, "BiliDownload/Dash Video_116_audio.m4s");
+  assert.equal(preparedResponse.payload.segments[0].context.role, "video");
+  assert.equal(preparedResponse.payload.segments[1].context.role, "audio");
+  assert.equal(preparedResponse.payload.segments[0].size, 20 * 1024 * 1024);
+  assert.equal(preparedResponse.payload.segments[1].size, 2 * 1024 * 1024);
+  assert.deepEqual(
+    toPlain(preparedResponse.payload.segments[1].candidates),
+    [
+      { url: "https://audio-primary.bilivideo.com/audio-high.m4s", kind: "primary", size: 2 * 1024 * 1024 },
+      { url: "https://audio-backup.bilivideo.com/audio-high.m4s", kind: "backup", size: 2 * 1024 * 1024 }
+    ]
+  );
+  assert.ok(fetchUrls.every((url) => !url.includes("fnval=0")));
+  assert.ok(fetchUrls.some((url) => url.includes("fnval=4048")));
 });
 
 

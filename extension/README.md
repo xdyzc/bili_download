@@ -2,18 +2,20 @@
 
 This folder contains the pure browser-extension prototype for Bili Download.
 
-## Current MVP
+## Current Version
 
 - Manifest V3 Chrome/Edge extension.
 - Reads the current Bilibili video page and extracts the BV id.
-- Fetches video metadata and available qualities from Bilibili web APIs.
-- Downloads directly available non-DASH streams from the Bilibili page context, then saves them as browser downloads.
+- Uses the browser's current Bilibili login cookie and shows the detected account in the popup.
+- Fetches video metadata, all cookie-accessible qualities, and DASH stream metadata from Bilibili web APIs.
+- Downloads directly available non-DASH streams as a single browser download.
+- Downloads DASH qualities as separate video and audio `.m4s` files.
 - Falls back to the browser downloads API and records diagnostics if page-context downloading fails.
-- Uses the browser's current Bilibili login state; no local `bili.json` import is needed.
+- No local `bili.json` import is needed for the extension.
 
 ## Current Limits
 
-- DASH video/audio separation is not handled yet.
+- DASH video/audio muxing is not handled yet, so high-quality DASH downloads are saved as two files.
 - Danmaku download and burning are not handled yet.
 - The extension only downloads content that the current browser session can access.
 - Page-context downloads currently buffer the whole file before saving, so large-file streaming is still a future step.
@@ -38,4 +40,4 @@ Run the extension smoke test from the project root:
 
 ## Next Milestone
 
-Support DASH by downloading video and audio streams first. After that, evaluate browser-side MP4 muxing.
+Evaluate browser-side MP4 muxing for DASH video/audio files.

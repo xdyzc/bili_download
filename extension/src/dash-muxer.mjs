@@ -2,6 +2,7 @@ import * as MP4Box from "../vendor/mp4box/mp4box.all.mjs";
 import { ArrayBufferTarget, Muxer } from "../vendor/mp4-muxer/mp4-muxer.mjs";
 
 const MICROSECONDS_PER_SECOND = 1_000_000;
+const FRAME_RATE_INTEGER_EPSILON = 0.01;
 
 export async function muxDashToMp4({ videoBlob, audioBlob, outputName = "bili_video.mp4" }) {
   const [videoTrack, audioTrack] = await Promise.all([
@@ -215,7 +216,21 @@ function frameRateFromTrack(track) {
   }
 
   const averageDuration = durations.reduce((sum, value) => sum + value, 0) / durations.length;
-  return track.samples[0].timescale / averageDuration;
+  return normalizeVideoFrameRate(track.samples[0].timescale / averageDuration);
+}
+
+export function normalizeVideoFrameRate(value) {
+  const frameRate = Number(value);
+  if (!Number.isFinite(frameRate) || frameRate <= 0) {
+    return undefined;
+  }
+
+  const rounded = Math.round(frameRate);
+  if (Math.abs(frameRate - rounded) <= FRAME_RATE_INTEGER_EPSILON) {
+    return rounded;
+  }
+
+  return undefined;
 }
 
 function sampleBytes(sample) {

@@ -93,6 +93,16 @@ test("DASH muxer combines video and audio into a parseable MP4", async () => {
 });
 
 
+test("DASH muxer normalizes near-integer video frame rates", async () => {
+  const { normalizeVideoFrameRate } = await import("../src/dash-muxer.mjs");
+
+  assert.equal(normalizeVideoFrameRate(59.99999518984133), 60);
+  assert.equal(normalizeVideoFrameRate(30.0000004), 30);
+  assert.equal(normalizeVideoFrameRate(59.94), undefined);
+  assert.equal(normalizeVideoFrameRate(0), undefined);
+});
+
+
 test("content script forwards page progress events", async () => {
   const code = await readFile("extension/src/content.js", "utf8");
   const runtimeMessages = [];

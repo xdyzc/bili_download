@@ -101,6 +101,14 @@ select {
   cursor: pointer;
 }
 
+.quality-size {
+  min-height: 18px;
+  margin: -2px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
 .field-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 70px;

@@ -70,6 +70,7 @@ const accountElement = document.querySelector("#account");
 const bvidInput = document.querySelector("#bvid");
 const titleInput = document.querySelector("#title");
 const qualitySelect = document.querySelector("#quality");
+const qualitySizeElement = document.querySelector("#quality-size");
 const copyButton = document.querySelector("#copy");
 const downloadButton = document.querySelector("#download");
 const downloadAudioButton = document.querySelector("#download-audio");
@@ -98,7 +99,10 @@ pageSelectAllButton?.addEventListener("click", toggleAllPages);
 downloadSelectedPagesButton?.addEventListener("click", downloadSelectedPages);
 downloadSelectedPageAudioButton?.addEventListener("click", downloadSelectedPageAudio);
 diagnosticButton.addEventListener("click", copyDiagnostic);
-qualitySelect.addEventListener?.("change", updateControls);
+qualitySelect.addEventListener?.("change", () => {
+  updateQualitySize();
+  updateControls();
+});
 pauseButton?.addEventListener("click", togglePauseDownload);
 cancelButton?.addEventListener("click", cancelDownload);
 const progressPort = chrome.runtime.connect({ name: PROGRESS_PORT_NAME });
@@ -263,11 +267,15 @@ function renderQualities() {
       qualitySelect.value = firstAvailable.value;
     }
   }
+
+  updateQualitySize();
 }
 
 function displayQualityLabel(quality) {
+  const parts = [quality.label || String(quality.code || "")];
+
   if (quality.available !== false) {
-    return quality.label;
+    return parts.filter(Boolean).join(" · ");
   }
 
   const suffix = quality.reason === "login-required"
@@ -275,7 +283,58 @@ function displayQualityLabel(quality) {
     : quality.reason === "vip-required"
       ? "\u9700\u8981\u5927\u4f1a\u5458"
       : "\u5f53\u524d\u4e0d\u53ef\u7528";
-  return `${quality.label}\uff08${suffix}\uff09`;
+  parts.push(suffix);
+  return parts.filter(Boolean).join(" · ");
+}
+
+function updateQualitySize() {
+  if (!qualitySizeElement) {
+    return;
+  }
+
+  const quality = selectedQualityData();
+  if (!quality) {
+    qualitySizeElement.textContent = "\u9884\u8ba1\u5927\u5c0f\uff1a--";
+    return;
+  }
+
+  if (quality.available === false) {
+    qualitySizeElement.textContent = `\u9884\u8ba1\u5927\u5c0f\uff1a${unavailableQualityText(quality)}`;
+    return;
+  }
+
+  const size = formatQualitySize(quality) || "--";
+  const mode = quality.mode === "dash"
+    ? "\u89c6\u9891+\u97f3\u9891\uff0c\u4e0b\u8f7d\u540e\u5408\u5e76"
+    : quality.mode === "direct"
+      ? "\u5355\u6587\u4ef6"
+      : "";
+  qualitySizeElement.textContent = `\u9884\u8ba1\u5927\u5c0f\uff1a${size}${mode ? `\uff08${mode}\uff09` : ""}`;
+}
+
+function selectedQualityData() {
+  const selectedCode = Number(qualitySelect.value);
+  return (state.video?.qualities || []).find((quality) => Number(quality.code) === selectedCode) || null;
+}
+
+function formatQualitySize(quality) {
+  const size = Number(quality?.estimatedSize) || 0;
+  if (size <= 0) {
+    return "";
+  }
+
+  const prefix = quality?.estimatedSizeApproximate ? "\u7ea6 " : "";
+  return `${prefix}${formatBytes(size)}`;
+}
+
+function unavailableQualityText(quality) {
+  if (quality.reason === "login-required") {
+    return "\u9700 Cookie \u540e\u83b7\u53d6";
+  }
+  if (quality.reason === "vip-required") {
+    return "\u9700\u5927\u4f1a\u5458\u540e\u83b7\u53d6";
+  }
+  return "\u5f53\u524d\u4e0d\u53ef\u7528";
 }
 
 function renderPages() {

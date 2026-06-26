@@ -885,7 +885,8 @@ test("background loads qualities and starts direct browser downloads", async () 
   assert.equal(video.account.isLogin, true);
   assert.equal(video.account.username, "cookie-user");
   assert.equal(video.account.vipLabel, "年度大会员");
-  assert.deepEqual(video.qualities.map((item) => item.label), ["80 - 1080P", "64 - 720P"]);
+  assert.deepEqual(video.qualities.map((item) => item.label), ["1080P", "720P"]);
+  assert.deepEqual(video.qualities.map((item) => item.estimatedSize), [10 * 1024 * 1024, 0]);
 
   const result = await sandbox.startDirectDownload({
     bvid: "BV1KGj36QEG3",
@@ -1225,9 +1226,14 @@ test("background reads browser cookie account and prepares DASH streams", async 
   assert.equal(video.dashAvailable, true);
   assert.equal(video.directAvailable, false);
   assert.deepEqual(video.qualities.map((item) => item.label), [
-    "116 - 1080P60 (1080p 60.000fps avc1.640032)",
-    "80 - 1080P (1080p 30.000fps avc1.640028)",
-    "64 - 720P"
+    "1080P60 · 1920x1080 · 60fps · AVC",
+    "1080P · 1920x1080 · 30fps · AVC",
+    "720P"
+  ]);
+  assert.deepEqual(video.qualities.map((item) => item.estimatedSize), [
+    22 * 1024 * 1024,
+    14 * 1024 * 1024,
+    0
   ]);
 
   const preparedResponse = await sendRuntimeMessage(messageListener, {
@@ -1258,6 +1264,248 @@ test("background reads browser cookie account and prepares DASH streams", async 
   );
   assert.ok(fetchUrls.some((url) => url.includes("fnval=0")));
   assert.ok(fetchUrls.some((url) => url.includes("fnval=4048")));
+});
+
+
+test("background probes missing DASH media sizes from response headers", async () => {
+  const code = await readFile("extension/src/background.js", "utf8");
+  const fetchCalls = [];
+
+  const sandbox = {
+    Array,
+    Date,
+    Error,
+    Number,
+    Promise,
+    String,
+    URL,
+    URLSearchParams,
+    clearTimeout,
+    setTimeout,
+    chrome: {
+      runtime: {
+        lastError: null,
+        onMessage: {
+          addListener() {}
+        },
+        onConnect: {
+          addListener() {}
+        }
+      },
+      declarativeNetRequest: {
+        onRuleMatchedDebug: {
+          addListener() {}
+        }
+      },
+      storage: {
+        local: {
+          async get() {
+            return {};
+          },
+          async set() {}
+        }
+      }
+    },
+    fetch: async (url, options = {}) => {
+      const value = String(url);
+      fetchCalls.push({
+        url: value,
+        method: options.method || "GET",
+        range: options.headers?.Range || options.headers?.range || ""
+      });
+      if (value.includes("/x/web-interface/nav")) {
+        return jsonResponse({
+          code: 0,
+          data: {
+            isLogin: true,
+            uname: "size-user",
+            mid: 42,
+            vipInfo: {}
+          }
+        });
+      }
+      if (value.includes("/x/web-interface/view")) {
+        return jsonResponse({
+          code: 0,
+          data: {
+            aid: 100,
+            bvid: "BV1SIZEPROBE1",
+            title: "Size Probe Video",
+            owner: { name: "tester" },
+            pages: [{ page: 1, cid: 456, part: "P1" }]
+          }
+        });
+      }
+      if (value.includes("/x/player/playurl")) {
+        return jsonResponse({
+          code: 0,
+          data: {
+            quality: 80,
+            format: "dash",
+            timelength: 60000,
+            accept_quality: [80],
+            accept_description: ["1080P"],
+            durl: [],
+            dash: {
+              video: [{
+                id: 80,
+                base_url: "https://video-primary.bilivideo.com/no-size-video.m4s",
+                bandwidth: 1500000,
+                codecs: "avc1.640028",
+                mime_type: "video/mp4",
+                width: 1920,
+                height: 1080,
+                frame_rate: "30.000"
+              }],
+              audio: [{
+                id: 30280,
+                base_url: "https://audio-primary.bilivideo.com/no-size-audio.m4s",
+                bandwidth: 192000,
+                codecs: "mp4a.40.2",
+                mime_type: "audio/mp4"
+              }]
+            }
+          }
+        });
+      }
+      if (value.includes("no-size-video.m4s") && options.method === "HEAD") {
+        return headersOnlyResponse(30 * 1024 * 1024);
+      }
+      if (value.includes("no-size-audio.m4s") && options.method === "HEAD") {
+        return headersOnlyResponse(2 * 1024 * 1024);
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    }
+  };
+
+  vm.createContext(sandbox);
+  vm.runInContext(code, sandbox);
+
+  const video = await sandbox.loadVideo({
+    bvid: "BV1SIZEPROBE1",
+    title: "Size Probe Video",
+    url: "https://www.bilibili.com/video/BV1SIZEPROBE1/"
+  });
+  assert.equal(video.qualities[0].estimatedSize, 32 * 1024 * 1024);
+  assert.equal(video.qualities[0].estimatedSizeSource, "headers");
+  assert.equal(video.qualities[0].estimatedSizeApproximate, false);
+  assert.ok(fetchCalls.some((call) => call.method === "HEAD" && call.url.includes("no-size-video.m4s")));
+  assert.ok(fetchCalls.some((call) => call.method === "HEAD" && call.url.includes("no-size-audio.m4s")));
+});
+
+
+test("background estimates missing DASH media sizes from bandwidth when header probing fails", async () => {
+  const code = await readFile("extension/src/background.js", "utf8");
+  const expectedSize = Math.round(((8_000_000 + 192_000) * 60) / 8);
+
+  const sandbox = {
+    Array,
+    Date,
+    Error,
+    Number,
+    Promise,
+    String,
+    URL,
+    URLSearchParams,
+    clearTimeout,
+    setTimeout,
+    chrome: {
+      runtime: {
+        lastError: null,
+        onMessage: {
+          addListener() {}
+        },
+        onConnect: {
+          addListener() {}
+        }
+      },
+      declarativeNetRequest: {
+        onRuleMatchedDebug: {
+          addListener() {}
+        }
+      },
+      storage: {
+        local: {
+          async get() {
+            return {};
+          },
+          async set() {}
+        }
+      }
+    },
+    fetch: async (url) => {
+      const value = String(url);
+      if (value.includes("/x/web-interface/nav")) {
+        return jsonResponse({
+          code: 0,
+          data: {
+            isLogin: true,
+            uname: "size-user",
+            mid: 42,
+            vipInfo: {}
+          }
+        });
+      }
+      if (value.includes("/x/web-interface/view")) {
+        return jsonResponse({
+          code: 0,
+          data: {
+            aid: 100,
+            bvid: "BV1BANDWIDTH1",
+            title: "Bandwidth Estimate Video",
+            owner: { name: "tester" },
+            pages: [{ page: 1, cid: 456, part: "P1" }]
+          }
+        });
+      }
+      if (value.includes("/x/player/playurl")) {
+        return jsonResponse({
+          code: 0,
+          data: {
+            quality: 120,
+            format: "dash",
+            timelength: 60000,
+            accept_quality: [120],
+            accept_description: ["4K"],
+            durl: [],
+            dash: {
+              video: [{
+                id: 120,
+                base_url: "https://video-primary.bilivideo.com/bandwidth-video.m4s",
+                bandwidth: 8_000_000,
+                codecs: "avc1.640033",
+                mime_type: "video/mp4",
+                width: 3840,
+                height: 2160,
+                frame_rate: "30.000"
+              }],
+              audio: [{
+                id: 30280,
+                base_url: "https://audio-primary.bilivideo.com/bandwidth-audio.m4s",
+                bandwidth: 192_000,
+                codecs: "mp4a.40.2",
+                mime_type: "audio/mp4"
+              }]
+            }
+          }
+        });
+      }
+      throw new Error(`media size probe failed: ${url}`);
+    }
+  };
+
+  vm.createContext(sandbox);
+  vm.runInContext(code, sandbox);
+
+  const video = await sandbox.loadVideo({
+    bvid: "BV1BANDWIDTH1",
+    title: "Bandwidth Estimate Video",
+    url: "https://www.bilibili.com/video/BV1BANDWIDTH1/"
+  });
+  assert.equal(video.qualities[0].label, "4K · 3840x2160 · 30fps · AVC");
+  assert.equal(video.qualities[0].estimatedSize, expectedSize);
+  assert.equal(video.qualities[0].estimatedSizeSource, "bandwidth");
+  assert.equal(video.qualities[0].estimatedSizeApproximate, true);
 });
 
 
@@ -1685,6 +1933,7 @@ test("popup disables login-only quality options", async () => {
   const statusElement = textElement();
   const accountElement = textElement();
   const qualitySelect = selectElement();
+  const qualitySizeElement = textElement();
   const downloadButton = buttonElement();
   let prepareMessages = 0;
 
@@ -1720,6 +1969,7 @@ test("popup disables login-only quality options", async () => {
           "#bvid": textElement(),
           "#title": textElement(),
           "#quality": qualitySelect,
+          "#quality-size": qualitySizeElement,
           "#copy": buttonElement(),
           "#download": downloadButton,
           "#diagnostic": buttonElement(),
@@ -1773,8 +2023,8 @@ test("popup disables login-only quality options", async () => {
                 account: { isLogin: false },
                 currentQuality: 64,
                 qualities: [
-                  { code: 80, label: "80 - 1080P", available: false, reason: "login-required", mode: "" },
-                  { code: 64, label: "64 - 720P", available: true, reason: "", mode: "direct" }
+                  { code: 80, label: "1080P", estimatedSize: 0, available: false, reason: "login-required", mode: "" },
+                  { code: 64, label: "720P", estimatedSize: 10 * 1024 * 1024, available: true, reason: "", mode: "direct" }
                 ]
               }
             };
@@ -1805,7 +2055,9 @@ test("popup disables login-only quality options", async () => {
   assert.match(qualitySelect.children[0].textContent, /Cookie/);
   assert.equal(qualitySelect.children[1].value, "64");
   assert.equal(qualitySelect.children[1].disabled, false);
+  assert.doesNotMatch(qualitySelect.children[1].textContent, /10\.0 MB/);
   assert.equal(qualitySelect.value, "64");
+  assert.match(qualitySizeElement.textContent, /10\.0 MB/);
   assert.equal(downloadButton.disabled, false);
 
   qualitySelect.value = "80";
@@ -4274,6 +4526,21 @@ function jsonResponse(payload) {
   return {
     ok: true,
     json: async () => payload
+  };
+}
+
+
+function headersOnlyResponse(contentLength, status = 200) {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    headers: {
+      get(name) {
+        return String(name).toLowerCase() === "content-length"
+          ? String(contentLength)
+          : "";
+      }
+    }
   };
 }
 

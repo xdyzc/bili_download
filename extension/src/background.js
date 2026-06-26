@@ -3,6 +3,7 @@ const DIAGNOSTIC_STORAGE_KEY = "lastDiagnostic";
 const DNR_TEST_TYPES = ["main_frame", "other", "media", "xmlhttprequest"];
 const PROGRESS_MESSAGE_TYPE = "BILI_DOWNLOAD_PAGE_PROGRESS";
 const PROGRESS_PORT_NAME = "BILI_DOWNLOAD_PROGRESS_PORT";
+const SIZE_PROBE_TIMEOUT_MS = 2500;
 
 let lastDiagnostic = null;
 const progressPorts = new Set();
@@ -763,12 +764,13 @@ async function buildQualityAvailability({ bvid, epId = null, cid, playUrl, accou
   const availability = new Map();
   const requestedCodes = Array.isArray(playUrl.accept_quality) ? playUrl.accept_quality : [];
 
-  for (const stream of playUrl.dashVideos || []) {
-    markQualityAvailable(availability, stream.id, "dash");
-  }
+  const dashQualityCodes = new Set((playUrl.dashVideos || []).map((stream) => stream.id));
+  await Promise.all(Array.from(dashQualityCodes).map((code) => (
+    markQualityAvailable(availability, code, "dash", playUrl)
+  )));
 
   if (hasDirectStreams(playUrl)) {
-    markQualityAvailable(availability, responseQuality(playUrl), "direct");
+    await markQualityAvailable(availability, responseQuality(playUrl), "direct", playUrl);
   }
 
   const missingCodes = requestedCodes
@@ -778,17 +780,17 @@ async function buildQualityAvailability({ bvid, epId = null, cid, playUrl, accou
     try {
       const dashPlayUrl = await fetchMediaPlayUrl({ bvid, epId, cid, quality: code, fnval: 4048, tabId });
       if (hasDashQuality(dashPlayUrl, code)) {
-        markQualityAvailable(availability, code, "dash");
+        await markQualityAvailable(availability, code, "dash", dashPlayUrl);
         return;
       }
       if (hasExactDirectQuality(dashPlayUrl, code)) {
-        markQualityAvailable(availability, code, "direct");
+        await markQualityAvailable(availability, code, "direct", dashPlayUrl);
         return;
       }
 
       const directPlayUrl = await fetchMediaPlayUrl({ bvid, epId, cid, quality: code, fnval: 0, tabId });
       if (hasExactDirectQuality(directPlayUrl, code)) {
-        markQualityAvailable(availability, code, "direct");
+        await markQualityAvailable(availability, code, "direct", directPlayUrl);
       }
     } catch (_error) {
       // The DASH response still gives us the advertised list; legacy direct probing is best effort.
@@ -806,19 +808,29 @@ async function buildQualityAvailability({ bvid, epId = null, cid, playUrl, accou
   return availability;
 }
 
-function markQualityAvailable(availability, code, mode) {
+async function markQualityAvailable(availability, code, mode, playUrl = null) {
   const numericCode = Number(code);
   if (!Number.isFinite(numericCode) || numericCode <= 0) {
     return;
   }
   const current = availability.get(numericCode);
-  if (current?.mode === "dash") {
+  if (current?.mode === "dash" && mode !== "dash") {
     return;
   }
+  if (current?.mode === mode && current.estimatedSize) {
+    return;
+  }
+
+  const stream = mode === "dash" ? findBestDashVideo(playUrl, numericCode) : null;
+  const sizeInfo = await resolveQualitySize(playUrl, numericCode, mode);
   availability.set(numericCode, {
     available: true,
     mode,
-    reason: ""
+    reason: "",
+    estimatedSize: sizeInfo.size || current?.estimatedSize || 0,
+    estimatedSizeSource: sizeInfo.source || current?.estimatedSizeSource || "",
+    estimatedSizeApproximate: sizeInfo.approximate || false,
+    stream: stream || current?.stream || null
   });
 }
 
@@ -909,13 +921,17 @@ function buildQualityOptions(playUrl, availability = new Map()) {
   return qualities.map((code, index) => {
     const numericCode = Number(code);
     const info = availability.get(numericCode) || unavailableQualityInfo(null);
+    const stream = dashByQuality.get(numericCode) || info.stream || null;
     return {
       code: numericCode,
       label: buildQualityLabel(
         numericCode,
         descriptions[index] || supportByQuality.get(numericCode)?.description || supportByQuality.get(numericCode)?.newDescription,
-        dashByQuality.get(numericCode)
+        stream
       ),
+      estimatedSize: Number(info.estimatedSize) || estimateQualitySize(playUrl, numericCode, info.mode) || 0,
+      estimatedSizeSource: info.estimatedSizeSource || "",
+      estimatedSizeApproximate: Boolean(info.estimatedSizeApproximate),
       available: info.available,
       mode: info.mode || "",
       reason: info.reason || ""
@@ -924,19 +940,59 @@ function buildQualityOptions(playUrl, availability = new Map()) {
 }
 
 function buildQualityLabel(code, description, stream) {
-  const detail = [];
-  if (stream?.height) {
-    detail.push(`${stream.height}p`);
-  }
-  if (stream?.frameRate) {
-    detail.push(`${stream.frameRate}fps`);
-  }
-  if (stream?.codecs) {
-    detail.push(stream.codecs);
+  const base = String(description || "").trim() || `QN ${code}`;
+  return [
+    base,
+    compactResolution(stream),
+    compactFrameRate(stream?.frameRate),
+    compactVideoCodec(stream?.codecs)
+  ].filter(Boolean).join(" · ");
+}
+
+function compactResolution(stream) {
+  const width = Number(stream?.width) || 0;
+  const height = Number(stream?.height) || 0;
+  if (width && height) {
+    return `${width}x${height}`;
   }
 
-  const suffix = detail.length ? ` (${detail.join(" ")})` : "";
-  return `${code} - ${description || "Unknown"}${suffix}`;
+  if (height) {
+    return `${height}p`;
+  }
+
+  return "";
+}
+
+function compactFrameRate(value) {
+  const parsed = frameRateNumber(value);
+  if (!parsed) {
+    return "";
+  }
+
+  const rounded = Math.round(parsed);
+  return `${rounded}fps`;
+}
+
+function compactVideoCodec(value) {
+  const codec = String(value || "").toLowerCase();
+  if (!codec) {
+    return "";
+  }
+
+  if (codec.startsWith("avc1")) {
+    return "AVC";
+  }
+  if (codec.startsWith("hev1") || codec.startsWith("hvc1")) {
+    return "HEVC";
+  }
+  if (codec.startsWith("av01")) {
+    return "AV1";
+  }
+  if (codec.startsWith("vp09") || codec.startsWith("vp9")) {
+    return "VP9";
+  }
+
+  return String(value).split(".")[0].toUpperCase();
 }
 
 function normalizePlayUrl(data) {
@@ -951,6 +1007,7 @@ function normalizePlayUrl(data) {
     isPreview: Boolean(Number(data.is_preview)),
     canWatchReason: Number(data.can_watch_reason) || 0,
     status: Number(data.status) || 0,
+    timeLength: optionalNumber(data.timelength ?? data.time_length ?? data.duration) || 0,
     dashVideos: (Array.isArray(dash.video) ? dash.video : [])
       .map(parseDashMedia)
       .filter((item) => item.url),
@@ -1014,10 +1071,19 @@ function parseDashMedia(item) {
 }
 
 function selectDashVideo(playUrl, requestedQuality) {
-  let candidates = playUrl.dashVideos.filter((stream) => stream.id === requestedQuality);
-  if (!candidates.length) {
+  const video = findBestDashVideo(playUrl, requestedQuality);
+  if (!video) {
     const available = uniqueDashQualities(playUrl).map((stream) => stream.id).join(", ");
     throw new Error(`Quality ${requestedQuality} was not found in DASH streams. Available qualities: ${available}`);
+  }
+
+  return video;
+}
+
+function findBestDashVideo(playUrl, requestedQuality) {
+  const candidates = (playUrl?.dashVideos || []).filter((stream) => stream.id === requestedQuality);
+  if (!candidates.length) {
+    return null;
   }
 
   return candidates.reduce((best, stream) => (
@@ -1039,6 +1105,265 @@ function hasExactDirectQuality(playUrl, requestedQuality) {
 
 function responseQuality(playUrl) {
   return Number(playUrl.quality) || 0;
+}
+
+async function resolveQualitySize(playUrl, quality, mode) {
+  const apiSize = estimateQualitySize(playUrl, quality, mode);
+  if (apiSize) {
+    return {
+      size: apiSize,
+      source: "api",
+      approximate: false
+    };
+  }
+
+  const probedSize = await probeQualitySize(playUrl, quality, mode);
+  if (probedSize) {
+    return {
+      size: probedSize,
+      source: "headers",
+      approximate: false
+    };
+  }
+
+  const bandwidthSize = estimateQualitySizeByBandwidth(playUrl, quality, mode);
+  if (bandwidthSize) {
+    return {
+      size: bandwidthSize,
+      source: "bandwidth",
+      approximate: true
+    };
+  }
+
+  return {
+    size: 0,
+    source: "",
+    approximate: false
+  };
+}
+
+function estimateQualitySize(playUrl, quality, mode) {
+  if (!playUrl || !mode) {
+    return 0;
+  }
+
+  if (mode === "dash") {
+    return estimateDashQualitySize(playUrl, quality);
+  }
+
+  if (mode === "direct") {
+    return estimateDirectQualitySize(playUrl);
+  }
+
+  return 0;
+}
+
+function estimateDashQualitySize(playUrl, quality) {
+  const videoStream = findBestDashVideo(playUrl, quality);
+  const audioStream = selectDashAudio(playUrl);
+  return positiveSize(videoStream?.size) + positiveSize(audioStream?.size);
+}
+
+function estimateDirectQualitySize(playUrl) {
+  return buildDirectSegmentPlans(playUrl).reduce((total, segmentPlan) => (
+    total + positiveSize(segmentPlan.source?.size)
+  ), 0);
+}
+
+function positiveSize(value) {
+  const size = Number(value) || 0;
+  return size > 0 ? size : 0;
+}
+
+async function probeQualitySize(playUrl, quality, mode) {
+  if (!playUrl || !mode) {
+    return 0;
+  }
+
+  if (mode === "dash") {
+    return probeDashQualitySize(playUrl, quality);
+  }
+
+  if (mode === "direct") {
+    return probeDirectQualitySize(playUrl);
+  }
+
+  return 0;
+}
+
+async function probeDashQualitySize(playUrl, quality) {
+  const videoStream = findBestDashVideo(playUrl, quality);
+  const audioStream = selectDashAudio(playUrl);
+  const sizes = await Promise.all([
+    probeDashStreamSize(videoStream),
+    probeDashStreamSize(audioStream)
+  ]);
+
+  if (sizes.some((size) => !size)) {
+    return 0;
+  }
+
+  return sizes.reduce((total, size) => total + size, 0);
+}
+
+async function probeDirectQualitySize(playUrl) {
+  const segments = buildDirectSegmentPlans(playUrl);
+  if (!segments.length) {
+    return 0;
+  }
+
+  const sizes = await Promise.all(segments.map((segmentPlan) => (
+    probeMediaSizeFromUrls(segmentPlan.candidates.map((candidate) => candidate.url))
+  )));
+
+  if (sizes.some((size) => !size)) {
+    return 0;
+  }
+
+  return sizes.reduce((total, size) => total + size, 0);
+}
+
+async function probeDashStreamSize(stream) {
+  if (!stream?.url) {
+    return 0;
+  }
+
+  const candidates = buildDashCandidates(stream).map((candidate) => candidate.url);
+  return probeMediaSizeFromUrls(candidates);
+}
+
+async function probeMediaSizeFromUrls(urls) {
+  const seen = new Set();
+  for (const url of urls || []) {
+    if (!url || seen.has(url)) {
+      continue;
+    }
+    seen.add(url);
+
+    const size = await probeMediaUrlSize(url);
+    if (size) {
+      return size;
+    }
+  }
+
+  return 0;
+}
+
+async function probeMediaUrlSize(url) {
+  const headSize = await probeMediaUrlHeadSize(url);
+  if (headSize) {
+    return headSize;
+  }
+
+  return probeMediaUrlRangeSize(url);
+}
+
+async function probeMediaUrlHeadSize(url) {
+  try {
+    const response = await fetchWithTimeout(url, {
+      method: "HEAD",
+      credentials: "include",
+      cache: "no-store",
+      headers: {
+        "Accept": "*/*"
+      }
+    });
+    if (!response?.ok) {
+      return 0;
+    }
+    return contentLengthFromHeaders(response.headers);
+  } catch (_error) {
+    return 0;
+  }
+}
+
+async function probeMediaUrlRangeSize(url) {
+  try {
+    const response = await fetchWithTimeout(url, {
+      method: "GET",
+      credentials: "include",
+      cache: "no-store",
+      headers: {
+        "Accept": "*/*",
+        "Range": "bytes=0-0"
+      }
+    });
+    if (response?.status !== 206) {
+      return 0;
+    }
+
+    return contentRangeTotal(response.headers.get("content-range")) ||
+      contentLengthFromHeaders(response.headers);
+  } catch (_error) {
+    return 0;
+  }
+}
+
+async function fetchWithTimeout(url, options) {
+  const controller = typeof AbortController === "function" ? new AbortController() : null;
+  let timeoutId = null;
+  try {
+    const fetchOptions = controller
+      ? {
+        ...options,
+        signal: controller.signal
+      }
+      : options;
+    const timeout = new Promise((resolve) => {
+      timeoutId = setTimeout(() => {
+        controller?.abort();
+        resolve(null);
+      }, SIZE_PROBE_TIMEOUT_MS);
+    });
+    return await Promise.race([
+      fetch(url, fetchOptions),
+      timeout
+    ]);
+  } catch (_error) {
+    return null;
+  } finally {
+    if (timeoutId !== null) {
+      clearTimeout(timeoutId);
+    }
+  }
+}
+
+function contentLengthFromHeaders(headers) {
+  return positiveSize(headers?.get?.("content-length"));
+}
+
+function contentRangeTotal(value) {
+  const match = String(value || "").match(/\/(\d+)$/);
+  return match ? positiveSize(match[1]) : 0;
+}
+
+function estimateQualitySizeByBandwidth(playUrl, quality, mode) {
+  if (mode !== "dash") {
+    return 0;
+  }
+
+  const durationSeconds = playUrlDurationSeconds(playUrl);
+  if (!durationSeconds) {
+    return 0;
+  }
+
+  const videoStream = findBestDashVideo(playUrl, quality);
+  const audioStream = selectDashAudio(playUrl);
+  const totalBandwidth = positiveSize(videoStream?.bandwidth) + positiveSize(audioStream?.bandwidth);
+  if (!totalBandwidth) {
+    return 0;
+  }
+
+  return Math.round((totalBandwidth * durationSeconds) / 8);
+}
+
+function playUrlDurationSeconds(playUrl) {
+  const value = positiveSize(playUrl?.timeLength);
+  if (!value) {
+    return 0;
+  }
+
+  return value > 10000 ? value / 1000 : value;
 }
 
 function selectDefaultQuality(qualities, responseQualityValue) {

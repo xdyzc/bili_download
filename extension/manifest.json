@@ -17,7 +17,8 @@
       "matches": [
         "https://www.bilibili.com/video/*",
         "https://m.bilibili.com/video/*",
-        "https://www.bilibili.com/bangumi/play/*"
+        "https://www.bilibili.com/bangumi/play/*",
+        "https://live.bilibili.com/*"
       ],
       "js": [
         "src/content.js"
@@ -45,8 +46,10 @@
   },
   "host_permissions": [
     "https://api.bilibili.com/*",
+    "https://api.live.bilibili.com/*",
     "https://www.bilibili.com/*",
     "https://m.bilibili.com/*",
+    "https://live.bilibili.com/*",
     "https://*.bilivideo.com/*",
     "https://*.bilivideo.cn/*",
     "https://*.hdslb.com/*",

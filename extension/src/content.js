@@ -32,6 +32,15 @@ function normalizeProgressPayload(value) {
 }
 
 function readPage() {
+  if (isLivePage(location.href)) {
+    return {
+      type: "live",
+      roomId: extractLiveRoomId(location.href),
+      title: readTitle(),
+      url: location.href
+    };
+  }
+
   return {
     type: isBangumiPage(location.href) ? "bangumi" : "video",
     bvid: extractBvid(location.href),
@@ -67,6 +76,15 @@ function extractEpId(value) {
   return match ? Number(match[1]) : null;
 }
 
+function extractLiveRoomId(value) {
+  const match = String(value || "").match(/:\/\/live\.bilibili\.com\/(?:blanc\/)?(\d+)/);
+  return match ? Number(match[1]) : null;
+}
+
 function isBangumiPage(value) {
   return /:\/\/www\.bilibili\.com\/bangumi\/play\//.test(String(value || ""));
+}
+
+function isLivePage(value) {
+  return /:\/\/live\.bilibili\.com\/(?:blanc\/)?\d+/.test(String(value || ""));
 }

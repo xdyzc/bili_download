@@ -5,6 +5,11 @@ const TEXT = {
   collectionReady: "\u68c0\u6d4b\u5230\u591a\u4e2a\u5206 P\uff0c\u53ef\u9009\u62e9\u8981\u4e0b\u8f7d\u7684\u5206 P",
   copied: "\u89c6\u9891 ID \u5df2\u590d\u5236",
   noVideo: "\u5f53\u524d\u9875\u9762\u4e0d\u662f\u652f\u6301\u7684 Bilibili \u89c6\u9891\u6216\u756a\u5267\u9875",
+  liveReady: "\u68c0\u6d4b\u5230\u76f4\u64ad\u95f4\uff0c\u53ef\u5f00\u59cb\u5f55\u5236",
+  liveOffline: "\u5f53\u524d\u76f4\u64ad\u95f4\u672a\u5f00\u64ad",
+  liveRecording: "\u6b63\u5728\u5f55\u5236\u76f4\u64ad...",
+  liveStopping: "\u6b63\u5728\u7ed3\u675f\u5f55\u5236...",
+  liveRecorded: "\u76f4\u64ad\u5f55\u5236\u5df2\u4fdd\u5b58",
   noQuality: "\u6ca1\u6709\u53ef\u7528\u6e05\u6670\u5ea6",
   qualityUnavailable: "\u8be5\u6e05\u6670\u5ea6\u9700\u8981 Cookie \u767b\u5f55\u540e\u624d\u80fd\u4e0b\u8f7d",
   noSelectedPages: "\u8bf7\u5148\u9009\u62e9\u8981\u4e0b\u8f7d\u7684\u5206 P",
@@ -40,10 +45,12 @@ const state = {
     bvid: "",
     seasonId: null,
     epId: null,
+    roomId: null,
     title: "",
     url: ""
   },
   video: null,
+  live: null,
   account: null,
   lastDiagnostic: null,
   progress: {
@@ -74,6 +81,7 @@ const qualitySizeElement = document.querySelector("#quality-size");
 const copyButton = document.querySelector("#copy");
 const downloadButton = document.querySelector("#download");
 const downloadAudioButton = document.querySelector("#download-audio");
+const liveRecordButton = document.querySelector("#live-record");
 const pagePickerToggle = document.querySelector("#page-picker-toggle");
 const pagePicker = document.querySelector("#page-picker");
 const pageList = document.querySelector("#page-list");
@@ -91,14 +99,15 @@ const pauseButton = document.querySelector("#pause");
 const cancelButton = document.querySelector("#cancel");
 
 document.addEventListener("DOMContentLoaded", initialize);
-copyButton.addEventListener("click", copyBvid);
-downloadButton.addEventListener("click", downloadSelectedQuality);
+copyButton?.addEventListener("click", copyBvid);
+downloadButton?.addEventListener("click", downloadSelectedQuality);
 downloadAudioButton?.addEventListener("click", downloadCurrentAudio);
+liveRecordButton?.addEventListener("click", toggleLiveRecording);
 pagePickerToggle?.addEventListener("click", togglePagePicker);
 pageSelectAllButton?.addEventListener("click", toggleAllPages);
 downloadSelectedPagesButton?.addEventListener("click", downloadSelectedPages);
 downloadSelectedPageAudioButton?.addEventListener("click", downloadSelectedPageAudio);
-diagnosticButton.addEventListener("click", copyDiagnostic);
+diagnosticButton?.addEventListener("click", copyDiagnostic);
 qualitySelect.addEventListener?.("change", () => {
   updateQualitySize();
   updateControls();
@@ -152,6 +161,11 @@ async function refreshFromActiveTab(options = {}) {
       return;
     }
 
+    if (state.page.type === "live") {
+      await loadLiveFromPage();
+      return;
+    }
+
     setStatus(TEXT.loading);
     const response = await chrome.runtime.sendMessage({
       type: "BILI_DOWNLOAD_LOAD_VIDEO",
@@ -163,6 +177,7 @@ async function refreshFromActiveTab(options = {}) {
     }
 
     state.video = response.payload;
+    state.live = null;
     state.account = response.payload.account || null;
     state.page.type = state.video.source || state.page.type || "video";
     state.page.bvid = state.video.bvid;
@@ -188,6 +203,7 @@ async function readPage(tab) {
     bvid: extractBvid(tab?.url || ""),
     seasonId: extractSeasonId(tab?.url || ""),
     epId: extractEpId(tab?.url || ""),
+    roomId: extractLiveRoomId(tab?.url || ""),
     title: tab?.title || "",
     url: tab?.url || "",
     tabId: tab?.id || null
@@ -206,6 +222,7 @@ async function readPage(tab) {
       bvid: page?.bvid || fromUrl.bvid,
       seasonId: page?.seasonId || fromUrl.seasonId,
       epId: page?.epId || fromUrl.epId,
+      roomId: page?.roomId || fromUrl.roomId,
       title: page?.title || fromUrl.title,
       url: page?.url || fromUrl.url,
       tabId: fromUrl.tabId
@@ -221,7 +238,25 @@ function render() {
   renderAccount();
   renderQualities();
   renderPages();
+  renderMode();
   updateControls();
+}
+
+function renderMode() {
+  const isLive = state.page.type === "live";
+  setElementHidden(downloadButton, isLive);
+  setElementHidden(downloadAudioButton, isLive);
+  setElementHidden(liveRecordButton, !isLive);
+  setElementHidden(qualitySelect, false);
+  setElementHidden(qualitySizeElement, isLive);
+  const qualityLabel = document.querySelector?.("label[for=\"quality\"]");
+  setElementHidden(qualityLabel, false);
+}
+
+function setElementHidden(element, hidden) {
+  if (element) {
+    element.hidden = Boolean(hidden);
+  }
 }
 
 function renderAccount() {
@@ -246,8 +281,9 @@ function renderAccount() {
 
 function renderQualities() {
   qualitySelect.replaceChildren();
-  const qualities = state.video?.qualities || [];
-  const selectedCode = Number(qualitySelect.value) || state.video?.currentQuality;
+  const qualitySource = currentQualitySource();
+  const qualities = qualitySource?.qualities || [];
+  const selectedCode = Number(qualitySelect.value) || qualitySource?.currentQuality;
 
   for (const quality of qualities) {
     const option = document.createElement("option");
@@ -292,6 +328,11 @@ function updateQualitySize() {
     return;
   }
 
+  if (state.page.type === "live") {
+    qualitySizeElement.textContent = "预计大小：直播录制无固定大小";
+    return;
+  }
+
   const quality = selectedQualityData();
   if (!quality) {
     qualitySizeElement.textContent = "\u9884\u8ba1\u5927\u5c0f\uff1a--";
@@ -314,7 +355,11 @@ function updateQualitySize() {
 
 function selectedQualityData() {
   const selectedCode = Number(qualitySelect.value);
-  return (state.video?.qualities || []).find((quality) => Number(quality.code) === selectedCode) || null;
+  return (currentQualitySource()?.qualities || []).find((quality) => Number(quality.code) === selectedCode) || null;
+}
+
+function currentQualitySource() {
+  return state.page.type === "live" ? state.live : state.video;
 }
 
 function formatQualitySize(quality) {
@@ -483,6 +528,30 @@ async function downloadSelectedQuality() {
   }
 }
 
+async function loadLiveFromPage() {
+  setStatus(TEXT.loading);
+  const response = await chrome.runtime.sendMessage({
+    type: "BILI_DOWNLOAD_LOAD_LIVE",
+    payload: state.page
+  });
+
+  if (!response?.ok) {
+    throw new Error(response?.error || "Failed to load live room.");
+  }
+
+  state.video = null;
+  state.live = response.payload;
+  state.account = response.payload.account || null;
+  state.page.type = "live";
+  state.page.roomId = state.live.roomId;
+  state.page.title = state.live.title;
+  state.selectedPageCids = null;
+  render();
+  setStatus(state.live.liveStatus === 1
+    ? (qualityDataHasAvailable(state.live) ? TEXT.liveReady : TEXT.noQuality)
+    : TEXT.liveOffline);
+}
+
 async function downloadCurrentAudio() {
   if (!state.video) {
     return;
@@ -615,6 +684,102 @@ async function downloadSelectedPageAudio() {
     }
     setBusy(false);
   }
+}
+
+async function toggleLiveRecording() {
+  if (state.downloadControl?.liveRecording) {
+    stopLiveRecording();
+    return;
+  }
+
+  await startLiveRecording();
+}
+
+async function startLiveRecording() {
+  if (!state.live?.roomId) {
+    return;
+  }
+  if (state.live.liveStatus !== 1) {
+    setStatus(TEXT.liveOffline);
+    return;
+  }
+  if (!selectedQualityAvailable()) {
+    setStatus(TEXT.qualityUnavailable);
+    updateControls();
+    return;
+  }
+
+  const control = createDownloadControl();
+  control.liveRecording = true;
+  state.downloadControl = control;
+  resetProgress();
+  setStatus(TEXT.liveRecording);
+  updateControls();
+
+  try {
+    const prepared = await prepareLiveRecording();
+    const diagnostic = await recordLiveSegment(prepared.segments[0], control);
+    state.lastDiagnostic = diagnostic;
+    await saveDiagnostic(diagnostic);
+    setStatus(`${TEXT.liveRecorded}: ${filenameForPageDownload(prepared.segments[0].filename)}`);
+  } catch (error) {
+    if (isDownloadCanceledError(error)) {
+      const diagnostic = error.diagnostic || state.lastDiagnostic;
+      if (diagnostic) {
+        state.lastDiagnostic = diagnostic;
+        await saveDiagnostic(diagnostic);
+      }
+      setStatus(`${TEXT.liveRecorded}: ${diagnostic?.saved?.filename || ""}`.trim());
+      return;
+    }
+    if (error.diagnostic) {
+      state.lastDiagnostic = error.diagnostic;
+      await saveDiagnostic(error.diagnostic);
+    }
+    setStatus(error.message);
+  } finally {
+    if (state.downloadControl === control) {
+      state.downloadControl = null;
+    }
+    completeProgress();
+    updateControls();
+  }
+}
+
+function stopLiveRecording() {
+  const control = state.downloadControl;
+  if (!control?.liveRecording || control.canceled) {
+    return;
+  }
+
+  setStatus(TEXT.liveStopping);
+  control.canceled = true;
+  control.paused = false;
+  for (const abortController of control.abortControllers) {
+    abortController.abort();
+  }
+  resumeDownloadWaiters(control);
+  renderDownloadControls();
+  updateControls();
+}
+
+async function prepareLiveRecording() {
+  const prepared = await chrome.runtime.sendMessage({
+    type: "BILI_DOWNLOAD_PREPARE_LIVE_RECORDING",
+    payload: {
+      roomId: state.live.roomId,
+      title: state.live.title,
+      url: state.page.url,
+      quality: Number(qualitySelect.value)
+    }
+  });
+
+  if (!prepared?.ok) {
+    state.lastDiagnostic = prepared?.diagnostic || state.lastDiagnostic;
+    throw new Error(prepared?.error || "Failed to prepare live recording.");
+  }
+
+  return prepared.payload;
 }
 
 async function preparePageDownload(page, quality, title) {
@@ -758,6 +923,184 @@ async function downloadSegment(segment, options = {}) {
       throw error;
     }
     return downloadViaExtensionBlob(segment, diagnostic, error, downloadOptions);
+  }
+}
+
+async function recordLiveSegment(segment, control) {
+  const diagnostic = createPageDiagnostic(segment);
+  const candidates = readCandidates(segment);
+  let lastError = null;
+
+  for (const [index, candidate] of candidates.entries()) {
+    diagnostic.phase = "recording-live";
+    diagnostic.context = {
+      ...segment.context,
+      candidateIndex: index + 1,
+      candidateCount: candidates.length,
+      candidateKind: candidate.kind
+    };
+    diagnostic.request = {
+      media: summarizeUrl(candidate.url),
+      filename: segment.filename
+    };
+
+    try {
+      const result = await fetchLiveRecording(candidate.url, filenameForPageDownload(segment.filename), control, {
+        segmentIndex: 1,
+        segmentCount: 1,
+        candidateIndex: index + 1,
+        candidateCount: candidates.length,
+        totalBytes: 0
+      });
+      diagnostic.candidateAttempts.push({
+        at: new Date().toISOString(),
+        candidateIndex: index + 1,
+        candidateCount: candidates.length,
+        candidateKind: candidate.kind,
+        request: {
+          media: summarizeUrl(candidate.url)
+        },
+        fetch: pickFetchResult(result)
+      });
+      diagnostic.fetch = pickFetchResult(result);
+      diagnostic.phase = "complete";
+      diagnostic.error = null;
+      diagnostic.saved = {
+        filename: result.filename,
+        mime: result.mime,
+        size: result.size,
+        method: "live-recording",
+        mode: "live-flv"
+      };
+      completeProgress(result);
+      await saveDiagnostic(diagnostic);
+      return diagnostic;
+    } catch (error) {
+      if (isDownloadCanceledError(error)) {
+        diagnostic.phase = "complete";
+        diagnostic.error = null;
+        const result = error.result || {};
+        diagnostic.saved = {
+          filename: result.filename || filenameForPageDownload(segment.filename),
+          mime: result.mime || "video/x-flv",
+          size: result.size || 0,
+          method: "live-recording",
+          mode: "live-flv"
+        };
+        completeProgress(result);
+        await saveDiagnostic(diagnostic);
+        error.diagnostic = diagnostic;
+        throw error;
+      }
+
+      diagnostic.phase = "live-recording-error";
+      diagnostic.error = error.message;
+      diagnostic.candidateAttempts.push({
+        at: new Date().toISOString(),
+        candidateIndex: index + 1,
+        candidateCount: candidates.length,
+        candidateKind: candidate.kind,
+        request: {
+          media: summarizeUrl(candidate.url)
+        },
+        error: error.message
+      });
+      await saveDiagnostic(diagnostic);
+      lastError = diagnosticError(error.message, diagnostic);
+    }
+  }
+
+  throw lastError || diagnosticError("All live stream candidates failed.", diagnostic);
+}
+
+async function fetchLiveRecording(url, filename, control, progressContext) {
+  const abortController = new AbortController();
+  control.abortControllers.add(abortController);
+  const chunks = [];
+  let receivedBytes = 0;
+  let response = null;
+  let stoppedByUser = false;
+
+  try {
+    response = await fetch(url, {
+      credentials: "include",
+      cache: "no-store",
+      headers: {
+        "Accept": "*/*"
+      },
+      signal: abortController.signal
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status || "unknown"}`);
+    }
+
+    const reader = response.body?.getReader();
+    if (!reader) {
+      throw new Error("Live stream response did not include a readable body.");
+    }
+
+    while (true) {
+      await waitForSpecificControl(control);
+      let packet = null;
+      try {
+        packet = await reader.read();
+      } catch (error) {
+        if (control.canceled || error?.name === "AbortError") {
+          stoppedByUser = true;
+          break;
+        }
+        throw error;
+      }
+
+      if (packet.done) {
+        break;
+      }
+
+      chunks.push(packet.value);
+      receivedBytes += packet.value.byteLength;
+      updateProgress({
+        ...progressContext,
+        receivedBytes,
+        totalBytes: 0,
+        done: false
+      });
+    }
+
+    const blob = new Blob(chunks, {
+      type: response.headers.get("content-type") || "video/x-flv"
+    });
+    if (blob.size <= 0) {
+      throw new Error("直播录制为空，未保存文件。");
+    }
+
+    saveBlob(blob, filename);
+    const durationMs = state.progress.startedAt ? Date.now() - state.progress.startedAt : state.progress.durationMs;
+    state.progress.durationMs = durationMs;
+    const result = {
+      ok: true,
+      responseOk: true,
+      status: response.status,
+      statusText: response.statusText,
+      mime: blob.type,
+      size: blob.size,
+      totalBytes: blob.size,
+      receivedBytes: blob.size,
+      durationMs,
+      filename,
+      mode: "live-flv",
+      savedToDisk: true
+    };
+
+    if (stoppedByUser || control.canceled) {
+      const error = downloadCanceledError();
+      error.result = result;
+      throw error;
+    }
+
+    return result;
+  } finally {
+    control.abortControllers.delete(abortController);
   }
 }
 
@@ -1216,10 +1559,20 @@ async function waitForDownloadControl() {
     return;
   }
 
+  await waitForSpecificControl(control);
+}
+
+async function waitForSpecificControl(control) {
+  if (!control) {
+    return;
+  }
+
   while (control.paused && !control.canceled) {
     await new Promise((resolve) => control.waiters.push(resolve));
   }
-  throwIfDownloadCanceled();
+  if (control.canceled && !control.liveRecording) {
+    throw downloadCanceledError();
+  }
 }
 
 function throwIfDownloadCanceled() {
@@ -1815,6 +2168,7 @@ function resetProgress() {
     totalBytes: 0,
     percent: 0,
     speedBytesPerSecond: 0,
+    durationMs: 0,
     startedAt: Date.now(),
     lastAt: Date.now(),
     segmentIndex: 0,
@@ -1832,6 +2186,7 @@ function clearProgress() {
     totalBytes: 0,
     percent: 0,
     speedBytesPerSecond: 0,
+    durationMs: 0,
     startedAt: 0,
     lastAt: 0,
     segmentIndex: 0,
@@ -1848,6 +2203,7 @@ function beginCandidateProgress(context) {
   state.progress.totalBytes = Number(context.totalBytes) || 0;
   state.progress.percent = 0;
   state.progress.speedBytesPerSecond = 0;
+  state.progress.durationMs = 0;
   state.progress.startedAt = Date.now();
   state.progress.lastAt = Date.now();
   state.progress.segmentIndex = context.segmentIndex;
@@ -1864,6 +2220,7 @@ function beginMuxProgress(totalBytes) {
   state.progress.totalBytes = size;
   state.progress.percent = size ? 100 : 0;
   state.progress.speedBytesPerSecond = 0;
+  state.progress.durationMs = 0;
   state.progress.startedAt = Date.now();
   state.progress.lastAt = Date.now();
   state.progress.segmentIndex = 0;
@@ -1874,7 +2231,7 @@ function beginMuxProgress(totalBytes) {
 }
 
 function updateProgress(payload) {
-  if (!state.busy || state.downloadControl?.canceled || !payload) {
+  if ((!state.busy && !state.downloadControl?.liveRecording) || state.downloadControl?.canceled || !payload) {
     return;
   }
 
@@ -1887,6 +2244,9 @@ function updateProgress(payload) {
   state.progress.totalBytes = totalBytes;
   state.progress.percent = totalBytes ? Math.min((receivedBytes / totalBytes) * 100, 100) : 0;
   state.progress.speedBytesPerSecond = receivedBytes / elapsedSeconds;
+  if (state.downloadControl?.liveRecording) {
+    state.progress.durationMs = now - state.progress.startedAt;
+  }
   state.progress.lastAt = now;
   state.progress.segmentIndex = payload.segmentIndex || state.progress.segmentIndex;
   state.progress.segmentCount = payload.segmentCount || state.progress.segmentCount;
@@ -1896,12 +2256,24 @@ function updateProgress(payload) {
 }
 
 function completeProgress(result = null) {
-  const totalBytes = Number(result?.totalBytes || result?.size || state.progress.totalBytes) || 0;
+  const isLiveResult = result?.mode === "live-flv" ||
+    (state.page.type === "live" && state.progress.receivedBytes && !state.progress.totalBytes);
+  const totalBytes = isLiveResult
+    ? 0
+    : Number(result?.totalBytes || result?.size || state.progress.totalBytes) || 0;
   const receivedBytes = Number(result?.receivedBytes || result?.size || totalBytes || state.progress.receivedBytes) || 0;
   if (totalBytes || receivedBytes) {
     state.progress.receivedBytes = receivedBytes;
     state.progress.totalBytes = totalBytes || receivedBytes;
     state.progress.percent = 100;
+  }
+  if (isLiveResult) {
+    state.progress.totalBytes = 0;
+    state.progress.percent = 0;
+    state.progress.durationMs = Number(result?.durationMs) || state.progress.durationMs;
+  }
+  if (!state.progress.totalBytes && state.progress.startedAt && state.progress.receivedBytes) {
+    state.progress.durationMs = state.progress.durationMs || (Date.now() - state.progress.startedAt);
   }
   state.progress.active = false;
   renderProgress();
@@ -1915,7 +2287,9 @@ function renderProgress() {
   const visible = state.progress.active || state.progress.receivedBytes || state.progress.totalBytes;
   progressPanel.hidden = !visible;
   const percent = Math.floor(state.progress.percent || 0);
-  progressPercent.textContent = state.progress.totalBytes ? `${percent}%` : "--";
+  progressPercent.textContent = isLiveProgress()
+    ? formatDuration(progressDurationMs())
+    : state.progress.totalBytes ? `${percent}%` : "--";
   progressBar.style.width = `${Math.min(percent, 100)}%`;
   progressSize.textContent = `${formatBytes(state.progress.receivedBytes)} / ${
     state.progress.totalBytes ? formatBytes(state.progress.totalBytes) : "--"
@@ -1929,7 +2303,7 @@ function renderProgress() {
 
 function renderDownloadControls() {
   const control = state.downloadControl;
-  const visible = Boolean(state.busy && control);
+  const visible = Boolean(state.busy && control && !control.liveRecording);
   if (downloadControls) {
     downloadControls.hidden = !visible;
   }
@@ -1940,6 +2314,30 @@ function renderDownloadControls() {
   if (cancelButton) {
     cancelButton.disabled = !visible || control?.canceled;
   }
+}
+
+function isLiveProgress() {
+  return Boolean(state.downloadControl?.liveRecording) ||
+    (state.page.type === "live" && state.progress.receivedBytes && !state.progress.totalBytes);
+}
+
+function progressDurationMs() {
+  if (state.progress.durationMs) {
+    return state.progress.durationMs;
+  }
+  if (state.progress.active && state.progress.startedAt) {
+    return Date.now() - state.progress.startedAt;
+  }
+  return 0;
+}
+
+function formatDuration(milliseconds) {
+  const totalSeconds = Math.max(Math.floor((Number(milliseconds) || 0) / 1000), 0);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  const pad = (value) => String(value).padStart(2, "0");
+  return hours ? `${hours}:${pad(minutes)}:${pad(seconds)}` : `${pad(minutes)}:${pad(seconds)}`;
 }
 
 function formatBytes(bytes) {
@@ -1962,24 +2360,33 @@ function formatBytes(bytes) {
 
 function updateControls() {
   const hasVideoId = hasSupportedPageId(state.page);
-  const hasQuality = Boolean(state.video?.qualities?.length);
+  const isLive = state.page.type === "live";
+  const isLiveRecording = Boolean(state.downloadControl?.liveRecording);
+  const hasQuality = Boolean(currentQualitySource()?.qualities?.length);
   const hasAvailableQuality = Boolean(availableQualityOptions().length);
   const hasMultiplePages = videoHasMultiplePages(state.video);
   const hasSelectedPages = Boolean(selectedPages().length);
   copyButton.disabled = state.busy || !hasVideoId;
-  downloadButton.disabled = state.busy || !hasVideoId || !hasAvailableQuality || !selectedQualityAvailable();
+  downloadButton.disabled = state.busy || isLive || !hasVideoId || !hasAvailableQuality || !selectedQualityAvailable();
   if (downloadAudioButton) {
-    downloadAudioButton.disabled = state.busy || !hasVideoId || !state.video?.page?.cid;
+    downloadAudioButton.disabled = state.busy || isLive || !hasVideoId || !state.video?.page?.cid;
   }
-  qualitySelect.disabled = state.busy || !hasQuality;
+  if (liveRecordButton) {
+    liveRecordButton.disabled = !isLive ||
+      (!isLiveRecording && state.live?.liveStatus !== 1) ||
+      (!isLiveRecording && (!hasAvailableQuality || !selectedQualityAvailable()));
+    liveRecordButton.textContent = isLiveRecording ? "\u7ed3\u675f\u5f55\u5236" : "\u5f00\u59cb\u5f55\u5236";
+  }
+  qualitySelect.disabled = state.busy || isLiveRecording || !hasQuality;
   if (pagePickerToggle) {
-    pagePickerToggle.disabled = state.busy || !hasMultiplePages;
+    pagePickerToggle.disabled = state.busy || isLive || !hasMultiplePages;
   }
   if (pageSelectAllButton) {
-    pageSelectAllButton.disabled = state.busy || !hasMultiplePages;
+    pageSelectAllButton.disabled = state.busy || isLive || !hasMultiplePages;
   }
   if (downloadSelectedPagesButton) {
     downloadSelectedPagesButton.disabled = state.busy ||
+      isLive ||
       !hasVideoId ||
       !hasMultiplePages ||
       !hasAvailableQuality ||
@@ -1988,6 +2395,7 @@ function updateControls() {
   }
   if (downloadSelectedPageAudioButton) {
     downloadSelectedPageAudioButton.disabled = state.busy ||
+      isLive ||
       !hasVideoId ||
       !hasMultiplePages ||
       !hasSelectedPages;
@@ -2002,7 +2410,11 @@ function availableQualityOptions() {
 }
 
 function videoHasAvailableQuality(video) {
-  return Boolean(video?.qualities?.some((quality) => quality.available !== false));
+  return qualityDataHasAvailable(video);
+}
+
+function qualityDataHasAvailable(data) {
+  return Boolean(data?.qualities?.some((quality) => quality.available !== false));
 }
 
 function selectedQualityOption() {
@@ -2042,7 +2454,7 @@ function setStatus(text) {
 }
 
 function isSupportedBilibiliUrl(value) {
-  return isBilibiliVideoUrl(value) || isBangumiUrl(value);
+  return isBilibiliVideoUrl(value) || isBangumiUrl(value) || isLiveUrl(value);
 }
 
 function isBilibiliVideoUrl(value) {
@@ -2053,12 +2465,19 @@ function isBangumiUrl(value) {
   return /^https:\/\/www\.bilibili\.com\/bangumi\/play\//.test(String(value));
 }
 
+function isLiveUrl(value) {
+  return /^https:\/\/live\.bilibili\.com\/(?:blanc\/)?\d+/.test(String(value));
+}
+
 function pageTypeFromUrl(value) {
+  if (isLiveUrl(value)) {
+    return "live";
+  }
   return isBangumiUrl(value) ? "bangumi" : isBilibiliVideoUrl(value) ? "video" : "";
 }
 
 function hasSupportedPageId(page) {
-  return Boolean(page?.bvid || page?.epId || page?.seasonId);
+  return Boolean(page?.bvid || page?.epId || page?.seasonId || page?.roomId);
 }
 
 function displayPageId(page) {
@@ -2070,6 +2489,9 @@ function displayPageId(page) {
   }
   if (page?.seasonId) {
     return `ss${page.seasonId}`;
+  }
+  if (page?.roomId) {
+    return `live ${page.roomId}`;
   }
   return "";
 }
@@ -2086,5 +2508,10 @@ function extractSeasonId(value) {
 
 function extractEpId(value) {
   const match = String(value || "").match(/\/bangumi\/play\/ep(\d+)/);
+  return match ? Number(match[1]) : null;
+}
+
+function extractLiveRoomId(value) {
+  const match = String(value || "").match(/:\/\/live\.bilibili\.com\/(?:blanc\/)?(\d+)/);
   return match ? Number(match[1]) : null;
 }

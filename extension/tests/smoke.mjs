@@ -20,8 +20,10 @@ test("manifest declares a pure browser side panel extension", async () => {
   assert.ok(manifest.permissions.includes("sidePanel"));
   assert.ok(manifest.permissions.includes("storage"));
   assert.ok(manifest.host_permissions.includes("https://api.bilibili.com/*"));
+  assert.ok(manifest.host_permissions.includes("https://api.live.bilibili.com/*"));
   assert.ok(manifest.host_permissions.includes("https://*.edge.mountaintoys.cn/*"));
   assert.ok(manifest.content_scripts[0].matches.includes("https://www.bilibili.com/bangumi/play/*"));
+  assert.ok(manifest.content_scripts[0].matches.includes("https://live.bilibili.com/*"));
   assert.equal(
     manifest.declarative_net_request.rule_resources[0].path,
     "rules/bili-media-headers.json"
@@ -143,6 +145,7 @@ test("popup contains MVP controls", async () => {
     "quality",
     "download",
     "download-audio",
+    "live-record",
     "page-picker-toggle",
     "page-picker",
     "page-list",
@@ -396,7 +399,13 @@ test("background loads Bangumi episodes and prepares PGC DASH downloads", async 
     URL,
     URLSearchParams,
     clearTimeout,
-    setTimeout,
+    setTimeout(callback, delay) {
+      if (delay) {
+        callback();
+        return 1;
+      }
+      return setTimeout(callback, delay);
+    },
     chrome: {
       runtime: {
         lastError: null,
@@ -1267,6 +1276,199 @@ test("background reads browser cookie account and prepares DASH streams", async 
 });
 
 
+test("background loads live rooms and prepares FLV recording streams", async () => {
+  const code = await readFile("extension/src/background.js", "utf8");
+  let messageListener = null;
+
+  const sandbox = {
+    Array,
+    Date,
+    Error,
+    Number,
+    Promise,
+    Set,
+    String,
+    URL,
+    URLSearchParams,
+    clearTimeout,
+    setTimeout,
+    chrome: {
+      runtime: {
+        lastError: null,
+        onMessage: {
+          addListener(listener) {
+            messageListener = listener;
+          }
+        },
+        onConnect: {
+          addListener() {}
+        }
+      },
+      declarativeNetRequest: {
+        onRuleMatchedDebug: {
+          addListener() {}
+        }
+      },
+      storage: {
+        local: {
+          async get() {
+            return {};
+          },
+          async set() {}
+        }
+      }
+    },
+    fetch: async (url) => {
+      const value = String(url);
+      if (value.includes("/x/web-interface/nav")) {
+        return jsonResponse({
+          code: 0,
+          data: {
+            isLogin: true,
+            uname: "live-user",
+            mid: 42,
+            vipInfo: {}
+          }
+        });
+      }
+      if (value.includes("/room/v1/Room/room_init")) {
+        return jsonResponse({
+          code: 0,
+          data: {
+            room_id: 7734200,
+            short_id: 6,
+            live_status: 1
+          }
+        });
+      }
+      if (value.includes("/room/v1/Room/get_info")) {
+        return jsonResponse({
+          code: 0,
+          data: {
+            room_id: 7734200,
+            short_id: 6,
+            live_status: 1,
+            title: "Live Test Room"
+          }
+        });
+      }
+      if (value.includes("/xlive/web-room/v2/index/getRoomPlayInfo")) {
+        const qn = new URL(value).searchParams.get("qn");
+        assert.ok(["10000", "250"].includes(qn));
+        return jsonResponse({
+          code: 0,
+          data: {
+            room_id: 7734200,
+            playurl_info: {
+              playurl: {
+                cid: 7734200,
+                g_qn_desc: [
+                  { qn: 10000, desc: "原画" },
+                  { qn: 250, desc: "超清" }
+                ],
+                stream: [{
+                  protocol_name: "http_stream",
+                  format: [{
+                    format_name: "flv",
+                    codec: [{
+                      codec_name: "avc",
+                      current_qn: 250,
+                      base_url: "/live/test.flv?",
+                      is_pushing: true,
+                      url_info: [{
+                        host: "https://live-primary.bilivideo.com",
+                        extra: "token=1"
+                      }, {
+                        host: "https://live-backup.bilivideo.com",
+                        extra: "token=2"
+                      }]
+                    }]
+                  }]
+                }]
+              }
+            }
+          }
+        });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    }
+  };
+
+  vm.createContext(sandbox);
+  vm.runInContext(code, sandbox);
+
+  const live = await sandbox.loadLive({
+    type: "live",
+    roomId: 6,
+    title: "Live Page",
+    url: "https://live.bilibili.com/6"
+  });
+  assert.equal(live.source, "live");
+  assert.equal(live.roomId, 7734200);
+  assert.equal(live.shortId, 6);
+  assert.equal(live.liveStatus, 1);
+  assert.equal(live.account.username, "live-user");
+  assert.equal(live.currentQuality, 250);
+  assert.equal(live.qualities.length, 2);
+  assert.equal(live.qualities[0].code, 10000);
+  assert.equal(live.qualities[0].available, false);
+  assert.equal(live.qualities[0].reason, "unavailable");
+  assert.equal(live.qualities[1].code, 250);
+  assert.equal(live.qualities[1].available, true);
+  const noCookieQualities = await sandbox.buildLiveQualityOptions({
+    roomId: 7734200,
+    playInfo: sandbox.normalizeLivePlayInfo({
+      playurl_info: {
+        playurl: {
+          cid: 7734200,
+          g_qn_desc: [
+            { qn: 10000, desc: "原画" },
+            { qn: 250, desc: "超清" }
+          ],
+          stream: [{
+            protocol_name: "http_stream",
+            format: [{
+              format_name: "flv",
+              codec: [{
+                codec_name: "avc",
+                current_qn: 250,
+                base_url: "/live/test.flv?",
+                is_pushing: true,
+                url_info: [{
+                  host: "https://live-primary.bilivideo.com",
+                  extra: "token=1"
+                }]
+              }]
+            }]
+          }]
+        }
+      }
+    }),
+    account: { isLogin: false }
+  });
+  assert.equal(noCookieQualities[0].code, 10000);
+  assert.equal(noCookieQualities[0].available, false);
+  assert.equal(noCookieQualities[0].reason, "login-required");
+
+  const preparedResponse = await sendRuntimeMessage(messageListener, {
+    type: "BILI_DOWNLOAD_PREPARE_LIVE_RECORDING",
+    payload: {
+      roomId: 6,
+      title: "Live Page",
+      quality: 250
+    }
+  });
+  assert.equal(preparedResponse.ok, true);
+  assert.equal(preparedResponse.payload.mode, "live");
+  assert.equal(preparedResponse.payload.format, "flv");
+  assert.equal(preparedResponse.payload.live.roomId, 7734200);
+  assert.equal(preparedResponse.payload.live.qualityLabel, "超清");
+  assert.match(preparedResponse.payload.segments[0].url, /^https:\/\/live-primary\.bilivideo\.com\/live\/test\.flv\?token=1$/);
+  assert.equal(preparedResponse.payload.segments[0].candidates.length, 2);
+  assert.match(preparedResponse.payload.segments[0].filename, /^BiliDownload\/Live Page_\d{8}_\d{6}\.flv$/);
+});
+
+
 test("background probes missing DASH media sizes from response headers", async () => {
   const code = await readFile("extension/src/background.js", "utf8");
   const fetchCalls = [];
@@ -1938,6 +2140,7 @@ test("popup disables login-only quality options", async () => {
   let prepareMessages = 0;
 
   const sandbox = {
+    AbortController,
     Blob,
     Date,
     Error,
@@ -1950,10 +2153,7 @@ test("popup disables login-only quality options", async () => {
         async writeText() {}
       }
     },
-    setTimeout(callback) {
-      callback();
-      return 1;
-    },
+    setTimeout,
     document: {
       addEventListener() {},
       body: {
@@ -2084,6 +2284,7 @@ test("popup lets users choose specific multi-page videos to download", async () 
   const downloadSelectedPageAudioButton = buttonElement();
 
   const sandbox = {
+    AbortController,
     Blob,
     Date,
     Error,
@@ -2096,10 +2297,7 @@ test("popup lets users choose specific multi-page videos to download", async () 
         async writeText() {}
       }
     },
-    setTimeout(callback) {
-      callback();
-      return 1;
-    },
+    setTimeout,
     document: {
       addEventListener() {},
       body: {
@@ -2355,10 +2553,7 @@ test("popup sends Bangumi episode ids for selected episode downloads", async () 
         async writeText() {}
       }
     },
-    setTimeout(callback) {
-      callback();
-      return 1;
-    },
+    setTimeout,
     document: {
       addEventListener() {},
       body: {
@@ -4183,6 +4378,282 @@ test("popup muxes DASH segments into one MP4 download", async () => {
 });
 
 
+test("popup records a live FLV stream until the user stops it", async () => {
+  const code = await readFile("extension/src/popup.js", "utf8");
+  const runtimeMessages = [];
+  const savedAnchors = [];
+  const statusElement = textElement();
+  const accountElement = textElement();
+  const bvidInput = textElement();
+  const titleInput = textElement();
+  const qualitySelect = selectElement();
+  const qualitySizeElement = textElement();
+  const downloadButton = buttonElement();
+  const downloadAudioButton = buttonElement();
+  const liveRecordButton = buttonElement();
+  const progressPanel = panelElement();
+  const progressPercent = textElement();
+  const progressBar = styleElement();
+  const progressSize = textElement();
+  let pendingRead = null;
+  let abortListener = null;
+
+  const sandbox = {
+    AbortController,
+    Blob,
+    Date,
+    Error,
+    RegExp,
+    String,
+    URL: class extends URL {
+      static createObjectURL(blob) {
+        return `blob:live/${blob.size}`;
+      }
+      static revokeObjectURL() {}
+    },
+    console,
+    navigator: {
+      clipboard: {
+        async writeText() {}
+      }
+    },
+    setTimeout(callback, delay) {
+      if (delay) {
+        callback();
+        return 1;
+      }
+      return setTimeout(callback, delay);
+    },
+    document: {
+      addEventListener() {},
+      body: {
+        append(anchor) {
+          savedAnchors.push(anchor);
+        }
+      },
+      createElement(tagName) {
+        if (tagName === "a") {
+          return {
+            href: "",
+            download: "",
+            rel: "",
+            click() {},
+            remove() {}
+          };
+        }
+        return optionElement();
+      },
+      querySelector(selector) {
+        return {
+          "#status": statusElement,
+          "#account": accountElement,
+          "#bvid": bvidInput,
+          "#title": titleInput,
+          "#quality": qualitySelect,
+          "#quality-size": qualitySizeElement,
+          "#copy": buttonElement(),
+          "#download": downloadButton,
+          "#download-audio": downloadAudioButton,
+          "#live-record": liveRecordButton,
+          "#page-picker-toggle": buttonElement(),
+          "#page-picker": panelElement(),
+          "#page-list": containerElement(),
+          "#page-select-all": buttonElement(),
+          "#download-selected-pages": buttonElement(),
+          "#download-selected-page-audio": buttonElement(),
+          "#diagnostic": buttonElement(),
+          "#progress": progressPanel,
+          "#progress-percent": progressPercent,
+          "#progress-bar": progressBar,
+          "#progress-size": progressSize,
+          "#progress-speed": textElement(),
+          "#download-controls": panelElement(),
+          "#pause": buttonElement(),
+          "#cancel": buttonElement(),
+          "label[for=\"quality\"]": textElement()
+        }[selector];
+      }
+    },
+    fetch: async (_url, options = {}) => {
+      abortListener = () => {
+        pendingRead?.({ done: true });
+        pendingRead = null;
+      };
+      options.signal?.addEventListener?.("abort", abortListener);
+      return {
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        headers: {
+          get(name) {
+            return String(name).toLowerCase() === "content-type" ? "video/x-flv" : "";
+          }
+        },
+        body: {
+          getReader() {
+            let count = 0;
+            return {
+              async read() {
+                count += 1;
+                if (count === 1) {
+                  return { done: false, value: new Uint8Array([1, 2, 3, 4]) };
+                }
+                return new Promise((resolve) => {
+                  pendingRead = resolve;
+                });
+              }
+            };
+          }
+        }
+      };
+    },
+    chrome: {
+      tabs: {
+        async query() {
+          return [{
+            id: 99,
+            url: "https://live.bilibili.com/6",
+            title: "Live Test"
+          }];
+        },
+        async sendMessage() {
+          return {
+            type: "live",
+            roomId: 6,
+            title: "Live Test",
+            url: "https://live.bilibili.com/6"
+          };
+        },
+        onActivated: {
+          addListener() {}
+        },
+        onUpdated: {
+          addListener() {}
+        }
+      },
+      runtime: {
+        connect() {
+          return {
+            onMessage: {
+              addListener() {}
+            }
+          };
+        },
+        async sendMessage(message) {
+          runtimeMessages.push(message);
+          if (message.type === "BILI_DOWNLOAD_GET_DIAGNOSTIC") {
+            return { ok: true, payload: null };
+          }
+          if (message.type === "BILI_DOWNLOAD_LOAD_LIVE") {
+            return {
+              ok: true,
+              payload: {
+                source: "live",
+                roomId: 7734200,
+                shortId: 6,
+                title: "Live Test",
+                liveStatus: 1,
+                liveStatusText: "直播中",
+                account: { isLogin: true, username: "live-user" },
+                currentQuality: 250,
+                qualities: [{
+                  code: 10000,
+                  label: "原画",
+                  available: false,
+                  mode: "",
+                  reason: "unavailable"
+                }, {
+                  code: 250,
+                  label: "超清 · AVC",
+                  available: true,
+                  mode: "live",
+                  reason: ""
+                }]
+              }
+            };
+          }
+          if (message.type === "BILI_DOWNLOAD_PREPARE_LIVE_RECORDING") {
+            return {
+              ok: true,
+              payload: {
+                mode: "live",
+                count: 1,
+                format: "flv",
+                live: { roomId: 7734200, title: "Live Test" },
+                segments: [{
+                  url: "https://live-primary.bilivideo.com/live/test.flv?token=1",
+                  filename: "BiliDownload/Live Test_20260628_120000.flv",
+                  size: 0,
+                  candidates: [{ url: "https://live-primary.bilivideo.com/live/test.flv?token=1", kind: "primary", size: 0 }],
+                  context: {
+                    roomId: 7734200,
+                    source: "live",
+                    segmentIndex: 1,
+                    segmentCount: 1,
+                    format: "flv",
+                    downloadMethod: "live-recording"
+                  }
+                }]
+              }
+            };
+          }
+          if (message.type === "BILI_DOWNLOAD_SAVE_DIAGNOSTIC") {
+            return { ok: true };
+          }
+          throw new Error(`unexpected runtime message: ${message.type}`);
+        }
+      },
+      scripting: {
+        async executeScript() {}
+      }
+    }
+  };
+
+  vm.createContext(sandbox);
+  vm.runInContext(code, sandbox);
+
+  await sandbox.initialize();
+  assert.equal(bvidInput.value, "live 7734200");
+  assert.equal(downloadButton.hidden, true);
+  assert.equal(downloadAudioButton.hidden, true);
+  assert.equal(liveRecordButton.hidden, false);
+  assert.equal(liveRecordButton.textContent, "开始录制");
+  assert.equal(qualitySelect.hidden, false);
+  assert.equal(qualitySelect.value, "250");
+  assert.equal(qualitySelect.children.length, 2);
+  assert.equal(qualitySelect.children[0].value, "10000");
+  assert.equal(qualitySelect.children[0].disabled, true);
+  assert.match(qualitySelect.children[0].textContent, /当前不可用/);
+  assert.equal(qualitySelect.children[1].value, "250");
+  assert.equal(qualitySelect.children[1].disabled, false);
+
+  const recording = sandbox.startLiveRecording();
+  for (let index = 0; index < 20 && !pendingRead; index += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  assert.equal(liveRecordButton.textContent, "结束录制");
+  assert.equal(Boolean(pendingRead), true);
+  assert.match(progressSize.textContent, /4 B \/ --/);
+  assert.match(progressPercent.textContent, /^\d{2}:\d{2}$/);
+  assert.notEqual(progressPercent.textContent, "--");
+  sandbox.stopLiveRecording();
+  await recording;
+
+  assert.equal(savedAnchors.length, 1);
+  assert.match(progressPercent.textContent, /^\d{2}:\d{2}$/);
+  assert.equal(savedAnchors[0].download, "Live Test_20260628_120000.flv");
+  assert.match(statusElement.textContent, /直播录制已保存/);
+  const prepareMessage = runtimeMessages.find((message) => message.type === "BILI_DOWNLOAD_PREPARE_LIVE_RECORDING");
+  assert.equal(prepareMessage.payload.quality, 250);
+  const savedDiagnostic = runtimeMessages
+    .filter((message) => message.type === "BILI_DOWNLOAD_SAVE_DIAGNOSTIC")
+    .at(-1).payload;
+  assert.equal(savedDiagnostic.phase, "complete");
+  assert.equal(savedDiagnostic.saved.mode, "live-flv");
+  assert.equal(savedDiagnostic.saved.size, 4);
+});
+
+
 test("background captures interrupted download diagnostics", async () => {
   const code = await readFile("extension/src/background.js", "utf8");
   const downloadItems = new Map();
@@ -4611,3 +5082,4 @@ function parseMp4Info(buffer) {
     file.flush();
   });
 }
+

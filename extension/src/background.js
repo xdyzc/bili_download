@@ -64,6 +64,20 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
 
+  if (message?.type === "BILI_DOWNLOAD_LOAD_LIVE") {
+    loadLive(message.payload)
+      .then((payload) => sendResponse({ ok: true, payload }))
+      .catch((error) => sendResponse(errorResponse(error)));
+    return true;
+  }
+
+  if (message?.type === "BILI_DOWNLOAD_PREPARE_LIVE_RECORDING") {
+    prepareLiveRecording(message.payload)
+      .then((payload) => sendResponse({ ok: true, payload }))
+      .catch((error) => sendResponse(errorResponse(error)));
+    return true;
+  }
+
   if (message?.type === "BILI_DOWNLOAD_SAVE_DIAGNOSTIC") {
     setLastDiagnostic(message.payload)
       .then(() => sendResponse({ ok: true }))
@@ -270,6 +284,116 @@ async function loadBangumi(page) {
     directAvailable: qualities.some((quality) => quality.available && quality.mode === "direct"),
     dashAvailable: qualities.some((quality) => quality.available && quality.mode === "dash"),
     qualities
+  };
+}
+
+async function loadLive(page) {
+  const roomId = normalizeId(page?.roomId) || extractLiveRoomId(page?.url);
+  if (!roomId) {
+    throw new Error("No live room id was found on this page.");
+  }
+
+  const [roomPayload, account] = await Promise.all([
+    fetchLiveRoomInfo(roomId),
+    fetchAccountStatus().catch((error) => ({
+      isLogin: false,
+      username: "",
+      userId: null,
+      vipLabel: "",
+      error: error.message
+    }))
+  ]);
+  const room = normalizeLiveRoom(roomPayload, roomId);
+  const title = page?.title || room.title || `live_${room.roomId}`;
+  let playInfo = { qualities: [], streams: [], currentQuality: null };
+  let qualities = [];
+  if (room.liveStatus === 1) {
+    const playPayload = await fetchLivePlayInfo(room.roomId);
+    playInfo = normalizeLivePlayInfo(expectData(playPayload));
+    qualities = await buildLiveQualityOptions({
+      roomId: room.roomId,
+      playInfo,
+      account
+    });
+  }
+
+  return {
+    source: "live",
+    roomId: room.roomId,
+    shortId: room.shortId,
+    title,
+    liveStatus: room.liveStatus,
+    liveStatusText: room.liveStatus === 1 ? "直播中" : "未开播",
+    anchorName: room.anchorName,
+    account,
+    currentQuality: selectDefaultQuality(qualities, playInfo.currentQuality),
+    qualities
+  };
+}
+
+async function prepareLiveRecording(payload) {
+  const roomId = normalizeId(payload?.roomId) || extractLiveRoomId(payload?.url);
+  const title = payload?.title || (roomId ? `live_${roomId}` : "bili_live");
+  const requestedQuality = Number(payload?.quality) || 0;
+  if (!roomId) {
+    throw new Error("Missing live room id.");
+  }
+
+  const roomPayload = await fetchLiveRoomInfo(roomId);
+  const room = normalizeLiveRoom(roomPayload, roomId);
+  if (room.liveStatus !== 1) {
+    throw new Error("当前直播间未开播，不能开始录制。");
+  }
+
+  const playPayload = await fetchLivePlayInfo(room.roomId, requestedQuality || 10000);
+  const playInfo = normalizeLivePlayInfo(expectData(playPayload));
+  const stream = selectLiveFlvStream(playInfo, requestedQuality);
+  if (!stream?.url) {
+    if (requestedQuality) {
+      throw unavailableQualityError(requestedQuality);
+    }
+    throw new Error("没有找到可录制的 FLV 直播流。");
+  }
+
+  const baseName = safeFilename(`${title}_${timestampForFilename(new Date())}`);
+  const segment = {
+    url: stream.url,
+    filename: `BiliDownload/${baseName}.flv`,
+    size: 0,
+    candidates: stream.candidates,
+    context: {
+      roomId: room.roomId,
+      shortId: room.shortId,
+      title,
+      source: "live",
+      segmentIndex: 1,
+      segmentCount: 1,
+      role: "live",
+      roleLabel: "直播",
+      format: "flv",
+      codec: stream.codec,
+      quality: stream.quality,
+      qualityLabel: stream.qualityLabel,
+      downloadMethod: "live-recording"
+    }
+  };
+
+  return {
+    mode: "live",
+    count: 1,
+    format: "flv",
+    live: {
+      roomId: room.roomId,
+      shortId: room.shortId,
+      title,
+      liveStatus: room.liveStatus,
+      quality: stream.quality,
+      qualityLabel: stream.qualityLabel,
+      protocol: stream.protocol,
+      format: stream.format,
+      codec: stream.codec
+    },
+    segments: [segment]
   };
 }
 
@@ -664,6 +788,42 @@ async function fetchPgcPlayUrl({ epId, cid, quality, fnval = 4048, tabId = null 
   return normalizePlayUrl(expectResult(payload));
 }
 
+async function fetchLiveRoomInfo(roomId) {
+  const payload = await fetchJson(`https://api.live.bilibili.com/room/v1/Room/room_init?id=${encodeURIComponent(roomId)}`);
+  const init = expectData(payload);
+  const realRoomId = Number(init.room_id) || Number(roomId);
+
+  let info = {};
+  try {
+    info = expectData(await fetchJson(
+      `https://api.live.bilibili.com/room/v1/Room/get_info?room_id=${encodeURIComponent(realRoomId)}`
+    ));
+  } catch (_error) {
+    info = {};
+  }
+
+  return {
+    ...init,
+    ...info,
+    room_id: realRoomId,
+    short_id: Number(init.short_id || info.short_id) || null,
+    live_status: Number(init.live_status ?? info.live_status) || 0
+  };
+}
+
+async function fetchLivePlayInfo(roomId, quality = 10000) {
+  const params = new URLSearchParams({
+    room_id: String(roomId),
+    protocol: "0,1",
+    format: "0,1,2",
+    codec: "0,1",
+    qn: String(Number(quality) || 10000),
+    platform: "web",
+    ptype: "8"
+  });
+  return fetchJson(`https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo?${params.toString()}`);
+}
+
 async function fetchJsonPreferPage(url, tabId) {
   const numericTabId = normalizeTabId(tabId);
   if (numericTabId && chrome.scripting?.executeScript) {
@@ -856,6 +1016,118 @@ function unavailableQualityInfo(account, requirement = null) {
     mode: "",
     reason: account?.isLogin ? "unavailable" : "login-required"
   };
+}
+
+async function buildLiveQualityOptions({ roomId, playInfo, account }) {
+  const qualityMap = new Map();
+  for (const quality of playInfo?.qualities || []) {
+    if (quality?.code) {
+      qualityMap.set(quality.code, quality);
+    }
+  }
+
+  for (const code of playInfo?.acceptQualities || []) {
+    if (!qualityMap.has(code)) {
+      qualityMap.set(code, {
+        code,
+        label: `QN ${code}`
+      });
+    }
+  }
+
+  for (const stream of playInfo?.streams || []) {
+    if (!stream.quality || qualityMap.has(stream.quality)) {
+      continue;
+    }
+    qualityMap.set(stream.quality, {
+      code: stream.quality,
+      label: stream.qualityLabel || `QN ${stream.quality}`
+    });
+  }
+
+  const qualities = Array.from(qualityMap.values())
+    .filter((quality) => Number(quality.code) > 0)
+    .sort((left, right) => Number(right.code) - Number(left.code));
+  const availableByQuality = groupLiveFlvStreamsByQuality(playInfo);
+  const missingQualities = qualities
+    .map((quality) => Number(quality.code))
+    .filter((code) => !availableByQuality.has(code));
+
+  await Promise.all(missingQualities.map(async (code) => {
+    try {
+      const payload = await fetchLivePlayInfo(roomId, code);
+      const probed = normalizeLivePlayInfo(expectData(payload));
+      for (const [quality, streams] of groupLiveFlvStreamsByQuality(probed)) {
+        const current = availableByQuality.get(quality) || [];
+        availableByQuality.set(quality, [...current, ...streams]);
+      }
+      for (const quality of probed.qualities) {
+        if (!qualityMap.has(quality.code)) {
+          qualityMap.set(quality.code, quality);
+        }
+      }
+    } catch (_error) {
+      // Live playurl probing is best effort. The advertised quality list remains useful.
+    }
+  }));
+
+  return Array.from(qualityMap.values())
+    .filter((quality) => Number(quality.code) > 0)
+    .sort((left, right) => Number(right.code) - Number(left.code))
+    .map((quality) => {
+      const code = Number(quality.code);
+      const stream = bestLiveStream(availableByQuality.get(code) || []);
+      const available = Boolean(stream?.url);
+      return {
+        code,
+        label: buildLiveQualityLabel(quality, stream),
+        estimatedSize: 0,
+        estimatedSizeSource: "",
+        estimatedSizeApproximate: false,
+        available,
+        mode: available ? "live" : "",
+        reason: available ? "" : liveUnavailableReason(account)
+      };
+    });
+}
+
+function liveUnavailableReason(account) {
+  return account?.isLogin ? "unavailable" : "login-required";
+}
+
+function groupLiveFlvStreamsByQuality(playInfo) {
+  const result = new Map();
+  for (const stream of Array.isArray(playInfo?.streams) ? playInfo.streams : []) {
+    if (!isUsableLiveFlvStream(stream)) {
+      continue;
+    }
+    const current = result.get(stream.quality) || [];
+    current.push(stream);
+    result.set(stream.quality, current);
+  }
+  return result;
+}
+
+function buildLiveQualityLabel(quality, stream = null) {
+  const parts = [
+    String(quality?.label || stream?.qualityLabel || `QN ${quality?.code || ""}`).trim(),
+    compactLiveCodec(stream?.codec)
+  ];
+  return parts.filter(Boolean).join(" · ");
+}
+
+function compactLiveCodec(value) {
+  const codec = String(value || "").toLowerCase();
+  if (!codec) {
+    return "";
+  }
+  if (codec === "avc" || codec.includes("avc") || codec.includes("h264")) {
+    return "AVC";
+  }
+  if (codec === "hevc" || codec.includes("hevc") || codec.includes("h265")) {
+    return "HEVC";
+  }
+  return codec.toUpperCase();
 }
 
 function prepareAudioSegment({ bvid, epId = null, cid, title, playUrl }) {
@@ -1498,6 +1770,123 @@ function normalizeBangumiEpisodes(episodes) {
     .filter((item) => item.cid && item.epId);
 }
 
+function normalizeLiveRoom(room, fallbackRoomId) {
+  const roomId = Number(room?.room_id || fallbackRoomId) || 0;
+  return {
+    roomId,
+    shortId: Number(room?.short_id) || null,
+    liveStatus: Number(room?.live_status) || 0,
+    title: String(room?.title || `live_${roomId}`),
+    anchorName: String(room?.uname || room?.anchor_name || "")
+  };
+}
+
+function normalizeLivePlayInfo(data) {
+  const playurl = data?.playurl_info?.playurl || data?.playurl || {};
+  const qualities = (Array.isArray(playurl.g_qn_desc) ? playurl.g_qn_desc : [])
+    .map((item) => ({
+      code: Number(item?.qn) || 0,
+      label: String(item?.desc || item?.media_base_desc?.detail_desc?.desc || item?.media_base_desc?.brief_desc?.desc || "")
+    }))
+    .filter((item) => item.code);
+  const qualityMap = new Map(qualities.map((quality) => [quality.code, quality.label]));
+  const acceptQualities = new Set(qualities.map((quality) => quality.code));
+  const streams = [];
+
+  for (const stream of Array.isArray(playurl.stream) ? playurl.stream : []) {
+    for (const format of Array.isArray(stream?.format) ? stream.format : []) {
+      for (const codec of Array.isArray(format?.codec) ? format.codec : []) {
+        const candidates = liveUrlCandidates(codec);
+        if (!candidates.length) {
+          continue;
+        }
+        const quality = Number(codec?.current_qn) || 0;
+        const codecAcceptQualities = (Array.isArray(codec?.accept_qn) ? codec.accept_qn : [])
+          .map((item) => Number(item))
+          .filter((item) => Number.isFinite(item) && item > 0);
+        for (const code of codecAcceptQualities) {
+          acceptQualities.add(code);
+        }
+        streams.push({
+          protocol: String(stream?.protocol_name || ""),
+          format: String(format?.format_name || ""),
+          codec: String(codec?.codec_name || ""),
+          quality,
+          qualityLabel: qualityMap.get(quality) || (quality ? `QN ${quality}` : ""),
+          acceptQualities: codecAcceptQualities,
+          candidates,
+          url: candidates[0].url,
+          isPushing: codec?.is_pushing !== false
+        });
+      }
+    }
+  }
+
+  return {
+    roomId: Number(playurl.cid || data?.room_id) || 0,
+    qualities,
+    acceptQualities: Array.from(acceptQualities).sort((left, right) => right - left),
+    currentQuality: streams.reduce((best, stream) => Math.max(best, Number(stream.quality) || 0), 0) || null,
+    streams
+  };
+}
+
+function liveUrlCandidates(codec) {
+  const baseUrl = String(codec?.base_url || codec?.baseUrl || "");
+  const infos = Array.isArray(codec?.url_info || codec?.urlInfo) ? (codec.url_info || codec.urlInfo) : [];
+  const seen = new Set();
+  return infos
+    .map((info, index) => {
+      const host = String(info?.host || "");
+      const extra = String(info?.extra || "");
+      const url = `${host}${baseUrl}${extra}`;
+      return {
+        url,
+        kind: index === 0 ? "primary" : "backup",
+        size: 0
+      };
+    })
+    .filter((candidate) => candidate.url && !seen.has(candidate.url) && seen.add(candidate.url));
+}
+
+function selectLiveFlvStream(playInfo, requestedQuality = 0) {
+  const streams = Array.isArray(playInfo?.streams) ? playInfo.streams : [];
+  const requested = Number(requestedQuality) || 0;
+  const flvStreams = streams.filter(isUsableLiveFlvStream);
+  const fallbackStreams = streams.filter((stream) => stream.format === "flv" && stream.url);
+  const source = flvStreams.length ? flvStreams : fallbackStreams;
+  const candidates = requested
+    ? source.filter((stream) => Number(stream.quality) === requested)
+    : source;
+  if (!candidates.length) {
+    return null;
+  }
+
+  return bestLiveStream(candidates);
+}
+
+function isUsableLiveFlvStream(stream) {
+  return stream?.protocol === "http_stream" &&
+    stream?.format === "flv" &&
+    Boolean(stream?.url) &&
+    stream?.isPushing;
+}
+
+function bestLiveStream(streams) {
+  const candidates = Array.isArray(streams) ? streams.filter((stream) => stream?.url) : [];
+  if (!candidates.length) {
+    return null;
+  }
+  return candidates.reduce((best, stream) => (
+    liveStreamScore(stream) > liveStreamScore(best) ? stream : best
+  ));
+}
+
+function liveStreamScore(stream) {
+  const codecScore = String(stream?.codec || "").toLowerCase() === "avc" ? 1 : 0;
+  return (Number(stream?.quality) || 0) * 10 + codecScore;
+}
+
 function bangumiEpisodeTitle(item, pageIndex) {
   const showTitle = String(item?.show_title || "").trim();
   if (showTitle) {
@@ -1572,6 +1961,11 @@ function extractEpId(value) {
   return match ? Number(match[1]) : null;
 }
 
+function extractLiveRoomId(value) {
+  const match = String(value || "").match(/:\/\/live\.bilibili\.com\/(?:blanc\/)?(\d+)/);
+  return match ? Number(match[1]) : null;
+}
+
 function isBangumiPage(page) {
   return page?.type === "bangumi" || /:\/\/www\.bilibili\.com\/bangumi\/play\//.test(String(page?.url || ""));
 }
@@ -1593,6 +1987,19 @@ function safeFilename(value) {
     .replace(/\s+/g, " ")
     .replace(/[ ._]+$/g, "")
     .slice(0, 120) || "bili_video";
+}
+
+function timestampForFilename(date) {
+  const pad = (value) => String(value).padStart(2, "0");
+  return [
+    date.getFullYear(),
+    pad(date.getMonth() + 1),
+    pad(date.getDate())
+  ].join("") + "_" + [
+    pad(date.getHours()),
+    pad(date.getMinutes()),
+    pad(date.getSeconds())
+  ].join("");
 }
 
 async function downloadFileWithDiagnostics({ options, context }) {

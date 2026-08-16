@@ -42,7 +42,6 @@ class FakeClient:
             accept_description=("360P",),
             segments=(
                 StreamSegment(url="https://example.test/part-1.mp4"),
-                StreamSegment(url="https://example.test/part-2.mp4"),
             ),
         )
 
@@ -64,7 +63,7 @@ class FakeClient:
     def open_stream(self, urls, *, referer: str):
         url = tuple(urls)[0]
         if url.endswith("part-1.mp4"):
-            return FakeResponse(b"hello ")
+            return FakeResponse(b"hello world")
         if url.endswith("video.m4s"):
             return FakeResponse(b"video")
         if url.endswith("audio.m4s"):
@@ -80,7 +79,41 @@ def test_downloader_writes_segments_to_file(tmp_path) -> None:
     assert result.path.read_bytes() == b"hello world"
     assert result.path.name == "Test Video_BV1xx411c7mD.mp4"
     assert result.bytes_written == 11
+    assert result.segments == 1
+
+
+def test_downloader_remuxes_multiple_durl_segments(monkeypatch, tmp_path) -> None:
+    play_url = PlayUrl(
+        quality=16,
+        format="mp4",
+        accept_quality=(16,),
+        accept_description=("360P",),
+        segments=(
+            StreamSegment(url="https://example.test/part-1.mp4"),
+            StreamSegment(url="https://example.test/part-2.mp4"),
+        ),
+    )
+
+    def fake_concat(segment_paths, output_path, *, overwrite):
+        assert [path.read_bytes() for path in segment_paths] == [b"hello world", b"world"]
+        output_path.write_bytes(b"valid-remux")
+
+    monkeypatch.setattr(downloader_module, "_concat_with_ffmpeg", fake_concat)
+
+    events = []
+    result = BiliDownloader(client=FakeClient(play_url)).download(
+        "BV1xx411c7mD",
+        output_dir=tmp_path,
+        progress_callback=lambda label, written, total, done: events.append(
+            (label, written, total, done)
+        ),
+    )
+
+    assert result.path.read_bytes() == b"valid-remux"
+    assert result.bytes_written == 16
     assert result.segments == 2
+    assert not list(tmp_path.glob("*.segment-*.mp4"))
+    assert [event for event in events if event[-1]] == [("video", 16, None, True)]
 
 
 def test_downloader_passes_requested_quality(tmp_path) -> None:

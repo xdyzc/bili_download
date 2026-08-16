@@ -78,12 +78,18 @@ class BiliDownloader:
 
         path.parent.mkdir(parents=True, exist_ok=True)
         with _reserve_output(path, overwrite=overwrite):
-            part_path = _new_staging_path(path, suffix=".part")
             referer = f"https://www.bilibili.com/video/{video.bvid}/"
             total = sum(segment.size or 0 for segment in play_url.segments) or None
             bytes_written = 0
-            with part_path.open("wb") as destination:
-                for segment in play_url.segments:
+            segment_paths: list[Path] = []
+            task_started = time.monotonic()
+            for index, segment in enumerate(play_url.segments, start=1):
+                segment_path = _new_staging_path(
+                    path,
+                    suffix=f".segment-{index:04d}{path.suffix}",
+                )
+                segment_paths.append(segment_path)
+                with segment_path.open("wb") as destination:
                     bytes_written += self._write_stream(
                         segment,
                         referer=referer,
@@ -91,10 +97,17 @@ class BiliDownloader:
                         label="video",
                         total=total,
                         initial=bytes_written,
+                        started_at=task_started,
+                        final=index == len(play_url.segments),
                         progress=progress,
                         progress_callback=progress_callback,
                     )
-            os.replace(part_path, path)
+            if len(segment_paths) == 1:
+                os.replace(segment_paths[0], path)
+            else:
+                _concat_with_ffmpeg(segment_paths, path, overwrite=overwrite)
+                for segment_path in segment_paths:
+                    segment_path.unlink(missing_ok=True)
 
         result = DownloadResult(
             path=path,
@@ -254,6 +267,8 @@ class BiliDownloader:
         label: str,
         total: int | None = None,
         initial: int = 0,
+        started_at: float | None = None,
+        final: bool = True,
         progress: bool,
         progress_callback: ProgressCallback | None = None,
     ) -> int:
@@ -263,7 +278,7 @@ class BiliDownloader:
             destination.seek(start_position)
             destination.truncate()
             written = 0
-            started = time.monotonic()
+            started = started_at if started_at is not None else time.monotonic()
             try:
                 with self.client.open_stream((url,), referer=referer) as response:
                     response_length = _content_length(response)
@@ -297,7 +312,7 @@ class BiliDownloader:
                 last_error = exc
                 continue
 
-            if progress:
+            if progress and final:
                 _print_progress(
                     label,
                     initial + written,
@@ -305,7 +320,7 @@ class BiliDownloader:
                     started,
                     done=True,
                 )
-            if progress_callback:
+            if progress_callback and final:
                 progress_callback(label, initial + written, progress_total, True)
             return written
 
@@ -533,6 +548,61 @@ def _merge_with_ffmpeg(
             f"Temporary files: {video_part}, {audio_part}\n{stderr.strip()}"
         )
     _publish_staging_file(temp_path, output_path, label="merged DASH output")
+
+
+def _concat_with_ffmpeg(
+    segment_paths: list[Path],
+    output_path: Path,
+    *,
+    overwrite: bool,
+) -> None:
+    ffmpeg = _find_ffmpeg()
+    if not ffmpeg:
+        raise UnsupportedStreamError(
+            "Multiple media segments were downloaded, but ffmpeg was not found. "
+            f"Temporary files: {', '.join(str(path) for path in segment_paths)}"
+        )
+
+    concat_path = _new_staging_path(output_path, suffix=".concat.txt")
+    temp_path = _new_staging_path(output_path, suffix=f".concat{output_path.suffix}")
+    try:
+        concat_path.write_text(
+            "".join(f"file '{_escape_concat_path(path)}'\n" for path in segment_paths),
+            encoding="utf-8",
+        )
+        command = [
+            ffmpeg,
+            "-y",
+            "-nostdin",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(concat_path),
+            "-c",
+            "copy",
+            str(temp_path),
+        ]
+        completed = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if completed.returncode != 0:
+            stderr = completed.stderr.decode("utf-8", errors="replace")
+            raise UnsupportedStreamError(
+                "ffmpeg failed to concatenate the media segments. "
+                f"Temporary files: {', '.join(str(path) for path in segment_paths)}\n{stderr.strip()}"
+            )
+        _publish_staging_file(temp_path, output_path, label="concatenated media output")
+    finally:
+        concat_path.unlink(missing_ok=True)
+        temp_path.unlink(missing_ok=True)
+
+
+def _escape_concat_path(path: Path) -> str:
+    return str(path.resolve()).replace("\\", "/").replace("'", "'\\''")
 
 
 def _burn_ass_with_ffmpeg(

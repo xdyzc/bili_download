@@ -98,45 +98,75 @@
           <div id="task-list" class="task-list" aria-live="polite"></div>
         </section>
 
-        <details class="safety-settings settings-section">
-          <summary>&#20869;&#23384;&#19982;&#24405;&#21046;&#20445;&#25252;</summary>
-          <div class="safety-grid">
-            <label>DASH &#25991;&#20214;&#19978;&#38480; (MB)
-              <input id="dash-max-file-mb" type="number" min="16" max="4096" step="1" inputmode="numeric">
+        <section class="safety-settings settings-section">
+          <h2>&#19979;&#36733;&#20445;&#25252;</h2>
+          <div class="safety-presets" role="radiogroup" aria-label="&#19979;&#36733;&#20445;&#25252;&#26041;&#26696;">
+            <label>
+              <input type="radio" name="safety-preset" value="standard" checked>
+              <span>&#25512;&#33616;</span>
             </label>
-            <label>DASH &#20869;&#23384;&#39044;&#31639; (MB)
-              <input id="dash-max-memory-mb" type="number" min="128" max="8192" step="1" inputmode="numeric">
+            <label>
+              <input type="radio" name="safety-preset" value="memory">
+              <span>&#30465;&#20869;&#23384;</span>
             </label>
-            <label>&#30452;&#25773;&#26368;&#38271;&#24405;&#21046; (&#20998;&#38047;)
-              <input id="live-max-duration-minutes" type="number" min="1" max="720" step="1" inputmode="numeric">
+            <label>
+              <input type="radio" name="safety-preset" value="large">
+              <span>&#22823;&#25991;&#20214;</span>
             </label>
-            <label>&#30452;&#25773;&#25991;&#20214;&#19978;&#38480; (MB)
-              <input id="live-max-file-mb" type="number" min="16" max="4096" step="1" inputmode="numeric">
-            </label>
-            <label>&#30452;&#25773;&#20869;&#23384;&#39044;&#31639; (MB)
-              <input id="live-max-memory-mb" type="number" min="32" max="8192" step="1" inputmode="numeric">
+            <label>
+              <input type="radio" name="safety-preset" value="custom">
+              <span>&#33258;&#23450;&#20041;</span>
             </label>
           </div>
+          <p id="safety-preset-description" class="safety-note"></p>
+          <details id="safety-advanced" class="advanced-settings">
+            <summary>&#39640;&#32423;&#35774;&#32622;</summary>
+            <div class="advanced-group">
+              <h3>&#35270;&#39057;&#19979;&#36733;</h3>
+              <div class="safety-grid">
+                <label>&#21333;&#20010;&#35270;&#39057;&#19978;&#38480; (MB)
+                  <input id="dash-max-file-mb" type="number" min="16" max="4096" step="1" inputmode="numeric">
+                </label>
+                <label>&#35270;&#39057;&#21512;&#24182;&#20869;&#23384; (MB)
+                  <input id="dash-max-memory-mb" type="number" min="128" max="8192" step="1" inputmode="numeric">
+                </label>
+              </div>
+            </div>
+            <div class="advanced-group">
+              <h3>&#30452;&#25773;&#24405;&#21046;</h3>
+              <div class="safety-grid">
+                <label>&#26368;&#38271;&#24405;&#21046;&#26102;&#38388; (&#20998;&#38047;)
+                  <input id="live-max-duration-minutes" type="number" min="1" max="720" step="1" inputmode="numeric">
+                </label>
+                <label>&#21333;&#27425;&#24405;&#21046;&#19978;&#38480; (MB)
+                  <input id="live-max-file-mb" type="number" min="16" max="4096" step="1" inputmode="numeric">
+                </label>
+                <label>&#24405;&#21046;&#20351;&#29992;&#20869;&#23384; (MB)
+                  <input id="live-max-memory-mb" type="number" min="32" max="8192" step="1" inputmode="numeric">
+                </label>
+              </div>
+            </div>
+          </details>
           <p id="safety-settings-summary" class="safety-note"></p>
-          <button id="safety-save" class="settings-save" type="button">&#20445;&#23384;&#20445;&#25252;&#35774;&#32622;</button>
-        </details>
+          <button id="safety-save" class="settings-save" type="button">&#20445;&#23384;&#19979;&#36733;&#20445;&#25252;</button>
+        </section>
 
         <details class="companion-settings settings-section">
-          <summary>&#26412;&#22320;&#27969;&#24335;&#21161;&#25163;</summary>
+          <summary>&#22686;&#24378;&#19979;&#36733;&#65288;&#21487;&#36873;&#65289;</summary>
           <div class="companion-status-row">
-            <span id="companion-status" class="companion-status" data-state="unknown">&#23578;&#26410;&#26816;&#27979;</span>
-            <button id="companion-check" type="button">&#26816;&#27979;</button>
+            <span id="companion-status" class="companion-status" data-state="unknown">&#23578;&#26410;&#26816;&#26597;</span>
+            <button id="companion-check" type="button">&#26816;&#26597;&#21487;&#29992;&#24615;</button>
           </div>
           <label class="companion-option">
             <input id="companion-prefer-dash" type="checkbox">
-            <span>&#21333;&#20010; DASH &#20248;&#20808;&#20351;&#29992;&#26412;&#22320;&#21161;&#25163;</span>
+            <span>&#39640;&#28165;&#38271;&#35270;&#39057;&#20248;&#20808;&#20351;&#29992;&#22686;&#24378;&#19979;&#36733;</span>
           </label>
           <label class="companion-option">
             <input id="companion-prefer-live" type="checkbox">
-            <span>&#30452;&#25773;&#24405;&#21046;&#20351;&#29992;&#26412;&#22320;&#21161;&#25163;</span>
+            <span>&#30452;&#25773;&#24405;&#21046;&#20248;&#20808;&#20351;&#29992;&#22686;&#24378;&#19979;&#36733;</span>
           </label>
-          <button id="companion-save" class="settings-save" type="button">&#20445;&#23384;&#21161;&#25163;&#20559;&#22909;</button>
-          <p class="companion-note">&#36755;&#20986;&#20301;&#32622;&#65306;Videos\BiliDownload</p>
+          <button id="companion-save" class="settings-save" type="button">&#20445;&#23384;&#22686;&#24378;&#19979;&#36733;&#35774;&#32622;</button>
+          <p class="companion-note">&#25991;&#20214;&#20445;&#23384;&#21040;&#65306;Videos\BiliDownload</p>
         </details>
 
         <section class="settings-section diagnostic-settings">

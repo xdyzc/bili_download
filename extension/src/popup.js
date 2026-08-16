@@ -23,7 +23,7 @@ const TEXT = {
   muxing: "\u6b63\u5728\u5408\u5e76 MP4...",
   downloadStarted: "\u4e0b\u8f7d\u5df2\u5f00\u59cb",
   downloadCompleted: "\u4e0b\u8f7d\u5df2\u5b8c\u6210",
-  dashMuxed: "DASH \u5df2\u5408\u5e76\u4e3a MP4",
+  dashMuxed: "\u89c6\u9891\u5df2\u5408\u5e76\u4e3a MP4",
   diagnosticCopied: "\u8bca\u65ad\u4fe1\u606f\u5df2\u590d\u5236",
   noDiagnostic: "\u6682\u65e0\u8bca\u65ad\u4fe1\u606f",
   paused: "\u5df2\u6682\u505c\u4e0b\u8f7d",
@@ -59,6 +59,29 @@ const SAFETY_SETTINGS_BOUNDS = Object.freeze({
   liveMaxDurationMinutes: { min: 1, max: 720 },
   liveMaxFileMb: { min: 16, max: 4096 },
   liveMaxMemoryMb: { min: 32, max: 8192 }
+});
+const SAFETY_SETTINGS_PRESETS = Object.freeze({
+  standard: Object.freeze({ ...SAFETY_SETTINGS_DEFAULTS }),
+  memory: Object.freeze({
+    dashMaxFileMb: 256,
+    dashMaxMemoryMb: 768,
+    liveMaxDurationMinutes: 60,
+    liveMaxFileMb: 512,
+    liveMaxMemoryMb: 768
+  }),
+  large: Object.freeze({
+    dashMaxFileMb: 2048,
+    dashMaxMemoryMb: 6144,
+    liveMaxDurationMinutes: 240,
+    liveMaxFileMb: 2048,
+    liveMaxMemoryMb: 6144
+  })
+});
+const SAFETY_PRESET_DESCRIPTIONS = Object.freeze({
+  standard: "推荐：适合大多数视频和直播录制。",
+  memory: "省内存：适合内存较小的电脑，超大视频可能需要降低清晰度。",
+  large: "大文件：适合 4K 或较长视频，会占用更多内存和磁盘空间。",
+  custom: "自定义：使用高级设置中的限制。"
 });
 const COMPANION_SETTINGS_DEFAULTS = Object.freeze({
   preferDash: false,
@@ -149,6 +172,9 @@ const dashMaxMemoryInput = document.querySelector("#dash-max-memory-mb");
 const liveMaxDurationInput = document.querySelector("#live-max-duration-minutes");
 const liveMaxFileInput = document.querySelector("#live-max-file-mb");
 const liveMaxMemoryInput = document.querySelector("#live-max-memory-mb");
+const safetyPresetInputs = Array.from(document.querySelectorAll?.("input[name=\"safety-preset\"]") || []);
+const safetyPresetDescription = document.querySelector("#safety-preset-description");
+const safetyAdvancedSettings = document.querySelector("#safety-advanced");
 const safetySettingsSummary = document.querySelector("#safety-settings-summary");
 const safetySaveButton = document.querySelector("#safety-save");
 const companionStatusElement = document.querySelector("#companion-status");
@@ -187,6 +213,13 @@ companionSaveButton?.addEventListener("click", saveCompanionSettings);
 taskCenterRefreshButton?.addEventListener("click", () => {
   refreshTaskCenter({ resumeBatch: false }).catch(() => {});
 });
+for (const input of safetyPresetInputs) {
+  input.addEventListener?.("change", () => {
+    if (input.checked) {
+      applySafetyPreset(input.value);
+    }
+  });
+}
 for (const input of [dashMaxFileInput, dashMaxMemoryInput, liveMaxDurationInput, liveMaxFileInput, liveMaxMemoryInput]) {
   input?.addEventListener("input", renderSafetySettingsSummary);
 }
@@ -284,7 +317,7 @@ async function saveSafetySettings() {
     await chrome.storage?.local?.set({
       [SAFETY_SETTINGS_STORAGE_KEY]: state.safetySettings
     });
-    setStatus("已保存内存与录制保护设置");
+    setStatus("已保存下载保护设置");
   } catch (_error) {
     setStatus("保护设置已生效，但未能保存到浏览器");
   }
@@ -308,9 +341,9 @@ async function saveCompanionSettings() {
     await chrome.storage?.local?.set({
       [COMPANION_SETTINGS_STORAGE_KEY]: state.companionSettings
     });
-    setStatus("本地流式助手偏好已保存");
+    setStatus("增强下载设置已保存");
   } catch (_error) {
-    setStatus("本地流式助手偏好已生效，但未能保存到浏览器");
+    setStatus("增强下载设置已生效，但未能保存到浏览器");
   }
 }
 
@@ -345,10 +378,10 @@ function renderCompanionStatus() {
   }
   const status = String(state.companionStatus || "unknown");
   const labels = {
-    unknown: "尚未检测",
-    checking: "正在检测…",
-    available: "已连接，可用于流式落盘",
-    unavailable: "未检测到已注册的本地助手"
+    unknown: "尚未检查",
+    checking: "正在检查…",
+    available: "可用",
+    unavailable: "当前不可用"
   };
   companionStatusElement.dataset.state = status;
   companionStatusElement.textContent = labels[status] || labels.unknown;
@@ -373,14 +406,14 @@ async function checkStreamingCompanion(options = {}) {
     state.companionStatus = "available";
     renderCompanionStatus();
     if (options.userInitiated) {
-      setStatus("本地流式助手已连接");
+      setStatus("增强下载可用");
     }
     return true;
   } catch (_error) {
     state.companionStatus = "unavailable";
     renderCompanionStatus();
     if (options.userInitiated) {
-      setStatus("未检测到本地流式助手；请按 README 构建并注册后重试");
+      setStatus("增强下载暂不可用；请确认已安装后重新检查");
     }
     return false;
   }
@@ -416,6 +449,12 @@ function readSafetySettingsInputs() {
 
 function renderSafetySettings() {
   const settings = state.safetySettings;
+  writeSafetySettingsInputs(settings);
+  syncSafetyPresetSelection(settings);
+  renderSafetySettingsSummary();
+}
+
+function writeSafetySettingsInputs(settings) {
   if (dashMaxFileInput) {
     dashMaxFileInput.value = String(settings.dashMaxFileMb);
   }
@@ -431,7 +470,48 @@ function renderSafetySettings() {
   if (liveMaxMemoryInput) {
     liveMaxMemoryInput.value = String(settings.liveMaxMemoryMb);
   }
+}
+
+function applySafetyPreset(presetId) {
+  if (presetId === "custom") {
+    if (safetyAdvancedSettings) {
+      safetyAdvancedSettings.open = true;
+    }
+    renderSafetyPresetDescription("custom");
+    return;
+  }
+  const preset = SAFETY_SETTINGS_PRESETS[presetId];
+  if (!preset) {
+    return;
+  }
+  writeSafetySettingsInputs(preset);
+  syncSafetyPresetSelection(preset);
   renderSafetySettingsSummary();
+}
+
+function syncSafetyPresetSelection(settings) {
+  const presetId = matchingSafetyPreset(settings);
+  for (const input of safetyPresetInputs) {
+    input.checked = input.value === presetId;
+  }
+  renderSafetyPresetDescription(presetId);
+  return presetId;
+}
+
+function matchingSafetyPreset(settings) {
+  const normalized = normalizeSafetySettings(settings);
+  for (const [presetId, preset] of Object.entries(SAFETY_SETTINGS_PRESETS)) {
+    if (Object.keys(SAFETY_SETTINGS_DEFAULTS).every((key) => normalized[key] === preset[key])) {
+      return presetId;
+    }
+  }
+  return "custom";
+}
+
+function renderSafetyPresetDescription(presetId) {
+  if (safetyPresetDescription) {
+    safetyPresetDescription.textContent = SAFETY_PRESET_DESCRIPTIONS[presetId] || SAFETY_PRESET_DESCRIPTIONS.custom;
+  }
 }
 
 function renderSafetySettingsSummary() {
@@ -439,9 +519,8 @@ function renderSafetySettingsSummary() {
     return;
   }
   const settings = normalizeSafetySettings(readSafetySettingsInputs());
-  const dashLimits = getDashSafetyLimits(settings);
-  const liveLimits = getLiveSafetyLimits(settings);
-  safetySettingsSummary.textContent = `实际缓冲上限：DASH ${formatBytes(dashLimits.maxInputBytes)} · 直播 ${formatBytes(liveLimits.maxBytes)}。达到时长或大小上限时自动停止。`;
+  syncSafetyPresetSelection(settings);
+  safetySettingsSummary.textContent = "达到限制时会自动停止，避免浏览器占用过多内存。";
 }
 
 function getDashSafetyLimits(settings = state.safetySettings) {
@@ -482,7 +561,7 @@ function assertDashInputWithinSafetyLimits(inputBytes, safety, phase) {
   }
   if (bytes > safety.maxFileBytes) {
     throw createMediaSafetyLimitError(
-      `DASH ${phase}媒体为 ${formatBytes(bytes)}，超过设置的 DASH 文件上限 ${formatBytes(safety.maxFileBytes)}；为防止浏览器内存耗尽，未开始合并。请降低清晰度，或在“内存与录制保护”中调高上限。`
+      `当前视频为 ${formatBytes(bytes)}，超过下载保护允许的单个视频大小 ${formatBytes(safety.maxFileBytes)}；未开始合并。请降低清晰度，或在“下载保护”的高级设置中调高上限。`
     );
   }
   if (bytes > safety.maxInputBytes) {
@@ -497,10 +576,10 @@ function dashSafetyLimitError(safety, bytes, phase) {
 function dashSafetyLimitMessage(safety, bytes = 0, phase = "下载") {
   const memoryBound = safety.maxInputBytes < safety.maxFileBytes;
   const limitLabel = memoryBound
-    ? `DASH 内存预算 ${formatBytes(safety.maxMemoryBytes)}（合并峰值按约 ${DASH_MUX_MEMORY_MULTIPLIER} 倍估算）`
-    : `DASH 文件上限 ${formatBytes(safety.maxFileBytes)}`;
+    ? `视频合并内存 ${formatBytes(safety.maxMemoryBytes)}`
+    : `单个视频上限 ${formatBytes(safety.maxFileBytes)}`;
   const measured = normalizeMediaLimitBytes(bytes);
-  return `DASH ${phase}${measured ? `媒体为 ${formatBytes(measured)}，` : ""}超过${limitLabel}对应的安全缓冲上限 ${formatBytes(safety.maxInputBytes)}；已停止且未保存该文件。请降低清晰度，或在“内存与录制保护”中调高上限。`;
+  return `视频${phase}${measured ? `媒体为 ${formatBytes(measured)}，` : ""}超过${limitLabel}允许的大小；已停止且未保存该文件。请降低清晰度，或在“下载保护”的高级设置中调高上限。`;
 }
 
 function normalizeMediaLimitBytes(value) {
@@ -1140,7 +1219,7 @@ async function startLiveRecording() {
       usedCompanion = true;
       const task = await downloadPreparedCompanionPayload(prepared);
       setStatus(task.outputName
-        ? `本地流式助手已完成录制：${task.outputName}`
+        ? `增强下载已完成录制：${task.outputName}`
         : TEXT.liveRecorded);
       return;
     }
@@ -1190,7 +1269,7 @@ function stopLiveRecording() {
       .catch((error) => {
         if (state.downloadControl === control) {
           control.canceled = false;
-          setStatus(error.message || "无法结束本地流式助手录制。");
+          setStatus(error.message || "无法结束增强下载录制。");
           updateControls();
         }
       });
@@ -1306,7 +1385,7 @@ async function downloadPreparedCompanionPayload(prepared, options = {}) {
     }
   });
   if (!started?.ok || !started?.payload?.taskId) {
-    throw new Error(started?.error || "无法启动本地流式助手。");
+    throw new Error(started?.error || "无法启动增强下载。");
   }
 
   const task = rememberCompanionTask(started.payload);
@@ -1334,7 +1413,7 @@ async function downloadPreparedCompanionPayload(prepared, options = {}) {
     if (completedTask.state === "canceled") {
       throw downloadCanceledError();
     }
-    throw new Error(completedTask.error || "本地流式助手任务未完成。");
+    throw new Error(completedTask.error || "增强下载任务未完成。");
   }
   completeProgress(completedTask);
   return completedTask;
@@ -1511,7 +1590,7 @@ function companionTaskError(task) {
   if (task?.state === "canceled") {
     return downloadCanceledError();
   }
-  return new Error(task?.error || "本地流式助手任务已中断。");
+  return new Error(task?.error || "增强下载任务已中断。");
 }
 
 async function requestCompanionTaskControl(taskId, action) {
@@ -1520,7 +1599,7 @@ async function requestCompanionTaskControl(taskId, action) {
     payload: { taskId, action }
   });
   if (!response?.ok) {
-    throw new Error(response?.error || "无法控制本地流式助手任务。");
+    throw new Error(response?.error || "无法控制增强下载任务。");
   }
   return response.payload ? rememberCompanionTask(response.payload) : null;
 }
@@ -1914,8 +1993,8 @@ function taskCenterTitle(kind, item) {
     return String(item.title || item.label || "多分 P 下载队列");
   }
   if (kind === "companion") {
-    const label = item.kind === "live" ? "直播录制" : "DASH 下载";
-    return `${label} · ${String(item.title || item.outputName || "本地流式助手")}`;
+    const label = item.kind === "live" ? "直播录制" : "高清视频";
+    return `${label} · ${String(item.title || item.outputName || "增强下载")}`;
   }
   const segment = Array.isArray(item.segments) ? item.segments[0] : null;
   return String(item.title || segment?.context?.title || segment?.title || "媒体下载");
@@ -1955,7 +2034,7 @@ function taskCenterDetail(kind, item) {
     return String(item.kind === "audio" || item.mode === "audio" ? "音频" : "视频");
   }
   if (kind === "companion") {
-    return item.kind === "live" ? "本地流式助手 · 分段直播录制" : "本地流式助手 · DASH 流式落盘";
+    return item.kind === "live" ? "增强下载 · 直播录制" : "增强下载 · 高清视频";
   }
   const completeCount = Number(item.completedCount) || 0;
   const count = Number(item.count) || (Array.isArray(item.segments) ? item.segments.length : 0);
@@ -2273,7 +2352,7 @@ async function runBatchJob(jobId, options = {}) {
         // output is saved, so returning this item to the queue is safe.
         job = await updateBatchJob(job.jobId, {
           currentIndex: index,
-          itemUpdates: [{ index, state: "queued", error: "浏览器端 DASH 在面板关闭后将重新开始。" }]
+          itemUpdates: [{ index, state: "queued", error: "浏览器合并任务在面板关闭后将重新开始。" }]
         });
         item = job.items?.[offset] || { ...item, state: "queued" };
       }
@@ -2532,7 +2611,7 @@ async function downloadDashAsMp4(prepared) {
   const video = downloads.find((item) => item.segment.context?.role === "video");
   const audio = downloads.find((item) => item.segment.context?.role === "audio");
   if (!video?.blob || !audio?.blob) {
-    throw new Error("DASH video or audio data was not downloaded.");
+    throw new Error("视频或音频数据未下载完成。");
   }
 
   await waitForDownloadControl();
@@ -2547,7 +2626,7 @@ async function downloadDashAsMp4(prepared) {
       outputName: dashOutputFilename(prepared)
     });
     if (merged?.blob?.size > safety.maxFileBytes) {
-      throw new Error(`合并后的 MP4 为 ${formatBytes(merged.blob.size)}，超过设置的 DASH 文件上限 ${formatBytes(safety.maxFileBytes)}；未保存文件。请降低清晰度，或在“内存与录制保护”中调高上限。`);
+      throw new Error(`合并后的视频为 ${formatBytes(merged.blob.size)}，超过下载保护允许的单个视频大小 ${formatBytes(safety.maxFileBytes)}；未保存文件。请降低清晰度，或在“下载保护”的高级设置中调高上限。`);
     }
     await waitForDownloadControl();
     throwIfDownloadCanceled();
@@ -3333,7 +3412,7 @@ function togglePauseDownload() {
   }
 
   if (control.companionTaskId) {
-    setStatus("本地流式助手任务暂不支持暂停；可在任务中心取消。");
+    setStatus("增强下载任务暂不支持暂停；可在任务中心取消。");
     renderDownloadControls();
     return;
   }
@@ -3427,7 +3506,7 @@ async function cancelDownload() {
     requestCompanionTaskControl(control.companionTaskId, "cancel").catch((error) => {
       if (state.downloadControl === control) {
         control.canceled = false;
-        setStatus(error.message || "无法取消本地流式助手任务。");
+        setStatus(error.message || "无法取消增强下载任务。");
         renderDownloadControls();
       }
     });
@@ -4651,7 +4730,14 @@ function updateControls() {
       !hasSelectedPages;
   }
   const safetyLocked = Boolean(state.downloadControl);
-  for (const input of [dashMaxFileInput, dashMaxMemoryInput, liveMaxDurationInput, liveMaxFileInput, liveMaxMemoryInput]) {
+  for (const input of [
+    ...safetyPresetInputs,
+    dashMaxFileInput,
+    dashMaxMemoryInput,
+    liveMaxDurationInput,
+    liveMaxFileInput,
+    liveMaxMemoryInput
+  ]) {
     if (input) {
       input.disabled = safetyLocked;
       input.title = safetyLocked ? "下载或录制进行中；保护设置仅可在下一项任务开始前调整。" : "";

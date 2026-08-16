@@ -184,6 +184,8 @@ test("popup contains MVP controls", async () => {
     "live-max-duration-minutes",
     "live-max-file-mb",
     "live-max-memory-mb",
+    "safety-preset-description",
+    "safety-advanced",
     "safety-settings-summary",
     "safety-save",
     "companion-status",
@@ -261,6 +263,88 @@ test("popup keeps advanced controls in a secondary settings view", async () => {
   assert.equal(elements["#main-view"].hidden, false);
   assert.equal(elements["#settings-view"].hidden, true);
   assert.equal(elements["#view-title"].textContent, "Bili Download");
+});
+
+
+test("popup maps friendly download protection presets to safety limits", async () => {
+  const code = await readFile("extension/src/popup.js", "utf8");
+  const description = textElement();
+  const summary = textElement();
+  const advanced = { open: false };
+  const numberInputs = {
+    "#dash-max-file-mb": textElement(),
+    "#dash-max-memory-mb": textElement(),
+    "#live-max-duration-minutes": textElement(),
+    "#live-max-file-mb": textElement(),
+    "#live-max-memory-mb": textElement()
+  };
+  const presetInputs = ["standard", "memory", "large", "custom"].map((value) => ({
+    value,
+    checked: value === "standard",
+    addEventListener() {}
+  }));
+  const elements = {
+    "#main-view": { hidden: false },
+    "#settings-view": { hidden: true },
+    "#view-title": textElement(),
+    "#settings-open": buttonElement(),
+    "#settings-back": buttonElement(),
+    "#status": textElement(),
+    "#quality": selectElement(),
+    "#safety-preset-description": description,
+    "#safety-advanced": advanced,
+    "#safety-settings-summary": summary,
+    ...numberInputs
+  };
+  const sandbox = {
+    Array,
+    Date,
+    Error,
+    Map,
+    Number,
+    Object,
+    Promise,
+    RegExp,
+    Set,
+    String,
+    URL,
+    clearTimeout,
+    setTimeout,
+    document: {
+      addEventListener() {},
+      querySelector(selector) {
+        return elements[selector];
+      },
+      querySelectorAll(selector) {
+        return selector === 'input[name="safety-preset"]' ? presetInputs : [];
+      }
+    },
+    chrome: {
+      runtime: {
+        connect() {
+          return { onMessage: { addListener() {} } };
+        }
+      }
+    }
+  };
+
+  vm.createContext(sandbox);
+  vm.runInContext(code, sandbox);
+  sandbox.applySafetyPreset("memory");
+  assert.equal(numberInputs["#dash-max-file-mb"].value, "256");
+  assert.equal(numberInputs["#dash-max-memory-mb"].value, "768");
+  assert.equal(numberInputs["#live-max-duration-minutes"].value, "60");
+  assert.equal(presetInputs.find((input) => input.value === "memory").checked, true);
+  assert.match(description.textContent, /省内存/);
+
+  numberInputs["#dash-max-file-mb"].value = "300";
+  sandbox.renderSafetySettingsSummary();
+  assert.equal(presetInputs.find((input) => input.value === "custom").checked, true);
+  assert.match(description.textContent, /自定义/);
+  assert.match(summary.textContent, /自动停止/);
+
+  sandbox.applySafetyPreset("custom");
+  assert.equal(advanced.open, true);
 });
 
 
@@ -5100,7 +5184,7 @@ test("popup blocks oversized DASH media before buffering it in memory", async ()
       count: 2,
       segments: [{ size: oversized }, { size: 1024 }]
     }),
-    /DASH/
+    /下载保护/
   );
   assert.equal(fetchCalls, 0);
 });
@@ -6235,7 +6319,7 @@ test("popup uses the explicitly enabled companion for DASH and live without reta
   const popupTaskState = vm.runInContext("JSON.stringify(Array.from(state.companionTasks.values()))", sandbox);
   assert.equal(popupTaskState.includes("popup-dash-secret"), false);
   assert.equal(popupTaskState.includes("popup-live-secret"), false);
-  assert.match(statusElement.textContent, /本地流式助手/);
+  assert.match(statusElement.textContent, /增强下载/);
 });
 
 

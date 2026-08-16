@@ -1,7 +1,7 @@
 """Optional native streaming companion for the Bili Download extension.
 
-The companion deliberately does *not* know how to log in to Bilibili, read a
-browser profile, call Bilibili APIs, or accept cookies / arbitrary request
+The companion deliberately does *not* know how to log in to supported sites,
+read a browser profile, call page APIs, or accept cookies / arbitrary request
 headers.  It only streams already-authorized, short-lived CDN URLs supplied by
 the extension over Chrome Native Messaging.  Those URLs remain in process
 memory and are never copied into events, manifests, error messages, or logs.
@@ -48,16 +48,27 @@ MAX_LIVE_SEGMENT_SECONDS = 60 * 60
 MAX_SOURCE_CANDIDATES = 16
 EXPIRED_SOURCE_STATUSES = {403, 404, 412}
 
-ALLOWED_CDN_SUFFIXES = (
-    "bilivideo.com",
-    "bilivideo.cn",
-    "hdslb.com",
-    "edge.mountaintoys.cn",
-)
+MEDIA_SITE_POLICIES = {
+    "bilibili": {
+        "referer_hosts": {"www.bilibili.com", "m.bilibili.com", "live.bilibili.com"},
+        "cdn_suffixes": {"bilivideo.com", "bilivideo.cn", "hdslb.com", "edge.mountaintoys.cn"},
+        "origin": "https://www.bilibili.com",
+    },
+    "douyu": {
+        "referer_hosts": {"www.douyu.com"},
+        "cdn_suffixes": {"douyucdn.cn"},
+        "origin": "https://www.douyu.com",
+    },
+    "huya": {
+        "referer_hosts": {"www.huya.com"},
+        "cdn_suffixes": {"flv.huya.com", "mobgslb.tbcache.com"},
+        "origin": "https://www.huya.com",
+    },
+}
 ALLOWED_REFERER_HOSTS = {
-    "www.bilibili.com",
-    "m.bilibili.com",
-    "live.bilibili.com",
+    host
+    for policy in MEDIA_SITE_POLICIES.values()
+    for host in policy["referer_hosts"]
 }
 FORBIDDEN_FIELD_NAMES = {
     "authorization",
@@ -109,10 +120,11 @@ class RefreshRequired(Exception):
 
 
 class SafeMediaRedirectHandler(HTTPRedirectHandler):
-    """Permit only validated Bilibili CDN redirects for a media request."""
+    """Permit only redirects to the CDN family paired with the page site."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        if not _is_allowed_media_url(newurl):
+        referer = req.get_header("Referer") or req.get_header("referer") or ""
+        if not _is_allowed_media_url(newurl, referer=referer):
             # This URL is intentionally never exposed to the caller; it becomes
             # a generic per-candidate failure at the download boundary.
             raise HTTPError(newurl, code, "unsafe redirect", headers, fp)
@@ -479,8 +491,8 @@ class CompanionHost:
         output_name = _safe_output_name(payload.get("outputName"), suffix=".mp4")
         referer = _safe_referer(payload.get("referer"), default="https://www.bilibili.com/")
         max_bytes = _task_max_bytes(payload.get("maxBytes"), self.max_disk_bytes)
-        video = _stream_input(payload.get("video"))
-        audio = _stream_input(payload.get("audio"))
+        video = _stream_input(payload.get("video"), referer=referer)
+        audio = _stream_input(payload.get("audio"), referer=referer)
         _assert_expected_total_within_limit(video, audio, max_bytes)
         reservation_bytes = _dash_storage_requirement(video, audio, max_bytes)
         output_path = self._claim_output_path(output_name)
@@ -509,7 +521,7 @@ class CompanionHost:
         payload = _payload(message)
         output_name = _safe_output_name(payload.get("outputName"), suffix=None)
         referer = _safe_referer(payload.get("referer"), default="https://live.bilibili.com/")
-        sources = _source_list(payload.get("sources"))
+        sources = _source_list(payload.get("sources"), referer=referer)
         max_bytes = _task_max_bytes(payload.get("maxBytes"), self.max_disk_bytes)
         duration_seconds = _bounded_int(
             payload.get("maxDurationSeconds", DEFAULT_LIVE_DURATION_SECONDS),
@@ -628,10 +640,10 @@ class CompanionHost:
     def _refresh_dash_sources(self, message: Mapping[str, Any], request_id: str) -> None:
         context = self._active_task(_task_id(message.get("taskId")), expected_kind="dash")
         payload = _payload(message)
-        video = _stream_input(payload.get("video"))
-        audio = _stream_input(payload.get("audio"))
-        _assert_expected_total_within_limit(video, audio, context.max_bytes)
         referer = _safe_referer(payload.get("referer"), default=context.referer)
+        video = _stream_input(payload.get("video"), referer=referer)
+        audio = _stream_input(payload.get("audio"), referer=referer)
+        _assert_expected_total_within_limit(video, audio, context.max_bytes)
         current_raw = _existing_size(_dash_part_path(context.output_path, "video")) + _existing_size(
             _dash_part_path(context.output_path, "audio")
         )
@@ -649,8 +661,8 @@ class CompanionHost:
     def _refresh_live_sources(self, message: Mapping[str, Any], request_id: str) -> None:
         context = self._active_task(_task_id(message.get("taskId")), expected_kind="live")
         payload = _payload(message)
-        sources = _source_list(payload.get("sources"))
         referer = _safe_referer(payload.get("referer"), default=context.referer)
+        sources = _source_list(payload.get("sources"), referer=referer)
         context.refresh_live(sources, referer)
         self.emit({
             "type": "sources_refreshed",
@@ -1407,11 +1419,11 @@ def _safe_referer(value: Any, *, default: str) -> str:
     parsed = urlparse(candidate)
     host = (parsed.hostname or "").lower()
     if parsed.scheme != "https" or host not in ALLOWED_REFERER_HOSTS:
-        raise ProtocolError("referer must be a Bilibili page origin.")
+        raise ProtocolError("referer must be a supported page origin.")
     return f"https://{host}/"
 
 
-def _source_list(value: Any) -> tuple[str, ...]:
+def _source_list(value: Any, *, referer: str) -> tuple[str, ...]:
     if not isinstance(value, list) or not value:
         raise ProtocolError("sources must be a non-empty list.")
     if len(value) > MAX_SOURCE_CANDIDATES:
@@ -1421,8 +1433,8 @@ def _source_list(value: Any) -> tuple[str, ...]:
     for item in value:
         if not isinstance(item, str):
             raise ProtocolError("Each media source must be a URL string.")
-        if not _is_allowed_media_url(item):
-            raise ProtocolError("Media sources must be HTTPS Bilibili CDN URLs.")
+        if not _is_allowed_media_url(item, referer=referer):
+            raise ProtocolError("Media sources must be HTTPS CDN URLs paired with the page site.")
         if item not in seen:
             seen.add(item)
             result.append(item)
@@ -1431,10 +1443,10 @@ def _source_list(value: Any) -> tuple[str, ...]:
     return tuple(result)
 
 
-def _stream_input(value: Any) -> StreamInput:
+def _stream_input(value: Any, *, referer: str) -> StreamInput:
     if not isinstance(value, Mapping):
         raise ProtocolError("A DASH stream object is required.")
-    sources = _source_list(value.get("sources"))
+    sources = _source_list(value.get("sources"), referer=referer)
     expected = _optional_positive_int(value.get("expectedBytes"), label="expectedBytes")
     return StreamInput(sources=sources, expected_bytes=expected)
 
@@ -1514,19 +1526,35 @@ def _assert_expected_total_within_limit(video: StreamInput, audio: StreamInput, 
         raise ProtocolError("Known DASH input sizes exceed maxBytes.")
 
 
-def _allowed_cdn_host(host: str) -> bool:
-    return any(host == suffix or host.endswith(f".{suffix}") for suffix in ALLOWED_CDN_SUFFIXES)
-
-
-def _is_allowed_media_url(value: str) -> bool:
+def _site_for_referer(value: str) -> str | None:
     parsed = urlparse(value)
     host = (parsed.hostname or "").lower()
+    if parsed.scheme != "https":
+        return None
+    for site, policy in MEDIA_SITE_POLICIES.items():
+        if host in policy["referer_hosts"]:
+            return site
+    return None
+
+
+def _allowed_cdn_host(host: str, *, site: str) -> bool:
+    policy = MEDIA_SITE_POLICIES.get(site)
+    if policy is None:
+        return False
+    return any(host == suffix or host.endswith(f".{suffix}") for suffix in policy["cdn_suffixes"])
+
+
+def _is_allowed_media_url(value: str, *, referer: str) -> bool:
+    parsed = urlparse(value)
+    host = (parsed.hostname or "").lower()
+    site = _site_for_referer(referer)
     return (
         parsed.scheme == "https"
         and bool(host)
+        and site is not None
         and parsed.username is None
         and parsed.password is None
-        and _allowed_cdn_host(host)
+        and _allowed_cdn_host(host, site=site)
     )
 
 
@@ -1538,7 +1566,10 @@ def _media_request_headers(referer: str) -> dict[str, str]:
     # Keep the Origin aligned with the extension's narrow DNR rules.  The
     # referer still identifies the allowed video or live page origin, while the
     # host never accepts a caller-provided header object.
-    origin = "https://www.bilibili.com"
+    site = _site_for_referer(referer)
+    if site is None:
+        raise ProtocolError("referer must be a supported page origin.")
+    origin = str(MEDIA_SITE_POLICIES[site]["origin"])
     return {
         "Accept": "*/*",
         "Origin": origin,

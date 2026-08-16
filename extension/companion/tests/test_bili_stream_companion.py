@@ -653,6 +653,85 @@ def test_protocol_rejects_cookies_custom_headers_and_non_cdn_api_urls(tmp_path: 
     )
 
 
+def test_live_media_policies_pair_each_referer_with_its_own_cdn_family() -> None:
+    pairs = [
+        (
+            "https://live.bilibili.com/123",
+            "https://live.bilivideo.com/live.flv?token=redacted",
+            "https://www.bilibili.com",
+        ),
+        (
+            "https://www.douyu.com/999001",
+            "https://fixture.douyucdn.cn/live/stream.flv?token=redacted",
+            "https://www.douyu.com",
+        ),
+        (
+            "https://www.huya.com/fixture-anchor",
+            "https://tx.flv.huya.com/src/stream.flv?token=redacted",
+            "https://www.huya.com",
+        ),
+        (
+            "https://www.huya.com/fixture-anchor",
+            "https://redirect.mobgslb.tbcache.com/src/stream.flv?token=redacted",
+            "https://www.huya.com",
+        ),
+    ]
+    for referer, source, origin in pairs:
+        safe_referer = companion._safe_referer(referer, default="")
+        assert companion._source_list([source], referer=safe_referer) == (source,)
+        headers = companion._media_request_headers(safe_referer)
+        assert headers["Origin"] == origin
+        assert headers["Referer"] == safe_referer
+
+    cross_site_pairs = [
+        ("https://www.douyu.com/", "https://tx.flv.huya.com/src/stream.flv"),
+        ("https://www.huya.com/", "https://fixture.douyucdn.cn/live/stream.flv"),
+        ("https://live.bilibili.com/", "https://redirect.mobgslb.tbcache.com/live.flv"),
+        ("https://www.huya.com/", "https://api.huya.com/live/stream.flv"),
+        ("https://www.douyu.com/", "http://fixture.douyucdn.cn/live/stream.flv"),
+    ]
+    for referer, source in cross_site_pairs:
+        assert_raises(
+            companion.ProtocolError,
+            lambda referer=referer, source=source: companion._source_list([source], referer=referer),
+        )
+
+
+def test_redirect_policy_allows_huya_cdn_failover_and_rejects_cross_site_targets() -> None:
+    handler = companion.SafeMediaRedirectHandler()
+    original = companion.Request(
+        "https://tx.flv.huya.com/src/stream.flv?token=redacted",
+        headers={"Referer": "https://www.huya.com/"},
+    )
+    allowed = handler.redirect_request(
+        original,
+        None,
+        302,
+        "Found",
+        {},
+        "https://redirect.mobgslb.tbcache.com/src/stream.flv?token=redacted",
+    )
+    assert allowed is not None
+    assert allowed.full_url.startswith("https://redirect.mobgslb.tbcache.com/")
+
+    for target in [
+        "https://fixture.douyucdn.cn/live/stream.flv?token=redacted",
+        "https://api.huya.com/live/stream.flv?token=redacted",
+        "http://redirect.mobgslb.tbcache.com/src/stream.flv?token=redacted",
+    ]:
+        assert_raises(
+            HTTPError,
+            lambda target=target: handler.redirect_request(
+                original,
+                None,
+                302,
+                "Found",
+                {},
+                target,
+            ),
+        )
+
+
 def test_native_message_framing_round_trips_a_single_safe_event() -> None:
     stream = io.BytesIO()
     event = {"version": 1, "type": "pong", "requestId": "ping_1"}

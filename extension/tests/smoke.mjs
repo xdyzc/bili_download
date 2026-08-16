@@ -574,7 +574,7 @@ test("background loads Bangumi episodes and prepares PGC DASH downloads", async 
 });
 
 
-test("background unlocks Bangumi high qualities by probing PGC DASH per quality", async () => {
+test("background defers Bangumi high-quality validation until download preparation", async () => {
   const code = await readFile("extension/src/background.js", "utf8");
   const fetchUrls = [];
 
@@ -730,9 +730,11 @@ test("background unlocks Bangumi high qualities by probing PGC DASH per quality"
 
   const quality80 = video.qualities.find((quality) => quality.code === 80);
   assert.equal(quality80.available, true);
-  assert.equal(quality80.mode, "dash");
+  assert.equal(quality80.mode, "");
   assert.equal(video.currentQuality, 80);
-  assert.ok(fetchUrls.some((url) => url.includes("/pgc/player/web/playurl") && url.includes("qn=80") && url.includes("fnval=4048")));
+  const playUrlRequests = fetchUrls.filter((url) => url.includes("/pgc/player/web/playurl"));
+  assert.equal(playUrlRequests.length, 1);
+  assert.ok(playUrlRequests[0].includes("qn=127"));
 });
 
 
@@ -947,6 +949,7 @@ test("background loads qualities and starts direct browser downloads", async () 
   assert.equal(completedTask.segments[0].receivedBytes, 10);
   assert.ok(fetchUrls.some((url) => url.includes("/x/web-interface/nav")));
   assert.ok(fetchUrls.some((url) => url.includes("fnval=4048")));
+  assert.equal(fetchUrls.filter((url) => url.includes("/x/player/playurl")).length, 1);
 
   const diagnosticResponse = await sendRuntimeMessage(messageListener, {
     type: "BILI_DOWNLOAD_GET_DIAGNOSTIC"
@@ -1096,6 +1099,164 @@ test("background loads qualities and starts direct browser downloads", async () 
   assert.equal(downloadOptions.length, 3);
   assert.equal(downloadOptions[2].url, "https://recovered-primary.hdslb.test/next.mp4?token=next-secret");
   assert.doesNotMatch(JSON.stringify(storage.directDownloadTasks), /current-secret|next-secret/);
+});
+
+
+test("background evicts failed playurl requests and deduplicates retries", async () => {
+  const code = await readFile("extension/src/background.js", "utf8");
+  let playUrlAttempts = 0;
+  const sandbox = {
+    Array,
+    Date,
+    Error,
+    Number,
+    Promise,
+    String,
+    URL,
+    URLSearchParams,
+    clearTimeout,
+    setTimeout,
+    chrome: {
+      runtime: {
+        onMessage: { addListener() {} },
+        onConnect: { addListener() {} }
+      },
+      declarativeNetRequest: {
+        onRuleMatchedDebug: { addListener() {} }
+      },
+      storage: {
+        local: {
+          async get() { return {}; },
+          async set() {}
+        }
+      }
+    },
+    fetch: async (url) => {
+      if (!String(url).includes("/x/player/playurl")) {
+        throw new Error(`unexpected fetch: ${url}`);
+      }
+      playUrlAttempts += 1;
+      if (playUrlAttempts === 1) {
+        throw new Error("temporary playurl failure");
+      }
+      return jsonResponse({
+        code: 0,
+        data: {
+          quality: 80,
+          format: "dash",
+          accept_quality: [80],
+          accept_description: ["1080P"],
+          durl: [],
+          dash: {
+            video: [{ id: 80, base_url: "https://video.bilivideo.com/80.m4s" }],
+            audio: [{ id: 30280, base_url: "https://audio.bilivideo.com/audio.m4s" }]
+          }
+        }
+      });
+    }
+  };
+
+  vm.createContext(sandbox);
+  vm.runInContext(code, sandbox);
+  const request = { bvid: "BV1CACHEFAIL1", cid: 123, quality: 80 };
+  await assert.rejects(sandbox.fetchMediaPlayUrlCached(request), /temporary playurl failure/);
+  const [first, second] = await Promise.all([
+    sandbox.fetchMediaPlayUrlCached(request),
+    sandbox.fetchMediaPlayUrlCached(request)
+  ]);
+  assert.equal(playUrlAttempts, 2);
+  assert.equal(first, second);
+
+  await sandbox.fetchMediaPlayUrlCached({ ...request, cid: 456 });
+  assert.equal(playUrlAttempts, 3);
+});
+
+
+test("background starts native downloads before slow task persistence completes", async () => {
+  const code = await readFile("extension/src/background.js", "utf8");
+  let releaseStorage;
+  const storageGate = new Promise((resolve) => {
+    releaseStorage = resolve;
+  });
+  const downloadOptions = [];
+  const sandbox = {
+    Array,
+    Date,
+    Error,
+    Number,
+    Promise,
+    String,
+    URL,
+    URLSearchParams,
+    clearTimeout,
+    setTimeout,
+    chrome: {
+      runtime: {
+        lastError: null,
+        onMessage: { addListener() {} },
+        onConnect: { addListener() {} }
+      },
+      declarativeNetRequest: {
+        onRuleMatchedDebug: { addListener() {} }
+      },
+      downloads: {
+        download(options, callback) {
+          downloadOptions.push(options);
+          callback(1);
+        },
+        search(_query, callback) {
+          callback([{
+            id: 1,
+            state: "in_progress",
+            bytesReceived: 0,
+            totalBytes: 1024,
+            paused: false
+          }]);
+        },
+        onChanged: { addListener() {} }
+      },
+      storage: {
+        local: {
+          async get() { return {}; },
+          async set() { await storageGate; }
+        }
+      }
+    },
+    fetch: async () => {
+      throw new Error("media should be handed directly to Chrome");
+    }
+  };
+
+  vm.createContext(sandbox);
+  vm.runInContext(code, sandbox);
+  const startPromise = sandbox.startDirectDownload({
+    prepared: {
+      mode: "durl",
+      format: "mp4",
+      segments: [{
+        url: "https://primary.hdslb.test/video.mp4",
+        filename: "BiliDownload/Fast Start.mp4",
+        size: 1024,
+        candidates: [{ url: "https://primary.hdslb.test/video.mp4", kind: "primary", size: 1024 }],
+        context: {
+          bvid: "BV1FASTSTART1",
+          cid: 123,
+          quality: 80,
+          title: "Fast Start",
+          source: "video",
+          segmentIndex: 1,
+          segmentCount: 1,
+          format: "mp4"
+        }
+      }]
+    }
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(downloadOptions.length, 1);
+  releaseStorage();
+  const task = await startPromise;
+  assert.equal(task.state, "in_progress");
 });
 
 
@@ -1471,7 +1632,7 @@ test("background reads browser cookie account and prepares DASH streams", async 
       { url: "https://audio-backup.bilivideo.com/audio-high.m4s", kind: "backup", size: 2 * 1024 * 1024 }
     ]
   );
-  assert.ok(fetchUrls.some((url) => url.includes("fnval=0")));
+  assert.equal(fetchUrls.filter((url) => url.includes("/x/player/playurl")).length, 1);
   assert.ok(fetchUrls.some((url) => url.includes("fnval=4048")));
 });
 
@@ -1669,7 +1830,7 @@ test("background loads live rooms and prepares FLV recording streams", async () 
 });
 
 
-test("background probes missing DASH media sizes from response headers", async () => {
+test("background estimates missing DASH media sizes without probing media URLs", async () => {
   const code = await readFile("extension/src/background.js", "utf8");
   const fetchCalls = [];
 
@@ -1770,12 +1931,6 @@ test("background probes missing DASH media sizes from response headers", async (
           }
         });
       }
-      if (value.includes("no-size-video.m4s") && options.method === "HEAD") {
-        return headersOnlyResponse(30 * 1024 * 1024);
-      }
-      if (value.includes("no-size-audio.m4s") && options.method === "HEAD") {
-        return headersOnlyResponse(2 * 1024 * 1024);
-      }
       throw new Error(`unexpected fetch: ${url}`);
     }
   };
@@ -1788,11 +1943,11 @@ test("background probes missing DASH media sizes from response headers", async (
     title: "Size Probe Video",
     url: "https://www.bilibili.com/video/BV1SIZEPROBE1/"
   });
-  assert.equal(video.qualities[0].estimatedSize, 32 * 1024 * 1024);
-  assert.equal(video.qualities[0].estimatedSizeSource, "headers");
-  assert.equal(video.qualities[0].estimatedSizeApproximate, false);
-  assert.ok(fetchCalls.some((call) => call.method === "HEAD" && call.url.includes("no-size-video.m4s")));
-  assert.ok(fetchCalls.some((call) => call.method === "HEAD" && call.url.includes("no-size-audio.m4s")));
+  assert.equal(video.qualities[0].estimatedSize, Math.round(((1_500_000 + 192_000) * 60) / 8));
+  assert.equal(video.qualities[0].estimatedSizeSource, "bandwidth");
+  assert.equal(video.qualities[0].estimatedSizeApproximate, true);
+  assert.equal(fetchCalls.some((call) => call.url.includes("no-size-video.m4s")), false);
+  assert.equal(fetchCalls.some((call) => call.url.includes("no-size-audio.m4s")), false);
 });
 
 
@@ -2297,7 +2452,7 @@ test("background marks login-only qualities unavailable without downgrading", as
   assert.equal(video.currentQuality, 64);
   assert.deepEqual(video.qualities.map((item) => [item.code, item.available, item.mode, item.reason]), [
     [80, false, "", "login-required"],
-    [64, true, "direct", ""],
+    [64, true, "", ""],
     [32, true, "dash", ""]
   ]);
 
@@ -6381,21 +6536,6 @@ function jsonResponse(payload) {
   return {
     ok: true,
     json: async () => payload
-  };
-}
-
-
-function headersOnlyResponse(contentLength, status = 200) {
-  return {
-    ok: status >= 200 && status < 300,
-    status,
-    headers: {
-      get(name) {
-        return String(name).toLowerCase() === "content-length"
-          ? String(contentLength)
-          : "";
-      }
-    }
   };
 }
 

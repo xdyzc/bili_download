@@ -6,7 +6,8 @@ const BATCH_DOWNLOAD_JOB_STORAGE_KEY = "batchDownloadJobs";
 const DNR_TEST_TYPES = ["main_frame", "other", "media", "xmlhttprequest"];
 const PROGRESS_MESSAGE_TYPE = "BILI_DOWNLOAD_PAGE_PROGRESS";
 const PROGRESS_PORT_NAME = "BILI_DOWNLOAD_PROGRESS_PORT";
-const SIZE_PROBE_TIMEOUT_MS = 2500;
+const PLAY_URL_CACHE_TTL_MS = 45 * 1000;
+const PLAY_URL_CACHE_LIMIT = 40;
 const DIRECT_DOWNLOAD_TASK_HISTORY_LIMIT = 20;
 const BATCH_DOWNLOAD_JOB_HISTORY_LIMIT = 20;
 const DIRECT_DOWNLOAD_SNAPSHOT_MIN_INTERVAL_MS = 1500;
@@ -52,6 +53,7 @@ let batchDownloadJobSequence = 0;
 let batchDownloadJobsRestored = false;
 let batchDownloadJobsRestorePromise = null;
 let batchDownloadJobsPersistOperation = Promise.resolve();
+const playUrlCache = new Map();
 
 configureSidePanelBehavior();
 chrome.runtime.onInstalled?.addListener(configureSidePanelBehavior);
@@ -320,6 +322,7 @@ if (chrome.declarativeNetRequest?.onRuleMatchedDebug) {
 }
 
 async function loadVideo(page) {
+  restoreDirectDownloadTasks().catch(() => {});
   if (isBangumiPage(page)) {
     return loadBangumi(page);
   }
@@ -348,9 +351,10 @@ async function loadVideo(page) {
     throw new Error("Could not find the video cid.");
   }
 
-  const playUrl = await fetchPlayUrl({
+  const playUrl = await fetchMediaPlayUrlCached({
     bvid,
-    cid: videoPage.cid
+    cid: videoPage.cid,
+    tabId: normalizeTabId(page?.tabId)
   });
   const availability = await buildQualityAvailability({
     bvid,
@@ -405,7 +409,8 @@ async function loadBangumi(page) {
     throw new Error("Could not find a playable Bangumi episode.");
   }
 
-  const playUrl = await fetchPgcPlayUrl({
+  const playUrl = await fetchMediaPlayUrlCached({
+    bvid: episode.bvid,
     epId: episode.epId,
     cid: episode.cid,
     tabId
@@ -579,7 +584,7 @@ async function startDirectDownload(payload) {
   const task = createDirectDownloadTask(prepared, normalizeTabId(payload?.tabId));
   directDownloadTasks.set(task.id, task);
   pruneDirectDownloadTasks(task.id);
-  await persistDirectDownloadTasks({ force: true });
+  persistDirectDownloadTasks({ force: true }).catch(() => {});
   await queueDirectDownloadTask(task, () => advanceDirectDownloadTask(task));
   return snapshotDirectDownloadTask(task);
 }
@@ -708,18 +713,19 @@ async function startDirectDownloadSegment(task, segment) {
     filename: segment.filename,
     context
   });
-  diagnostic.phase = "probing-dnr";
-  diagnostic.dnr = await testDnrRules(candidate.url);
+  diagnostic.phase = "starting-download";
   segment.diagnostic = diagnostic;
   segment.candidateDiagnostics.push(diagnostic);
   task.state = "starting";
   task.error = "";
-  await setLastDiagnostic(diagnostic);
-  await publishDirectDownloadTask(task);
+  relayProgress(directDownloadTaskProgress(task), task.tabId);
+  const dnrPromise = testDnrRules(candidate.url).catch((error) => ({
+    available: false,
+    error: error.message,
+    checks: []
+  }));
 
   try {
-    diagnostic.phase = "starting-download";
-    await setLastDiagnostic(diagnostic);
     if (await honorPendingDirectTaskControl(task, segment)) {
       return;
     }
@@ -736,6 +742,7 @@ async function startDirectDownloadSegment(task, segment) {
       taskId: task.id,
       segmentIndex: segment.index
     });
+    diagnostic.dnr = await dnrPromise;
     if (await honorPendingDirectTaskControl(task, segment, downloadId)) {
       return;
     }
@@ -3161,7 +3168,7 @@ async function prepareDirectDownload(payload) {
     throw new Error("Missing video, cid, or quality.");
   }
 
-  const playUrl = await fetchMediaPlayUrl({ bvid, epId, cid, quality, tabId });
+  const playUrl = await fetchMediaPlayUrlCached({ bvid, epId, cid, quality, tabId });
   if (source === "bangumi") {
     assertPlayablePgc(playUrl);
   }
@@ -3192,7 +3199,7 @@ async function prepareDirectDownload(payload) {
     });
   }
 
-  const directPlayUrl = await fetchMediaPlayUrl({ bvid, epId, cid, quality, fnval: 0, tabId });
+  const directPlayUrl = await fetchMediaPlayUrlCached({ bvid, epId, cid, quality, fnval: 0, tabId });
   if (source === "bangumi") {
     assertPlayablePgc(directPlayUrl);
   }
@@ -3224,7 +3231,7 @@ async function prepareAudioDownload(payload) {
     throw new Error("Missing video or cid.");
   }
 
-  const playUrl = await fetchMediaPlayUrl({ bvid, epId, cid, tabId });
+  const playUrl = await fetchMediaPlayUrlCached({ bvid, epId, cid, tabId });
   if (epId) {
     assertPlayablePgc(playUrl);
   }
@@ -3429,6 +3436,74 @@ async function fetchMediaPlayUrl({ bvid, epId, cid, quality, fnval = 4048, tabId
   return fetchPlayUrl({ bvid, cid, quality, fnval });
 }
 
+function fetchMediaPlayUrlCached(params) {
+  const now = Date.now();
+  const key = playUrlCacheKey(params);
+  const cached = playUrlCache.get(key);
+  if (cached && cached.expiresAt > now) {
+    return cached.promise;
+  }
+  if (cached) {
+    playUrlCache.delete(key);
+  }
+
+  const entry = {
+    expiresAt: now + PLAY_URL_CACHE_TTL_MS,
+    promise: null
+  };
+  entry.promise = fetchMediaPlayUrl(params).then((playUrl) => {
+    cachePlayUrlAliases(params, playUrl, entry);
+    return playUrl;
+  }, (error) => {
+    removePlayUrlCacheEntry(entry);
+    throw error;
+  });
+  playUrlCache.set(key, entry);
+  prunePlayUrlCache(now);
+  return entry.promise;
+}
+
+function playUrlCacheKey({ bvid, epId, cid, quality, fnval = 4048, tabId = null }) {
+  const sourceId = epId ? `ep:${normalizeId(epId)}` : `bv:${normalizeBvid(bvid)}`;
+  const requestQuality = Number(quality) || 127;
+  const pageContext = epId ? (normalizeTabId(tabId) || 0) : 0;
+  return [sourceId, Number(cid) || 0, requestQuality, Number(fnval) || 0, pageContext].join(":");
+}
+
+function cachePlayUrlAliases(params, playUrl, entry) {
+  const qualities = new Set([
+    Number(params?.quality) || 127,
+    responseQuality(playUrl),
+    ...(playUrl?.dashVideos || []).map((stream) => Number(stream.id))
+  ]);
+  for (const quality of qualities) {
+    if (!quality) {
+      continue;
+    }
+    playUrlCache.set(playUrlCacheKey({ ...params, quality }), entry);
+  }
+  prunePlayUrlCache();
+}
+
+function removePlayUrlCacheEntry(entry) {
+  for (const [key, cached] of playUrlCache) {
+    if (cached === entry) {
+      playUrlCache.delete(key);
+    }
+  }
+}
+
+function prunePlayUrlCache(now = Date.now()) {
+  for (const [key, entry] of playUrlCache) {
+    if (entry.expiresAt <= now) {
+      playUrlCache.delete(key);
+    }
+  }
+  while (playUrlCache.size > PLAY_URL_CACHE_LIMIT) {
+    playUrlCache.delete(playUrlCache.keys().next().value);
+  }
+}
+
 async function fetchBangumiSeason({ seasonId, epId, tabId = null }) {
   const params = new URLSearchParams();
   if (seasonId) {
@@ -3588,7 +3663,7 @@ function expectResult(payload) {
   return payload.result;
 }
 
-async function buildQualityAvailability({ bvid, epId = null, cid, playUrl, account, source = "video", tabId = null }) {
+async function buildQualityAvailability({ playUrl, account, source = "video" }) {
   const availability = new Map();
   const requestedCodes = Array.isArray(playUrl.accept_quality) ? playUrl.accept_quality : [];
 
@@ -3601,36 +3676,20 @@ async function buildQualityAvailability({ bvid, epId = null, cid, playUrl, accou
     await markQualityAvailable(availability, responseQuality(playUrl), "direct", playUrl);
   }
 
-  const missingCodes = requestedCodes
-    .map((code) => Number(code))
-    .filter((code) => Number.isFinite(code) && !availability.get(code)?.available);
-  await Promise.all(missingCodes.map(async (code) => {
-    try {
-      const dashPlayUrl = await fetchMediaPlayUrl({ bvid, epId, cid, quality: code, fnval: 4048, tabId });
-      if (hasDashQuality(dashPlayUrl, code)) {
-        await markQualityAvailable(availability, code, "dash", dashPlayUrl);
-        return;
-      }
-      if (hasExactDirectQuality(dashPlayUrl, code)) {
-        await markQualityAvailable(availability, code, "direct", dashPlayUrl);
-        return;
-      }
-
-      const directPlayUrl = await fetchMediaPlayUrl({ bvid, epId, cid, quality: code, fnval: 0, tabId });
-      if (hasExactDirectQuality(directPlayUrl, code)) {
-        await markQualityAvailable(availability, code, "direct", directPlayUrl);
-      }
-    } catch (_error) {
-      // The DASH response still gives us the advertised list; legacy direct probing is best effort.
-    }
-  }));
+  const confirmedQuality = responseQuality(playUrl);
+  if (confirmedQuality && !availability.has(confirmedQuality)) {
+    availability.set(confirmedQuality, deferredQualityInfo(account, null, true));
+  }
 
   for (const code of requestedCodes) {
     const numericCode = Number(code);
     if (!Number.isFinite(numericCode) || availability.has(numericCode)) {
       continue;
     }
-    availability.set(numericCode, unavailableQualityInfo(account, qualityRequirement(playUrl, numericCode, source)));
+    availability.set(numericCode, deferredQualityInfo(
+      account,
+      qualityRequirement(playUrl, numericCode, source)
+    ));
   }
 
   return availability;
@@ -3683,6 +3742,24 @@ function unavailableQualityInfo(account, requirement = null) {
     available: false,
     mode: "",
     reason: account?.isLogin ? "unavailable" : "login-required"
+  };
+}
+
+function deferredQualityInfo(account, requirement = null, confirmed = false) {
+  if (requirement?.needVip && !account?.vipLabel) {
+    return unavailableQualityInfo(account, requirement);
+  }
+  if (!confirmed && (requirement?.needLogin || !requirement) && !account?.isLogin) {
+    return unavailableQualityInfo(account, requirement);
+  }
+  return {
+    available: true,
+    mode: "",
+    reason: "",
+    estimatedSize: 0,
+    estimatedSizeSource: "",
+    estimatedSizeApproximate: false,
+    stream: null
   };
 }
 
@@ -4057,15 +4134,6 @@ async function resolveQualitySize(playUrl, quality, mode) {
     };
   }
 
-  const probedSize = await probeQualitySize(playUrl, quality, mode);
-  if (probedSize) {
-    return {
-      size: probedSize,
-      source: "headers",
-      approximate: false
-    };
-  }
-
   const bandwidthSize = estimateQualitySizeByBandwidth(playUrl, quality, mode);
   if (bandwidthSize) {
     return {
@@ -4113,168 +4181,6 @@ function estimateDirectQualitySize(playUrl) {
 function positiveSize(value) {
   const size = Number(value) || 0;
   return size > 0 ? size : 0;
-}
-
-async function probeQualitySize(playUrl, quality, mode) {
-  if (!playUrl || !mode) {
-    return 0;
-  }
-
-  if (mode === "dash") {
-    return probeDashQualitySize(playUrl, quality);
-  }
-
-  if (mode === "direct") {
-    return probeDirectQualitySize(playUrl);
-  }
-
-  return 0;
-}
-
-async function probeDashQualitySize(playUrl, quality) {
-  const videoStream = findBestDashVideo(playUrl, quality);
-  const audioStream = selectDashAudio(playUrl);
-  const sizes = await Promise.all([
-    probeDashStreamSize(videoStream),
-    probeDashStreamSize(audioStream)
-  ]);
-
-  if (sizes.some((size) => !size)) {
-    return 0;
-  }
-
-  return sizes.reduce((total, size) => total + size, 0);
-}
-
-async function probeDirectQualitySize(playUrl) {
-  const segments = buildDirectSegmentPlans(playUrl);
-  if (!segments.length) {
-    return 0;
-  }
-
-  const sizes = await Promise.all(segments.map((segmentPlan) => (
-    probeMediaSizeFromUrls(segmentPlan.candidates.map((candidate) => candidate.url))
-  )));
-
-  if (sizes.some((size) => !size)) {
-    return 0;
-  }
-
-  return sizes.reduce((total, size) => total + size, 0);
-}
-
-async function probeDashStreamSize(stream) {
-  if (!stream?.url) {
-    return 0;
-  }
-
-  const candidates = buildDashCandidates(stream).map((candidate) => candidate.url);
-  return probeMediaSizeFromUrls(candidates);
-}
-
-async function probeMediaSizeFromUrls(urls) {
-  const seen = new Set();
-  for (const url of urls || []) {
-    if (!url || seen.has(url)) {
-      continue;
-    }
-    seen.add(url);
-
-    const size = await probeMediaUrlSize(url);
-    if (size) {
-      return size;
-    }
-  }
-
-  return 0;
-}
-
-async function probeMediaUrlSize(url) {
-  const headSize = await probeMediaUrlHeadSize(url);
-  if (headSize) {
-    return headSize;
-  }
-
-  return probeMediaUrlRangeSize(url);
-}
-
-async function probeMediaUrlHeadSize(url) {
-  try {
-    const response = await fetchWithTimeout(url, {
-      method: "HEAD",
-      credentials: "include",
-      cache: "no-store",
-      headers: {
-        "Accept": "*/*"
-      }
-    });
-    if (!response?.ok) {
-      return 0;
-    }
-    return contentLengthFromHeaders(response.headers);
-  } catch (_error) {
-    return 0;
-  }
-}
-
-async function probeMediaUrlRangeSize(url) {
-  try {
-    const response = await fetchWithTimeout(url, {
-      method: "GET",
-      credentials: "include",
-      cache: "no-store",
-      headers: {
-        "Accept": "*/*",
-        "Range": "bytes=0-0"
-      }
-    });
-    if (response?.status !== 206) {
-      return 0;
-    }
-
-    return contentRangeTotal(response.headers.get("content-range")) ||
-      contentLengthFromHeaders(response.headers);
-  } catch (_error) {
-    return 0;
-  }
-}
-
-async function fetchWithTimeout(url, options) {
-  const controller = typeof AbortController === "function" ? new AbortController() : null;
-  let timeoutId = null;
-  try {
-    const fetchOptions = controller
-      ? {
-        ...options,
-        signal: controller.signal
-      }
-      : options;
-    const timeout = new Promise((resolve) => {
-      timeoutId = setTimeout(() => {
-        controller?.abort();
-        resolve(null);
-      }, SIZE_PROBE_TIMEOUT_MS);
-    });
-    return await Promise.race([
-      fetch(url, fetchOptions),
-      timeout
-    ]);
-  } catch (_error) {
-    return null;
-  } finally {
-    if (timeoutId !== null) {
-      clearTimeout(timeoutId);
-    }
-  }
-}
-
-function contentLengthFromHeaders(headers) {
-  return positiveSize(headers?.get?.("content-length"));
-}
-
-function contentRangeTotal(value) {
-  const match = String(value || "").match(/\/(\d+)$/);
-  return match ? positiveSize(match[1]) : 0;
 }
 
 function estimateQualitySizeByBandwidth(playUrl, quality, mode) {

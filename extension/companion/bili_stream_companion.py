@@ -141,6 +141,7 @@ class TaskContext:
     source_lock: threading.Lock = field(default_factory=threading.Lock)
     connection_lock: threading.Lock = field(default_factory=threading.Lock)
     active_responses: list[Any] = field(default_factory=list)
+    live_part_paths: set[Path] = field(default_factory=set)
     source_version: int = 0
     dash_video: StreamInput | None = None
     dash_audio: StreamInput | None = None
@@ -211,6 +212,18 @@ class TaskContext:
                 response.close()
             except OSError:
                 pass
+
+    def track_live_part(self, path: Path) -> None:
+        with self.connection_lock:
+            self.live_part_paths.add(path)
+
+    def release_live_part(self, path: Path) -> None:
+        with self.connection_lock:
+            self.live_part_paths.discard(path)
+
+    def live_parts_snapshot(self) -> tuple[Path, ...]:
+        with self.connection_lock:
+            return tuple(self.live_part_paths)
 
 
 class StreamDownloader:
@@ -402,6 +415,7 @@ class CompanionHost:
         self._reservations: dict[str, int] = {}
         self._output_reservations: set[Path] = set()
         self._tasks_lock = threading.Lock()
+        self._emit_enabled = True
 
     def handle(self, message: Mapping[str, Any]) -> TaskContext | None:
         if not isinstance(message, Mapping):
@@ -439,8 +453,25 @@ class CompanionHost:
     def emit(self, event: Mapping[str, Any]) -> None:
         # Callers only pass protocol primitives deliberately constructed in this
         # module.  Source URLs and raw exceptions never enter this boundary.
-        payload = {"version": PROTOCOL_VERSION, **event}
-        self._emit_callback(payload)
+        if self._emit_enabled:
+            payload = {"version": PROTOCOL_VERSION, **event}
+            self._emit_callback(payload)
+
+    def shutdown(self, timeout_seconds: float = 5.0) -> None:
+        """Cancel active work and give workers a bounded cleanup window."""
+        self._emit_enabled = False
+        with self._tasks_lock:
+            contexts = tuple(self._tasks.values())
+        for context in contexts:
+            context.cancel_event.set()
+            context.source_event.set()
+            context.close_active_responses()
+        deadline = time.monotonic() + max(float(timeout_seconds), 0.0)
+        for context in contexts:
+            thread = context.thread
+            if thread is None or thread is threading.current_thread():
+                continue
+            thread.join(max(deadline - time.monotonic(), 0.0))
 
     def _start_dash(self, message: Mapping[str, Any], request_id: str) -> TaskContext:
         task_id = _task_id(message.get("taskId"))
@@ -562,7 +593,7 @@ class CompanionHost:
                 self._release_storage_locked(context.task_id)
                 self._release_output_path_locked(context.output_path)
             _cleanup_dash_artifacts(context.output_path, context.task_id)
-            _cleanup_live_part_files(context.output_path)
+            _cleanup_live_part_files(context)
             raise
 
     def _claim_output_path(self, output_name: str, *, reserve_suffix: str = "") -> Path:
@@ -773,7 +804,15 @@ class CompanionHost:
             self._ensure_mux_space(context, context.bytes_written)
             mux_temp = _dash_mux_temp_path(context.output_path, context.task_id)
             mux_temp.unlink(missing_ok=True)
-            self._muxer(video_part, audio_part, mux_temp)
+            if self._muxer is mux_with_ffmpeg:
+                mux_with_ffmpeg(
+                    video_part,
+                    audio_part,
+                    mux_temp,
+                    cancel_event=context.cancel_event,
+                )
+            else:
+                self._muxer(video_part, audio_part, mux_temp)
             if context.cancel_event.is_set():
                 raise CanceledError()
             try:
@@ -787,7 +826,7 @@ class CompanionHost:
                 "bytesWritten": context.bytes_written,
                 "completedAt": _utc_timestamp(),
             })
-            _write_manifest(context)
+            manifest_updated = self._write_terminal_manifest(context)
             self.emit({
                 "type": "completed",
                 "taskId": context.task_id,
@@ -795,6 +834,7 @@ class CompanionHost:
                 "outputName": context.output_name,
                 "bytesWritten": context.bytes_written,
                 "manifest": context.manifest_path.name,
+                "manifestUpdated": manifest_updated,
             })
         except CanceledError:
             context.bytes_written = _existing_size(video_part) + _existing_size(audio_part)
@@ -834,6 +874,7 @@ class CompanionHost:
                 segment_index = context.segment_count
                 segment_path = _live_segment_path(context.output_path, segment_index)
                 part_path = segment_path.with_name(f"{segment_path.name}.part")
+                context.track_live_part(part_path)
                 segment_started = self._clock()
                 segment_deadline = min(deadline, segment_started + context.segment_seconds)
                 remaining = context.max_bytes - context.bytes_written
@@ -865,6 +906,7 @@ class CompanionHost:
                 if bytes_in_segment > 0:
                     segment_path.parent.mkdir(parents=True, exist_ok=True)
                     part_path.replace(segment_path)
+                    context.release_live_part(part_path)
                     context.bytes_written += bytes_in_segment
                     reason = result.reason if result else "source_error"
                     context.manifest["segments"].append({
@@ -878,6 +920,7 @@ class CompanionHost:
                     _write_manifest(context)
                 else:
                     part_path.unlink(missing_ok=True)
+                    context.release_live_part(part_path)
 
                 if result is not None and result.reason in {"duration", "disk_limit"}:
                     self._finish_live_stop(context, result.reason)
@@ -934,7 +977,7 @@ class CompanionHost:
         except Exception:
             self._finish_failed(context, CompanionError("internal_error", "The local live task stopped unexpectedly."))
         finally:
-            _cleanup_live_part_files(context.output_path)
+            _cleanup_live_part_files(context)
             self._release_task(context)
 
     def _record_live_connection(
@@ -1050,7 +1093,7 @@ class CompanionHost:
             "segmentCount": len(context.manifest.get("segments", [])),
             "completedAt": _utc_timestamp(),
         })
-        _write_manifest(context)
+        manifest_updated = self._write_terminal_manifest(context)
         self.emit({
             "type": "completed",
             "taskId": context.task_id,
@@ -1059,6 +1102,7 @@ class CompanionHost:
             "bytesWritten": context.bytes_written,
             "segmentCount": len(context.manifest.get("segments", [])),
             "manifest": context.manifest_path.name,
+            "manifestUpdated": manifest_updated,
         })
 
     def _finish_canceled(self, context: TaskContext) -> None:
@@ -1067,7 +1111,7 @@ class CompanionHost:
             "bytesWritten": context.bytes_written,
             "completedAt": _utc_timestamp(),
         })
-        _write_manifest(context)
+        manifest_updated = self._write_terminal_manifest(context)
         self.emit({
             "type": "canceled",
             "taskId": context.task_id,
@@ -1075,6 +1119,7 @@ class CompanionHost:
             "outputName": context.output_name,
             "bytesWritten": context.bytes_written,
             "manifest": context.manifest_path.name,
+            "manifestUpdated": manifest_updated,
         })
 
     def _finish_failed(self, context: TaskContext, error: CompanionError) -> None:
@@ -1084,7 +1129,7 @@ class CompanionHost:
             "bytesWritten": context.bytes_written,
             "completedAt": _utc_timestamp(),
         })
-        _write_manifest(context)
+        manifest_updated = self._write_terminal_manifest(context)
         self.emit({
             "type": "failed",
             "taskId": context.task_id,
@@ -1092,9 +1137,18 @@ class CompanionHost:
             "outputName": context.output_name,
             "bytesWritten": context.bytes_written,
             "manifest": context.manifest_path.name,
+            "manifestUpdated": manifest_updated,
             "code": error.code,
             "message": error.message,
         })
+
+    @staticmethod
+    def _write_terminal_manifest(context: TaskContext) -> bool:
+        try:
+            _write_manifest(context)
+        except CompanionError:
+            return False
+        return True
 
     def _release_task(self, context: TaskContext) -> None:
         context.done_event.set()
@@ -1117,7 +1171,13 @@ class LiveConnectionResult:
     bytes_written: int
 
 
-def mux_with_ffmpeg(video_part: Path, audio_part: Path, output_path: Path) -> None:
+def mux_with_ffmpeg(
+    video_part: Path,
+    audio_part: Path,
+    output_path: Path,
+    *,
+    cancel_event: threading.Event | None = None,
+) -> None:
     ffmpeg = find_ffmpeg()
     if not ffmpeg:
         raise CompanionError("ffmpeg_missing", "FFmpeg is required to merge the local DASH streams.")
@@ -1135,16 +1195,27 @@ def mux_with_ffmpeg(video_part: Path, audio_part: Path, output_path: Path) -> No
         str(output_path),
     ]
     try:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             command,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            check=False,
         )
     except OSError as error:
         raise CompanionError("ffmpeg_start_failed", "FFmpeg could not be started.") from error
-    if completed.returncode != 0:
+    while process.poll() is None:
+        if cancel_event is not None and cancel_event.wait(0.1):
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2)
+            output_path.unlink(missing_ok=True)
+            raise CanceledError()
+        if cancel_event is None:
+            time.sleep(0.1)
+    if process.returncode != 0:
         raise CompanionError("mux_failed", "FFmpeg could not merge the local DASH streams.")
 
 
@@ -1185,6 +1256,7 @@ def run_native_host(
             emit({"version": PROTOCOL_VERSION, "type": "error", "code": "invalid_request", "message": "Invalid companion request."})
             continue
         if message is None:
+            host.shutdown()
             return 0
         try:
             host.handle(message)
@@ -1537,7 +1609,11 @@ def _unique_output_path(output_dir: Path, output_name: str, *, reserve_suffix: s
             raise ProtocolError("outputName escapes the companion output directory.") from error
         manifest = candidate.with_name(f"{candidate.name}{reserve_suffix}") if reserve_suffix else candidate.with_suffix(".manifest.json")
         dash_parts_exist = _dash_part_path(candidate, "video").exists() or _dash_part_path(candidate, "audio").exists()
-        live_parts_exist = any(output_dir.glob(f"{candidate.name}.segment-*.flv*"))
+        live_prefix = f"{candidate.name}.segment-"
+        try:
+            live_parts_exist = any(path.name.startswith(live_prefix) for path in output_dir.iterdir())
+        except OSError:
+            live_parts_exist = True
         if not candidate.exists() and not manifest.exists() and not dash_parts_exist and not live_parts_exist:
             return candidate
         index += 1
@@ -1570,17 +1646,14 @@ def _cleanup_dash_artifacts(output_path: Path, task_id: str) -> None:
             pass
 
 
-def _cleanup_live_part_files(output_path: Path) -> None:
-    pattern = f"{output_path.name}.segment-*.flv.part"
-    try:
-        candidates = tuple(output_path.parent.glob(pattern))
-    except OSError:
-        return
-    for path in candidates:
+def _cleanup_live_part_files(context: TaskContext) -> None:
+    for path in context.live_parts_snapshot():
         try:
             path.unlink(missing_ok=True)
         except OSError:
             pass
+        finally:
+            context.release_live_part(path)
 
 
 def _base_manifest(context: TaskContext) -> dict[str, Any]:

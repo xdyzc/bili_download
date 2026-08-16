@@ -259,7 +259,10 @@ py -3 -m unittest discover -s .\extension\companion\tests -v
 The MV3 extension integrates this host through `chrome.runtime.connectNative`
 only after the user explicitly enables the local streaming route in the side
 panel. The service worker, not the side panel, owns the runtime Native Messaging
-port so an open task remains observable when the side panel is closed.
+port so an open task remains observable when the side panel is closed. All active
+downloads share that port and one host process, allowing disk and output-path
+reservations to be enforced across concurrent tasks. The port is disconnected
+only after its final task reaches a terminal state.
 
 Only the in-memory start/refresh messages contain signed CDN candidates. The
 extension persists a task's safe page identifiers, basename, progress, and

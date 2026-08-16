@@ -321,16 +321,65 @@ def test_mux_rechecks_disk_space_and_does_not_call_muxer_when_space_drops(tmp_pa
 
 
 def test_ffmpeg_mux_never_reads_native_protocol_stdin() -> None:
+    process = SimpleNamespace(returncode=0, poll=lambda: 0)
     with patch.object(companion, "find_ffmpeg", return_value="ffmpeg") as _find, patch.object(
         companion.subprocess,
-        "run",
-        return_value=SimpleNamespace(returncode=0),
-    ) as run:
+        "Popen",
+        return_value=process,
+    ) as popen:
         companion.mux_with_ffmpeg(Path("video.part"), Path("audio.part"), Path("output.tmp"))
 
-    command = run.call_args.args[0]
+    command = popen.call_args.args[0]
     assert "-nostdin" in command
-    assert run.call_args.kwargs["stdin"] is companion.subprocess.DEVNULL
+    assert popen.call_args.kwargs["stdin"] is companion.subprocess.DEVNULL
+
+
+@with_tmp_path
+def test_live_cleanup_only_removes_parts_registered_by_the_task(tmp_path: Path) -> None:
+    context = companion.TaskContext(
+        task_id="cleanup_exact",
+        kind="live",
+        output_name="[x].flv",
+        output_path=tmp_path / "[x].flv",
+        manifest_path=tmp_path / "[x].flv.live.manifest.json",
+        referer="https://live.bilibili.com/1",
+        max_bytes=1024,
+    )
+    own_part = tmp_path / "[x].flv.segment-0001.flv.part"
+    unrelated_part = tmp_path / "x.flv.segment-0001.flv.part"
+    own_part.write_bytes(b"own")
+    unrelated_part.write_bytes(b"unrelated")
+    context.track_live_part(own_part)
+
+    companion._cleanup_live_part_files(context)
+
+    assert not own_part.exists()
+    assert unrelated_part.read_bytes() == b"unrelated"
+
+
+@with_tmp_path
+def test_terminal_event_survives_manifest_write_failure(tmp_path: Path) -> None:
+    events: list[dict] = []
+    host = companion.CompanionHost(output_dir=tmp_path, max_disk_bytes=1024, emit=events.append)
+    context = companion.TaskContext(
+        task_id="manifest_failure",
+        kind="dash",
+        output_name="safe.mp4",
+        output_path=tmp_path / "safe.mp4",
+        manifest_path=tmp_path / "safe.manifest.json",
+        referer="https://www.bilibili.com/",
+        max_bytes=1024,
+    )
+    with patch.object(
+        companion,
+        "_write_manifest",
+        side_effect=companion.CompanionError("local_io", "manifest failed"),
+    ):
+        host._finish_failed(context, companion.CompanionError("source_failed", "source failed"))
+
+    assert events[-1]["type"] == "failed"
+    assert events[-1]["code"] == "source_failed"
+    assert events[-1]["manifestUpdated"] is False
 
 
 def test_safe_output_names_reject_windows_devices_and_preserve_extension() -> None:
@@ -527,6 +576,40 @@ def test_cancel_closes_an_active_live_response_and_emits_a_safe_terminal_event(t
     assert any(event["type"] == "cancel_requested" for event in events)
     assert events[-1]["type"] == "canceled"
     assert "cancel-secret" not in json.dumps(events)
+
+
+@with_tmp_path
+def test_host_shutdown_cancels_workers_and_cleans_live_parts(tmp_path: Path) -> None:
+    source = "https://live.bilivideo.com/live.flv?token=shutdown-secret"
+    response = BlockingResponse()
+    host = companion.CompanionHost(
+        output_dir=tmp_path,
+        max_disk_bytes=4096,
+        opener=FakeOpener({source: [response]}),
+    )
+    task = host.handle({
+        "version": 1,
+        "type": "start_live",
+        "requestId": "shutdown_start",
+        "taskId": "shutdown_live",
+        "payload": {
+            "outputName": "[shutdown].flv",
+            "sources": [source],
+            "maxBytes": 1024,
+            "maxDurationSeconds": 60,
+            "segmentDurationSeconds": 60,
+        },
+    })
+    assert task is not None and task.thread is not None
+    wait_until(response.started.is_set)
+
+    host.shutdown(timeout_seconds=2)
+
+    assert not task.thread.is_alive()
+    assert response.closed
+    assert json.loads(task.manifest_path.read_text(encoding="utf-8"))["status"] == "canceled"
+    assert task.live_parts_snapshot() == ()
+    assert not list(tmp_path.glob("*.part"))
 
 
 @with_tmp_path

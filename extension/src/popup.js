@@ -2338,6 +2338,40 @@ async function loadOrWaitForBatchDirectTask(taskId, control, options = {}) {
   }
 }
 
+async function waitForBatchCancellationTerminal(task, timeoutMs = 15000) {
+  if (!task || isNativeDirectTaskTerminal(task)) {
+    return task;
+  }
+  beginNativeDirectTaskProgress(task);
+  if (typeof setTimeout !== "function") {
+    return waitForNativeDirectTask(task.taskId);
+  }
+  let timeout = null;
+  try {
+    try {
+      return await Promise.race([
+        waitForNativeDirectTask(task.taskId),
+        new Promise((_, reject) => {
+          timeout = setTimeout(
+            () => reject(new Error("等待浏览器确认取消超时。")),
+            timeoutMs
+          );
+        })
+      ]);
+    } catch (error) {
+      const latest = state.nativeDirectTasks.get(task.taskId);
+      if (isNativeDirectTaskTerminal(latest)) {
+        return latest;
+      }
+      throw error;
+    }
+  } finally {
+    if (timeout !== null && typeof clearTimeout === "function") {
+      clearTimeout(timeout);
+    }
+  }
+}
+
 async function cancelBatchJob(jobId) {
   const job = state.batchJobs.get(jobId) || await getBatchJob(jobId);
   if (!job || isBatchJobTerminal(job)) {
@@ -2363,14 +2397,16 @@ async function cancelBatchJob(jobId) {
   }
 
   let cancellationError = null;
-  const confirmedTasks = new Map();
   for (const taskId of directTaskIds) {
     try {
       const known = state.nativeDirectTasks.get(taskId);
       if (known && isNativeDirectTaskTerminal(known)) {
         continue;
       }
-      const task = await requestNativeDirectTaskControl(taskId, "cancel");
+      let task = await requestNativeDirectTaskControl(taskId, "cancel");
+      if (task?.state === "canceling") {
+        task = await waitForBatchCancellationTerminal(task);
+      }
       if (!task || !isNativeDirectTaskTerminal(task)) {
         throw new Error("未确认原生下载任务已经取消。");
       }
@@ -4122,7 +4158,13 @@ async function fetchMediaInExtensionRanges(url, filename, saveToDisk, progressCo
   const ranges = buildRanges(totalBytes, PARALLEL_RANGE_CHUNK_BYTES);
   const chunks = new Array(ranges.length);
   const rangeProgress = new Array(ranges.length).fill(0);
+  const attemptController = typeof AbortController !== "undefined"
+    ? new AbortController()
+    : { signal: undefined, abort() {} };
+  const downloadControl = state.downloadControl;
+  downloadControl?.abortControllers?.add(attemptController);
   let lastProgressAt = 0;
+  let attemptError = null;
 
   const emitRangeProgress = () => {
     const now = Date.now();
@@ -4141,22 +4183,45 @@ async function fetchMediaInExtensionRanges(url, filename, saveToDisk, progressCo
   try {
     let nextIndex = 0;
     const worker = async () => {
-      while (nextIndex < ranges.length) {
-        await waitForDownloadControl();
-        throwIfDownloadCanceled();
-        const rangeIndex = nextIndex;
-        nextIndex += 1;
-        chunks[rangeIndex] = await fetchRangeChunk(url, ranges[rangeIndex], (loadedBytes) => {
-          rangeProgress[rangeIndex] = loadedBytes;
+      try {
+        while (!attemptError && nextIndex < ranges.length) {
+          await waitForDownloadControl();
+          throwIfDownloadCanceled();
+          if (attemptError) {
+            return;
+          }
+          const rangeIndex = nextIndex;
+          nextIndex += 1;
+          chunks[rangeIndex] = await fetchRangeChunk(
+            url,
+            ranges[rangeIndex],
+            (loadedBytes) => {
+              rangeProgress[rangeIndex] = loadedBytes;
+              emitRangeProgress();
+            },
+            attemptController.signal
+          );
+          rangeProgress[rangeIndex] = ranges[rangeIndex].end - ranges[rangeIndex].start + 1;
           emitRangeProgress();
-        });
-        rangeProgress[rangeIndex] = ranges[rangeIndex].end - ranges[rangeIndex].start + 1;
-        emitRangeProgress();
+        }
+      } catch (error) {
+        if (!attemptError) {
+          attemptError = error;
+          attemptController.abort();
+        }
+        throw error;
       }
     };
 
     const workerCount = Math.min(PARALLEL_RANGE_CONCURRENCY, ranges.length);
-    await Promise.all(Array.from({ length: workerCount }, () => worker()));
+    const results = await Promise.allSettled(Array.from({ length: workerCount }, () => worker()));
+    if (attemptError) {
+      throw attemptError;
+    }
+    const rejected = results.find((result) => result.status === "rejected");
+    if (rejected) {
+      throw rejected.reason;
+    }
     await waitForDownloadControl();
     updateProgress({
       ...progressContext,
@@ -4206,10 +4271,13 @@ async function fetchMediaInExtensionRanges(url, filename, saveToDisk, progressCo
       filename,
       mode: "extension-range"
     };
+  } finally {
+    attemptController.abort();
+    downloadControl?.abortControllers?.delete(attemptController);
   }
 }
 
-async function fetchRangeChunk(url, range, onProgress) {
+async function fetchRangeChunk(url, range, onProgress, signal = undefined) {
   const expectedBytes = range.end - range.start + 1;
   await waitForDownloadControl();
   const response = await fetch(url, {
@@ -4219,7 +4287,7 @@ async function fetchRangeChunk(url, range, onProgress) {
       "Range": `bytes=${range.start}-${range.end}`
     },
     cache: "no-store",
-    signal: getDownloadAbortSignal()
+    signal: signal || getDownloadAbortSignal()
   });
 
   if (response.status !== 206) {

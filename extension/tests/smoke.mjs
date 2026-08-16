@@ -2779,6 +2779,7 @@ test("popup sends Bangumi episode ids for selected episode downloads", async () 
   const pageSelectAllButton = buttonElement();
 
   const sandbox = {
+    AbortController,
     Blob,
     Date,
     Error,
@@ -3723,6 +3724,7 @@ test("popup uses parallel extension range download for bilivideo media", async (
   let rangeCancelCalls = 0;
   let rangeBlobCalls = 0;
   let singleBlobCalls = 0;
+  let rangeAbortCalls = 0;
   class TestURL extends URL {
     static createObjectURL(blob) {
       const value = `blob:range-test/${objectUrls.length + 1}`;
@@ -3734,6 +3736,7 @@ test("popup uses parallel extension range download for bilivideo media", async (
   }
 
   const sandbox = {
+    AbortController,
     Blob,
     Date,
     Error,
@@ -3788,6 +3791,19 @@ test("popup uses parallel extension range download for bilivideo media", async (
             return new Blob([new Uint8Array(length)], { type: "video/mp4" });
           }
         };
+      }
+      if (rangeResponseMode === "fail-one") {
+        if (start === 0) {
+          return { ok: false, status: 500, statusText: "Failure", headers };
+        }
+        return new Promise((resolve, reject) => {
+          options.signal?.addEventListener?.("abort", () => {
+            rangeAbortCalls += 1;
+            const error = new Error("range aborted");
+            error.name = "AbortError";
+            reject(error);
+          });
+        });
       }
       return {
         ok: true,
@@ -3994,6 +4010,18 @@ test("popup uses parallel extension range download for bilivideo media", async (
   assert.equal(savedDiagnostic.extensionCandidateAttempts[0].fetch.concurrency, 3);
   assert.equal(savedDiagnostic.saved.method, "extension-blob");
   assert.equal(savedDiagnostic.saved.mode, "extension-range");
+
+  vm.runInContext("state.downloadControl = createDownloadControl();", sandbox);
+  rangeResponseMode = "fail-one";
+  const failedRange = await sandbox.fetchMediaInExtensionRanges(
+    "https://range.test/media",
+    "BiliDownload/fallback.mp4",
+    false,
+    { totalBytes: totalSize },
+    totalSize
+  );
+  assert.equal(failedRange.ok, false);
+  assert.ok(rangeAbortCalls >= 1, "a failed worker should abort the other in-flight ranges");
 
   rangeResponseMode = "oversized";
   await assert.rejects(
@@ -5485,6 +5513,7 @@ test("popup redacts signed diagnostics before sending them or copying them", asy
   };
 
   const sandbox = {
+    AbortController,
     Blob,
     Date,
     Error,
@@ -6014,12 +6043,21 @@ test("popup keeps task recovery tab-scoped and confirms restored batch downloads
         async sendMessage(message) {
           runtimeMessages.push(message);
           if (message.type === "BILI_DOWNLOAD_CONTROL_DIRECT") {
+            setImmediate(() => {
+              sandbox.receiveNativeDirectTaskProgress({
+                nativeDownload: true,
+                taskId: message.payload.taskId,
+                taskState: "canceled",
+                receivedBytes: 0,
+                totalBytes: 100
+              });
+            });
             return {
               ok: true,
               payload: {
                 taskId: message.payload.taskId,
                 tabId: 1,
-                state: "canceled",
+                state: "canceling",
                 receivedBytes: 0,
                 totalBytes: 100
               }

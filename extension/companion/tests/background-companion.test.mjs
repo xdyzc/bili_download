@@ -399,6 +399,41 @@ test("background companion starts DASH privately, relays progress, refreshes, ca
   assert.equal(completed.payload.state, "complete");
 });
 
+test("background companion shares one native host across concurrent tasks", async () => {
+  const harness = await createHarness();
+  const firstPromise = sendRuntimeMessage(harness.listeners.message, {
+    type: "BILI_DOWNLOAD_START_COMPANION",
+    payload: { tabId: 1, prepared: dashPrepared("first-concurrent") }
+  });
+  const secondPromise = sendRuntimeMessage(harness.listeners.message, {
+    type: "BILI_DOWNLOAD_START_COMPANION",
+    payload: { tabId: 2, prepared: dashPrepared("second-concurrent") }
+  });
+
+  await waitFor(() => harness.nativePorts.length === 1 && harness.nativePorts[0].sent.length === 2);
+  const native = harness.nativePorts[0];
+  const [firstStart, secondStart] = native.sent;
+  for (const message of [firstStart, secondStart]) {
+    native.emit({
+      version: 1,
+      type: "accepted",
+      requestId: message.requestId,
+      taskId: message.taskId,
+      kind: "dash"
+    });
+  }
+  const [first, second] = await Promise.all([firstPromise, secondPromise]);
+  assert.equal(first.ok, true);
+  assert.equal(second.ok, true);
+  assert.equal(harness.nativePorts.length, 1);
+
+  native.emit({ version: 1, type: "completed", taskId: firstStart.taskId, kind: "dash" });
+  await flush();
+  assert.equal(native.disconnected, false, "one completed task must not stop its sibling");
+  native.emit({ version: 1, type: "completed", taskId: secondStart.taskId, kind: "dash" });
+  await waitFor(() => native.disconnected);
+});
+
 test("background companion ping reports the fixed host and host failures never echo native diagnostics", async () => {
   const pingHarness = await createHarness({
     connectNative(host, ports) {

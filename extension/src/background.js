@@ -39,6 +39,7 @@ let directDownloadTasksLastPersistAt = 0;
 const directDownloadTaskPersistMetadata = new Map();
 const companionDownloadTasks = new Map();
 const companionDownloadPorts = new Map();
+let companionSharedDownloadPort = null;
 let companionDownloadTaskSequence = 0;
 let companionDownloadTasksRestored = false;
 let companionDownloadTasksRestorePromise = null;
@@ -1966,11 +1967,13 @@ async function connectCompanionDownloadPort(task, message, startRequestId) {
     throw new Error("The local companion task already has an active connection.");
   }
 
-  let port;
-  try {
-    port = chrome.runtime.connectNative(COMPANION_NATIVE_HOST_NAME);
-  } catch (_error) {
-    throw companionUnavailableError();
+  let port = companionSharedDownloadPort;
+  if (!port) {
+    try {
+      port = chrome.runtime.connectNative(COMPANION_NATIVE_HOST_NAME);
+    } catch (_error) {
+      throw companionUnavailableError();
+    }
   }
   if (!port?.onMessage?.addListener || !port?.onDisconnect?.addListener || !port?.postMessage) {
     try {
@@ -1980,6 +1983,7 @@ async function connectCompanionDownloadPort(task, message, startRequestId) {
     }
     throw companionUnavailableError();
   }
+  companionSharedDownloadPort = port;
 
   return new Promise((resolve, reject) => {
     const runtime = {
@@ -2033,6 +2037,9 @@ async function connectCompanionDownloadPort(task, message, startRequestId) {
       });
     };
     const onDisconnect = () => {
+      if (companionSharedDownloadPort === port) {
+        companionSharedDownloadPort = null;
+      }
       if (companionDownloadPorts.get(task.id) !== runtime) {
         return;
       }
@@ -2067,6 +2074,9 @@ async function connectCompanionDownloadPort(task, message, startRequestId) {
       port.postMessage(message);
     } catch (_error) {
       companionDownloadPorts.delete(task.id);
+      if (companionSharedDownloadPort === port) {
+        companionSharedDownloadPort = null;
+      }
       queueCompanionDownloadTask(task, () => (
         interruptCompanionDownloadTask(task, companionUnavailableMessage(), { force: true })
       )).finally(() => settleStart(companionUnavailableError()));
@@ -2393,10 +2403,13 @@ function releaseCompanionDownloadPort(taskId) {
   } catch (_error) {
     // A port can disappear while listeners are being removed.
   }
-  try {
-    runtime.port?.disconnect?.();
-  } catch (_error) {
-    // The task snapshot has already been safely persisted.
+  if (companionDownloadPorts.size === 0 && companionSharedDownloadPort === runtime.port) {
+    companionSharedDownloadPort = null;
+    try {
+      runtime.port?.disconnect?.();
+    } catch (_error) {
+      // The task snapshot has already been safely persisted.
+    }
   }
 }
 

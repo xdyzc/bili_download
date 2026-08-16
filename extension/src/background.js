@@ -54,6 +54,22 @@ let batchDownloadJobsRestored = false;
 let batchDownloadJobsRestorePromise = null;
 let batchDownloadJobsPersistOperation = Promise.resolve();
 const playUrlCache = new Map();
+const douyuTabResolutionOperations = new Map();
+
+const LIVE_SITE_ADAPTERS = Object.freeze({
+  bilibili: Object.freeze({
+    load: loadBilibiliLive,
+    prepare: prepareBilibiliLiveRecording
+  }),
+  douyu: Object.freeze({
+    load: loadDouyuLive,
+    prepare: prepareDouyuLiveRecording
+  }),
+  huya: Object.freeze({
+    load: loadHuyaLive,
+    prepare: prepareHuyaLiveRecording
+  })
+});
 
 configureSidePanelBehavior();
 chrome.runtime.onInstalled?.addListener(configureSidePanelBehavior);
@@ -448,6 +464,16 @@ async function loadBangumi(page) {
 }
 
 async function loadLive(page) {
+  const site = normalizeLiveSite(page?.site || siteFromUrl(page?.url));
+  return LIVE_SITE_ADAPTERS[site].load({ ...page, site });
+}
+
+async function prepareLiveRecording(payload) {
+  const site = normalizeLiveSite(payload?.site || siteFromUrl(payload?.url));
+  return LIVE_SITE_ADAPTERS[site].prepare({ ...payload, site });
+}
+
+async function loadBilibiliLive(page) {
   const roomId = normalizeId(page?.roomId) || extractLiveRoomId(page?.url);
   if (!roomId) {
     throw new Error("No live room id was found on this page.");
@@ -479,6 +505,8 @@ async function loadLive(page) {
 
   return {
     source: "live",
+    site: "bilibili",
+    roomKey: String(room.roomId),
     roomId: room.roomId,
     shortId: room.shortId,
     title,
@@ -491,7 +519,7 @@ async function loadLive(page) {
   };
 }
 
-async function prepareLiveRecording(payload) {
+async function prepareBilibiliLiveRecording(payload) {
   const roomId = normalizeId(payload?.roomId) || extractLiveRoomId(payload?.url);
   const title = payload?.title || (roomId ? `live_${roomId}` : "bili_live");
   const requestedQuality = Number(payload?.quality) || 0;
@@ -522,6 +550,8 @@ async function prepareLiveRecording(payload) {
     size: 0,
     candidates: stream.candidates,
     context: {
+      site: "bilibili",
+      roomKey: String(room.roomId),
       roomId: room.roomId,
       shortId: room.shortId,
       title,
@@ -543,6 +573,8 @@ async function prepareLiveRecording(payload) {
     count: 1,
     format: "flv",
     live: {
+      site: "bilibili",
+      roomKey: String(room.roomId),
       roomId: room.roomId,
       shortId: room.shortId,
       title,
@@ -633,6 +665,440 @@ function createDirectDownloadTask(prepared, tabId = null) {
     requestedAction: "",
     segments,
     operation: Promise.resolve()
+  };
+}
+
+async function loadDouyuLive(page) {
+  const roomKey = normalizeLiveRoomKey(page?.roomKey || extractLiveRoomKey(page?.url, "douyu"));
+  if (!/^\d+$/.test(roomKey)) {
+    throw new Error("没有识别到斗鱼直播间号。");
+  }
+  const room = normalizeDouyuRoom(await fetchJsonPreferPage(
+    `https://www.douyu.com/betard/${encodeURIComponent(roomKey)}`,
+    page?.tabId
+  ), roomKey);
+  const qualities = normalizeDouyuQualities(room.multirates);
+  return {
+    source: "live",
+    site: "douyu",
+    roomKey: String(room.roomId),
+    roomId: room.roomId,
+    title: room.title,
+    liveStatus: room.liveStatus,
+    liveStatusText: room.liveStatus === 1 ? "直播中" : "未开播",
+    anchorName: room.anchorName,
+    account: null,
+    currentQuality: qualities[0]?.code || null,
+    qualities
+  };
+}
+
+async function prepareDouyuLiveRecording(payload) {
+  const roomKey = normalizeLiveRoomKey(payload?.roomKey || payload?.roomId || extractLiveRoomKey(payload?.url, "douyu"));
+  if (!/^\d+$/.test(roomKey)) {
+    throw new Error("没有识别到斗鱼直播间号。");
+  }
+  const room = normalizeDouyuRoom(await fetchJsonPreferPage(
+    `https://www.douyu.com/betard/${encodeURIComponent(roomKey)}`,
+    payload?.tabId
+  ), roomKey);
+  if (room.liveStatus !== 1) {
+    throw new Error("当前斗鱼直播间未开播，不能开始录制。");
+  }
+  const qualities = normalizeDouyuQualities(room.multirates);
+  const requestedQuality = Number(payload?.quality) || qualities[0]?.code || 0;
+  const quality = qualities.find((item) => item.code === requestedQuality);
+  if (!quality) {
+    throw unavailableQualityError(requestedQuality);
+  }
+  const resolved = await resolveDouyuStreamFromPage({
+    tabId: payload?.tabId,
+    roomId: room.roomId,
+    ownerUid: room.ownerUid,
+    rate: quality.siteCode
+  });
+  const url = buildDouyuFlvUrl(resolved);
+  if (!url) {
+    throw new Error("斗鱼没有返回可录制的 HTTPS AVC FLV 直播流。");
+  }
+  return buildSiteLivePreparation({
+    site: "douyu",
+    roomKey: String(room.roomId),
+    roomId: room.roomId,
+    title: room.title,
+    anchorName: room.anchorName,
+    quality: quality.code,
+    qualityLabel: quality.label,
+    candidates: [{ url, kind: "primary", size: 0 }]
+  });
+}
+
+async function loadHuyaLive(page) {
+  const roomKey = normalizeLiveRoomKey(page?.roomKey || extractLiveRoomKey(page?.url, "huya"));
+  if (!roomKey) {
+    throw new Error("没有识别到虎牙房间标识。");
+  }
+  const live = await readHuyaLiveStateFromPage(page?.tabId, 0, false);
+  const qualities = normalizeHuyaQualities(live.qualities);
+  return {
+    source: "live",
+    site: "huya",
+    roomKey: String(live.roomKey || roomKey),
+    roomId: normalizeId(live.roomId),
+    title: live.title || page?.title || `huya_${roomKey}`,
+    liveStatus: live.liveStatus === 1 ? 1 : 0,
+    liveStatusText: live.liveStatus === 1 ? "直播中" : "未开播",
+    anchorName: live.anchorName || "",
+    account: null,
+    currentQuality: qualities[0]?.code || null,
+    qualities: live.liveStatus === 1 ? qualities : []
+  };
+}
+
+async function prepareHuyaLiveRecording(payload) {
+  const roomKey = normalizeLiveRoomKey(payload?.roomKey || payload?.roomId || extractLiveRoomKey(payload?.url, "huya"));
+  if (!roomKey) {
+    throw new Error("没有识别到虎牙房间标识。");
+  }
+  const requestedQuality = Number(payload?.quality) || 0;
+  const live = await readHuyaLiveStateFromPage(payload?.tabId, requestedQuality, true);
+  if (live.liveStatus !== 1) {
+    throw new Error("当前虎牙直播间未开播，不能开始录制。");
+  }
+  const qualities = normalizeHuyaQualities(live.qualities);
+  const quality = qualities.find((item) => item.code === requestedQuality) || qualities[0];
+  if (!quality || !Array.isArray(live.candidates) || !live.candidates.length) {
+    throw unavailableQualityError(requestedQuality);
+  }
+  return buildSiteLivePreparation({
+    site: "huya",
+    roomKey: String(live.roomKey || roomKey),
+    roomId: normalizeId(live.roomId),
+    title: live.title || payload?.title || `huya_${roomKey}`,
+    anchorName: live.anchorName || "",
+    quality: quality.code,
+    qualityLabel: quality.label,
+    candidates: live.candidates
+  });
+}
+
+function normalizeDouyuRoom(payload, fallbackRoomKey) {
+  const room = payload?.room || {};
+  const roomId = normalizeId(room.room_id || fallbackRoomKey);
+  if (!roomId) {
+    throw new Error("斗鱼房间信息不完整，请刷新直播页后重试。");
+  }
+  return {
+    roomId,
+    ownerUid: normalizeId(room.owner_uid),
+    title: String(room.room_name || `douyu_${roomId}`).trim(),
+    anchorName: String(room.owner_name || "").trim(),
+    liveStatus: Number(room.show_status) === 1 ? 1 : 0,
+    multirates: Array.isArray(room.multirates) ? room.multirates : []
+  };
+}
+
+function normalizeDouyuQualities(multirates) {
+  const seen = new Set();
+  return (Array.isArray(multirates) ? multirates : [])
+    .map((item) => {
+      const siteCode = Number(item?.type);
+      if (!Number.isFinite(siteCode) || siteCode < 0) {
+        return null;
+      }
+      const code = siteCode === 0 ? 10000 : siteCode;
+      return {
+        code,
+        siteCode,
+        label: String(item?.name || (siteCode === 0 ? "原画" : `画质 ${siteCode}`)),
+        estimatedSize: 0,
+        estimatedSizeSource: "",
+        estimatedSizeApproximate: false,
+        available: true,
+        mode: "live",
+        reason: ""
+      };
+    })
+    .filter((item) => item && !seen.has(item.code) && seen.add(item.code));
+}
+
+function normalizeHuyaQualities(qualities) {
+  const seen = new Set();
+  return (Array.isArray(qualities) ? qualities : [])
+    .map((item) => {
+      const bitrate = Number(item?.bitrate);
+      if (!Number.isFinite(bitrate) || bitrate < 0 || Number(item?.codecType) !== 0) {
+        return null;
+      }
+      const code = bitrate === 0 ? 10000 : bitrate;
+      return {
+        code,
+        siteCode: bitrate,
+        label: String(item?.label || (bitrate === 0 ? "原画" : `${bitrate} Kbps`)),
+        estimatedSize: 0,
+        estimatedSizeSource: "",
+        estimatedSizeApproximate: false,
+        available: true,
+        mode: "live",
+        reason: ""
+      };
+    })
+    .filter((item) => item && !seen.has(item.code) && seen.add(item.code));
+}
+
+async function resolveDouyuStreamFromPage({ tabId, roomId, ownerUid, rate }) {
+  const numericTabId = normalizeTabId(tabId);
+  if (!numericTabId) {
+    throw new Error("斗鱼直播页不可用，请回到原直播间后重试。");
+  }
+  const previous = douyuTabResolutionOperations.get(numericTabId) || Promise.resolve();
+  const operation = previous.catch(() => {}).then(async () => {
+    const [injection] = await chrome.scripting.executeScript({
+      target: { tabId: numericTabId },
+      world: "MAIN",
+      func: resolveDouyuStreamInPage,
+      args: [Number(roomId), Number(ownerUid) || 0, Number(rate) || 0]
+    });
+    const result = injection?.result;
+    if (!result?.ok) {
+      throw new Error(result?.error || "斗鱼播放器尚未准备好，请刷新直播页后重试。");
+    }
+    return result.payload;
+  });
+  douyuTabResolutionOperations.set(numericTabId, operation);
+  try {
+    return await operation;
+  } catch (error) {
+    throw new Error(error?.message || "斗鱼取流失败，请刷新直播页后重试。");
+  } finally {
+    if (douyuTabResolutionOperations.get(numericTabId) === operation) {
+      douyuTabResolutionOperations.delete(numericTabId);
+    }
+  }
+}
+
+async function resolveDouyuStreamInPage(roomId, ownerUid, rate) {
+  const waitUntilReady = async () => {
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      if (typeof globalThis.getLegacyFirstStream === "function") {
+        return globalThis.getLegacyFirstStream;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    return null;
+  };
+  const resolver = await waitUntilReady();
+  if (!resolver) {
+    return { ok: false, error: "斗鱼播放器尚未准备好，请刷新直播页后重试。" };
+  }
+  const originalFetch = globalThis.fetch;
+  let matched = false;
+  const wrappedFetch = function(input, init = {}) {
+    let url = "";
+    try {
+      url = new URL(typeof input === "string" ? input : input?.url || "", location.origin);
+    } catch (_error) {
+      return originalFetch.call(this, input, init);
+    }
+    if (url.origin === location.origin && url.pathname === `/lapi/live/getH5PlayV1/${roomId}`) {
+      const body = new URLSearchParams(String(init?.body || ""));
+      body.set("rate", String(Number(rate) || 0));
+      body.set("hevc", "0");
+      body.set("fa", "0");
+      matched = true;
+      return originalFetch.call(this, input, { ...init, body: body.toString() });
+    }
+    return originalFetch.call(this, input, init);
+  };
+  globalThis.fetch = wrappedFetch;
+  try {
+    const data = await resolver({
+      roomID: Number(roomId),
+      owner_uid: Number(ownerUid) || 0,
+      cookiePre: "",
+      nonce: ""
+    });
+    if (!matched || !data || typeof data !== "object") {
+      return { ok: false, error: "斗鱼没有返回可录制的直播流。" };
+    }
+    return {
+      ok: true,
+      payload: {
+        roomId: Number(data.room_id) || Number(roomId),
+        rate: Number(data.rate),
+        rtmpUrl: String(data.rtmp_url || ""),
+        rtmpLive: String(data.rtmp_live || ""),
+        isMixed: Boolean(data.is_mixed),
+        rtcUrl: String(data.rtc_stream_url || "")
+      }
+    };
+  } catch (_error) {
+    return { ok: false, error: "斗鱼取流失败，请刷新直播页后重试。" };
+  } finally {
+    if (globalThis.fetch === wrappedFetch) {
+      globalThis.fetch = originalFetch;
+    }
+  }
+}
+
+function buildDouyuFlvUrl(stream) {
+  const isMixed = Boolean(stream?.isMixed ?? stream?.is_mixed);
+  const rtcUrl = String(stream?.rtcUrl || stream?.rtc_stream_url || "");
+  const rtmpUrl = String(stream?.rtmpUrl || stream?.rtmp_url || "");
+  const rtmpLive = String(stream?.rtmpLive || stream?.rtmp_live || "");
+  if (!stream || isMixed || rtcUrl || !rtmpUrl || !rtmpLive) {
+    return "";
+  }
+  try {
+    const base = rtmpUrl.replace(/^http:\/\//i, "https://").replace(/\/+$/, "");
+    const live = rtmpLive.replace(/^\/+/, "");
+    const url = new URL(`${base}/${live}`);
+    return url.protocol === "https:" &&
+      /\.flv$/i.test(url.pathname) &&
+      isAllowedCompanionMediaUrl(url.href, "douyu")
+      ? url.href
+      : "";
+  } catch (_error) {
+    return "";
+  }
+}
+
+async function readHuyaLiveStateFromPage(tabId, quality, includeSources) {
+  const numericTabId = normalizeTabId(tabId);
+  if (!numericTabId) {
+    throw new Error("虎牙直播页不可用，请回到原直播间后重试。");
+  }
+  const [injection] = await chrome.scripting.executeScript({
+    target: { tabId: numericTabId },
+    world: "MAIN",
+    func: readHuyaLiveStateInPage,
+    args: [Number(quality) || 0, Boolean(includeSources)]
+  });
+  const result = injection?.result;
+  if (!result?.ok) {
+    throw new Error(result?.error || "虎牙播放器尚未准备好，请刷新直播页后重试。");
+  }
+  return result.payload;
+}
+
+async function readHuyaLiveStateInPage(requestedQuality, includeSources) {
+  let stream = null;
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    stream = globalThis.hyPlayerConfig?.stream;
+    if (stream && Array.isArray(stream.data)) {
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  if (!stream || !Array.isArray(stream.data)) {
+    return { ok: false, error: "虎牙播放器尚未准备好，请刷新直播页后重试。" };
+  }
+  const groups = stream.data.filter((item) => Array.isArray(item?.gameStreamInfoList));
+  const group = groups.find((item) => Number(item?.gameLiveInfo?.codecType) === 0) || null;
+  const info = group?.gameLiveInfo || groups[0]?.gameLiveInfo || {};
+  const roomKey = String(info.profileRoom || info.privateHost || location.pathname.split("/").filter(Boolean)[0] || "");
+  const qualities = (Array.isArray(group?.vMultiStreamInfo) ? group.vMultiStreamInfo : [])
+    .map((item) => ({
+      label: String(item?.sDisplayName || ""),
+      bitrate: Number(item?.iBitRate) || 0,
+      codecType: Number(item?.iCodecType) || 0
+    }));
+  const candidates = [];
+  if (includeSources && group) {
+    const requestedBitrate = Number(requestedQuality) === 10000 ? 0 : Number(requestedQuality) || 0;
+    const seen = new Set();
+    for (const item of group.gameStreamInfoList) {
+      if (candidates.length >= 3) {
+        break;
+      }
+      const suffix = String(item?.sFlvUrlSuffix || "").toLowerCase();
+      const base = String(item?.sFlvUrl || "").replace(/^http:\/\//i, "https://").replace(/\/+$/, "");
+      const streamName = String(item?.sStreamName || "");
+      const antiCode = String(item?.sFlvAntiCode || "").replace(/^\?/, "");
+      if (suffix !== "flv" || !base || !streamName || !antiCode) {
+        continue;
+      }
+      let url = "";
+      try {
+        const parsed = new URL(`${base}/${streamName}.${suffix}?${antiCode}`);
+        if (requestedBitrate > 0) {
+          parsed.searchParams.set("ratio", String(requestedBitrate));
+        } else {
+          parsed.searchParams.delete("ratio");
+        }
+        const host = parsed.hostname.toLowerCase();
+        if (parsed.protocol === "https:" && (host === "flv.huya.com" || host.endsWith(".flv.huya.com"))) {
+          url = parsed.href;
+        }
+      } catch (_error) {
+        url = "";
+      }
+      if (url && !seen.has(url)) {
+        seen.add(url);
+        candidates.push({ url, kind: candidates.length ? "backup" : "primary", size: 0 });
+      }
+    }
+  }
+  return {
+    ok: true,
+    payload: {
+      roomKey,
+      roomId: Number(info.profileRoom) || null,
+      title: String(info.roomName || info.introduction || info.nick || `huya_${roomKey}`).trim(),
+      anchorName: String(info.nick || "").trim(),
+      liveStatus: groups.some((item) => item.gameStreamInfoList.length) ? 1 : 0,
+      qualities,
+      candidates
+    }
+  };
+}
+
+function buildSiteLivePreparation({ site, roomKey, roomId, title, anchorName, quality, qualityLabel, candidates }) {
+  const siteLabel = liveSiteDisplayName(site);
+  const parts = [siteLabel, anchorName, title].map((item) => String(item || "").trim()).filter(Boolean);
+  const uniqueParts = parts.filter((item, index) => parts.indexOf(item) === index);
+  const outputTitle = uniqueParts.join("_") || `${site}_${roomKey}`;
+  const baseName = safeFilename(`${outputTitle}_${timestampForFilename(new Date())}`);
+  const normalizedCandidates = (Array.isArray(candidates) ? candidates : []).slice(0, 3);
+  const segment = {
+    url: normalizedCandidates[0]?.url || "",
+    filename: `BiliDownload/${baseName}.flv`,
+    size: 0,
+    candidates: normalizedCandidates,
+    context: {
+      site,
+      roomKey: String(roomKey || ""),
+      roomId: normalizeId(roomId),
+      title: outputTitle,
+      source: "live",
+      segmentIndex: 1,
+      segmentCount: 1,
+      role: "live",
+      roleLabel: "直播",
+      format: "flv",
+      codec: "avc",
+      quality: Number(quality) || 0,
+      qualityLabel: String(qualityLabel || ""),
+      downloadMethod: "live-recording"
+    }
+  };
+  return {
+    mode: "live",
+    count: 1,
+    format: "flv",
+    live: {
+      site,
+      roomKey: String(roomKey || ""),
+      roomId: normalizeId(roomId),
+      title: outputTitle,
+      liveStatus: 1,
+      quality: Number(quality) || 0,
+      qualityLabel: String(qualityLabel || ""),
+      protocol: "http_stream",
+      format: "flv",
+      codec: "avc"
+    },
+    segments: [segment]
   };
 }
 
@@ -1819,16 +2285,20 @@ function describeCompanionLivePreparation(prepared) {
   const segment = Array.isArray(prepared?.segments) ? prepared.segments[0] : null;
   const live = prepared?.live || {};
   const context = segment?.context || {};
+  const site = normalizeLiveSite(live.site || context.site);
+  const roomKey = normalizeLiveRoomKey(live.roomKey || context.roomKey || live.roomId || context.roomId);
   const roomId = normalizeId(live.roomId || context.roomId);
   const quality = Number(live.quality || context.quality) || 0;
-  if (!roomId || !quality) {
+  if (!roomKey || !quality) {
     throw new Error("The live preparation is missing the room or quality required to refresh sources.");
   }
 
-  const title = normalizeCompanionTitle(live.title || context.title, `live_${roomId}`);
+  const title = normalizeCompanionTitle(live.title || context.title, `live_${roomKey}`);
   return {
     kind: "live",
     metadata: {
+      site,
+      roomKey,
       roomId,
       shortId: normalizeId(live.shortId || context.shortId),
       quality,
@@ -1837,38 +2307,43 @@ function describeCompanionLivePreparation(prepared) {
       format: "flv"
     },
     outputName: companionOutputName(title, "live", quality),
-    liveSources: readCompanionSourceUrls(segment),
+    liveSources: readCompanionSourceUrls(segment, site),
     totalBytes: 0,
     videoExpectedBytes: 0,
     audioExpectedBytes: 0
   };
 }
 
-function readCompanionSourceUrls(segment) {
+function readCompanionSourceUrls(segment, site = "bilibili") {
   const urls = [];
   const seen = new Set();
   for (const candidate of readCandidates(segment)) {
     const url = String(candidate?.url || "");
-    if (!isAllowedCompanionMediaUrl(url) || seen.has(url)) {
+    if (!isAllowedCompanionMediaUrl(url, site) || seen.has(url)) {
       continue;
     }
     seen.add(url);
     urls.push(url);
   }
   if (!urls.length) {
-    throw new Error("The prepared media source is not an allowed Bilibili HTTPS CDN URL.");
+    throw new Error("The prepared media source is not an allowed HTTPS media URL for this site.");
   }
   return urls;
 }
 
-function isAllowedCompanionMediaUrl(value) {
+function isAllowedCompanionMediaUrl(value, site = "bilibili") {
   try {
     const url = new URL(String(value || ""));
     if (url.protocol !== "https:" || url.username || url.password) {
       return false;
     }
     const host = url.hostname.toLowerCase();
-    return ["bilivideo.com", "bilivideo.cn", "hdslb.com", "edge.mountaintoys.cn"].some((suffix) => (
+    const suffixes = {
+      bilibili: ["bilivideo.com", "bilivideo.cn", "hdslb.com", "edge.mountaintoys.cn"],
+      douyu: ["douyucdn.cn"],
+      huya: ["flv.huya.com", "mobgslb.tbcache.com"]
+    }[normalizeLiveSite(site)];
+    return suffixes.some((suffix) => (
       host === suffix || host.endsWith(`.${suffix}`)
     ));
   } catch (_error) {
@@ -1894,7 +2369,7 @@ function buildCompanionStartMessage(task, descriptor) {
   const requestId = createCompanionRequestId("start");
   const base = {
     outputName: normalizeCompanionOutputName(task.outputName, task.kind, task.title, task.metadata?.quality),
-    referer: task.kind === "live" ? "https://live.bilibili.com/" : "https://www.bilibili.com/",
+    referer: task.kind === "live" ? liveSiteReferer(task.metadata?.site) : "https://www.bilibili.com/",
     maxBytes: normalizeCompanionMaxBytes(task.maxBytes)
   };
   let payload;
@@ -1935,7 +2410,7 @@ function buildCompanionRefreshMessage(task, descriptor) {
     };
   } else {
     payload = {
-      referer: "https://live.bilibili.com/",
+      referer: liveSiteReferer(task.metadata?.site),
       sources: descriptor.liveSources
     };
   }
@@ -2259,7 +2734,15 @@ async function refreshCompanionDownloadSources(task, runtime) {
     runtime.pendingRequestIds.add(String(requestId));
     runtime.port.postMessage(message);
   } catch (error) {
-    await finishCompanionDownloadTask(task, "failed", normalizeCompanionErrorMessage(error?.message));
+    if (task.kind === "live" && normalizeLiveSite(task.metadata?.site) !== "bilibili") {
+      await interruptCompanionDownloadTask(
+        task,
+        "直播源需要重新授权，请回到原直播间后重试。",
+        { force: true }
+      );
+    } else {
+      await finishCompanionDownloadTask(task, "failed", normalizeCompanionErrorMessage(error?.message));
+    }
   } finally {
     task.refreshInFlight = false;
   }
@@ -2281,6 +2764,8 @@ async function rebuildCompanionDownloadTaskPayload(task) {
     });
   }
   return prepareLiveRecording({
+    site: metadata.site,
+    roomKey: metadata.roomKey,
     roomId: metadata.roomId,
     title: metadata.title,
     quality: metadata.quality,
@@ -2526,16 +3011,20 @@ function normalizeCompanionTaskMetadata(value, kind) {
     };
   }
   if (kind === "live") {
+    const site = normalizeLiveSite(value?.site);
+    const roomKey = normalizeLiveRoomKey(value?.roomKey || value?.roomId);
     const roomId = normalizeId(value?.roomId);
     const quality = Number(value?.quality) || 0;
-    if (!roomId || !quality) {
+    if (!roomKey || !quality) {
       return null;
     }
     return {
+      site,
+      roomKey,
       roomId,
       shortId: normalizeId(value?.shortId),
       quality,
-      title: normalizeCompanionTitle(value?.title, `live_${roomId}`),
+      title: normalizeCompanionTitle(value?.title, `live_${roomKey}`),
       source: "live",
       format: "flv"
     };
@@ -4420,7 +4909,12 @@ function liveUrlCandidates(codec) {
         size: 0
       };
     })
-    .filter((candidate) => candidate.url && !seen.has(candidate.url) && seen.add(candidate.url));
+    .filter((candidate) => (
+      candidate.url &&
+      isAllowedCompanionMediaUrl(candidate.url, "bilibili") &&
+      !seen.has(candidate.url) &&
+      seen.add(candidate.url)
+    ));
 }
 
 function selectLiveFlvStream(playInfo, requestedQuality = 0) {
@@ -4518,6 +5012,61 @@ function normalizeBvid(value) {
 function normalizeId(value) {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+function normalizeLiveSite(value) {
+  const site = String(value || "").toLowerCase();
+  return ["bilibili", "douyu", "huya"].includes(site) ? site : "bilibili";
+}
+
+function normalizeLiveRoomKey(value) {
+  const roomKey = String(value || "").trim();
+  return /^[A-Za-z0-9_-]{1,128}$/.test(roomKey) ? roomKey : "";
+}
+
+function siteFromUrl(value) {
+  const source = String(value || "");
+  if (/^https:\/\/live\.bilibili\.com\//.test(source) || /^https:\/\/(?:www|m)\.bilibili\.com\//.test(source)) {
+    return "bilibili";
+  }
+  if (/^https:\/\/www\.douyu\.com\//.test(source)) {
+    return "douyu";
+  }
+  if (/^https:\/\/www\.huya\.com\//.test(source)) {
+    return "huya";
+  }
+  return "";
+}
+
+function extractLiveRoomKey(value, site = siteFromUrl(value)) {
+  const source = String(value || "");
+  if (site === "bilibili") {
+    return source.match(/:\/\/live\.bilibili\.com\/(?:blanc\/)?(\d+)/)?.[1] || "";
+  }
+  if (site === "douyu") {
+    return source.match(/:\/\/www\.douyu\.com\/(\d+)(?:[/?#]|$)/)?.[1] || "";
+  }
+  if (site === "huya") {
+    const roomKey = source.match(/:\/\/www\.huya\.com\/([A-Za-z0-9_-]+)(?:[/?#]|$)/)?.[1] || "";
+    return ["g", "l", "m", "all", "index", "search"].includes(roomKey.toLowerCase()) ? "" : roomKey;
+  }
+  return "";
+}
+
+function liveSiteDisplayName(site) {
+  return {
+    bilibili: "Bilibili",
+    douyu: "斗鱼",
+    huya: "虎牙"
+  }[normalizeLiveSite(site)];
+}
+
+function liveSiteReferer(site) {
+  return {
+    bilibili: "https://live.bilibili.com/",
+    douyu: "https://www.douyu.com/",
+    huya: "https://www.huya.com/"
+  }[normalizeLiveSite(site)];
 }
 
 function normalizeTabId(value) {

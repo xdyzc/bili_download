@@ -1,0 +1,83 @@
+[
+  {
+    "id": 101,
+    "priority": 1,
+    "action": {
+      "type": "modifyHeaders",
+      "requestHeaders": [
+        {
+          "header": "Referer",
+          "operation": "set",
+          "value": "https://www.douyu.com/"
+        },
+        {
+          "header": "Origin",
+          "operation": "set",
+          "value": "https://www.douyu.com"
+        }
+      ]
+    },
+    "condition": {
+      "urlFilter": "||douyucdn.cn/",
+      "resourceTypes": [
+        "xmlhttprequest",
+        "media",
+        "other"
+      ]
+    }
+  },
+  {
+    "id": 102,
+    "priority": 1,
+    "action": {
+      "type": "modifyHeaders",
+      "requestHeaders": [
+        {
+          "header": "Referer",
+          "operation": "set",
+          "value": "https://www.huya.com/"
+        },
+        {
+          "header": "Origin",
+          "operation": "set",
+          "value": "https://www.huya.com"
+        }
+      ]
+    },
+    "condition": {
+      "urlFilter": "||flv.huya.com/",
+      "resourceTypes": [
+        "xmlhttprequest",
+        "media",
+        "other"
+      ]
+    }
+  },
+  {
+    "id": 103,
+    "priority": 1,
+    "action": {
+      "type": "modifyHeaders",
+      "requestHeaders": [
+        {
+          "header": "Referer",
+          "operation": "set",
+          "value": "https://www.huya.com/"
+        },
+        {
+          "header": "Origin",
+          "operation": "set",
+          "value": "https://www.huya.com"
+        }
+      ]
+    },
+    "condition": {
+      "urlFilter": "||mobgslb.tbcache.com/",
+      "resourceTypes": [
+        "xmlhttprequest",
+        "media",
+        "other"
+      ]
+    }
+  }
+]

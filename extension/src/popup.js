@@ -3,8 +3,8 @@ const TEXT = {
   loading: "\u6b63\u5728\u8bfb\u53d6\u89c6\u9891\u4fe1\u606f...",
   ready: "\u53ef\u9009\u62e9\u6e05\u6670\u5ea6\u4e0b\u8f7d",
   collectionReady: "\u68c0\u6d4b\u5230\u591a\u4e2a\u5206 P\uff0c\u53ef\u9009\u62e9\u8981\u4e0b\u8f7d\u7684\u5206 P",
-  copied: "\u89c6\u9891 ID \u5df2\u590d\u5236",
-  noVideo: "\u5f53\u524d\u9875\u9762\u4e0d\u662f\u652f\u6301\u7684 Bilibili \u89c6\u9891\u6216\u756a\u5267\u9875",
+  copied: "\u9875\u9762\u6807\u8bc6\u5df2\u590d\u5236",
+  noVideo: "\u5f53\u524d\u9875\u9762\u4e0d\u662f\u652f\u6301\u7684\u89c6\u9891\u6216\u76f4\u64ad\u9875",
   liveReady: "\u68c0\u6d4b\u5230\u76f4\u64ad\u95f4\uff0c\u53ef\u5f00\u59cb\u5f55\u5236",
   liveOffline: "\u5f53\u524d\u76f4\u64ad\u95f4\u672a\u5f00\u64ad",
   liveRecording: "\u6b63\u5728\u5f55\u5236\u76f4\u64ad...",
@@ -63,10 +63,12 @@ const state = {
   tabId: null,
   page: {
     type: "",
+    site: "",
     bvid: "",
     seasonId: null,
     epId: null,
     roomId: null,
+    roomKey: "",
     title: "",
     url: ""
   },
@@ -113,7 +115,9 @@ const viewTitleElement = document.querySelector("#view-title");
 const settingsOpenButton = document.querySelector("#settings-open");
 const settingsBackButton = document.querySelector("#settings-back");
 const statusElement = document.querySelector("#status");
+const accountLabelElement = document.querySelector("#account-label");
 const accountElement = document.querySelector("#account");
+const pageIdLabelElement = document.querySelector("#page-id-label");
 const bvidInput = document.querySelector("#bvid");
 const titleInput = document.querySelector("#title");
 const qualitySelect = document.querySelector("#quality");
@@ -538,18 +542,22 @@ async function refreshFromActiveTab(options = {}) {
 }
 
 async function readPage(tab) {
+  const site = siteFromUrl(tab?.url || "");
+  const roomKey = extractLiveRoomKey(tab?.url || "", site);
   const fromUrl = {
     type: pageTypeFromUrl(tab?.url || ""),
+    site,
     bvid: extractBvid(tab?.url || ""),
     seasonId: extractSeasonId(tab?.url || ""),
     epId: extractEpId(tab?.url || ""),
-    roomId: extractLiveRoomId(tab?.url || ""),
+    roomId: /^\d+$/.test(roomKey) ? Number(roomKey) : null,
+    roomKey,
     title: tab?.title || "",
     url: tab?.url || "",
     tabId: tab?.id || null
   };
 
-  if (!tab?.id || !isSupportedBilibiliUrl(tab.url)) {
+  if (!tab?.id || !isSupportedPageUrl(tab.url)) {
     return fromUrl;
   }
 
@@ -559,10 +567,12 @@ async function readPage(tab) {
     });
     return {
       type: page?.type || fromUrl.type,
+      site: page?.site || fromUrl.site,
       bvid: page?.bvid || fromUrl.bvid,
       seasonId: page?.seasonId || fromUrl.seasonId,
       epId: page?.epId || fromUrl.epId,
       roomId: page?.roomId || fromUrl.roomId,
+      roomKey: page?.roomKey || fromUrl.roomKey,
       title: page?.title || fromUrl.title,
       url: page?.url || fromUrl.url,
       tabId: fromUrl.tabId
@@ -584,6 +594,7 @@ function render() {
 
 function renderMode() {
   const isLive = state.page.type === "live";
+  const site = normalizeSite(state.page.site);
   setElementHidden(downloadButton, isLive);
   setElementHidden(downloadAudioButton, isLive);
   setElementHidden(liveRecordButton, !isLive);
@@ -591,6 +602,14 @@ function renderMode() {
   setElementHidden(qualitySizeElement, isLive);
   const qualityLabel = document.querySelector?.("label[for=\"quality\"]");
   setElementHidden(qualityLabel, false);
+  if (accountLabelElement) {
+    accountLabelElement.textContent = isLive && site !== "bilibili" ? "\u7ad9\u70b9" : "Cookie";
+  }
+  if (pageIdLabelElement) {
+    pageIdLabelElement.textContent = isLive
+      ? (site === "huya" && !/^\d+$/.test(String(state.page.roomKey || "")) ? "\u623f\u95f4\u6807\u8bc6" : "\u623f\u95f4\u53f7")
+      : "\u89c6\u9891 ID";
+  }
 }
 
 function setElementHidden(element, hidden) {
@@ -605,6 +624,11 @@ function renderAccount() {
   }
 
   const account = state.account;
+  const site = normalizeSite(state.page.site);
+  if (state.page.type === "live" && site !== "bilibili") {
+    accountElement.textContent = siteDisplayName(site);
+    return;
+  }
   if (!account) {
     accountElement.textContent = "\u672a\u9a8c\u8bc1";
     return;
@@ -885,7 +909,9 @@ async function loadLiveFromPage() {
   state.live = response.payload;
   state.account = response.payload.account || null;
   state.page.type = "live";
+  state.page.site = state.live.site || state.page.site || "bilibili";
   state.page.roomId = state.live.roomId;
+  state.page.roomKey = String(state.live.roomKey || state.live.roomId || state.page.roomKey || "");
   state.page.title = state.live.title;
   state.selectedPageCids = null;
   render();
@@ -1032,7 +1058,7 @@ async function toggleLiveRecording() {
 }
 
 async function startLiveRecording() {
-  if (!state.live?.roomId) {
+  if (!state.live?.roomKey && !state.live?.roomId) {
     return;
   }
   if (state.live.liveStatus !== 1) {
@@ -1132,10 +1158,13 @@ async function prepareLiveRecording() {
   const prepared = await chrome.runtime.sendMessage({
     type: "BILI_DOWNLOAD_PREPARE_LIVE_RECORDING",
     payload: {
+      site: state.live.site || state.page.site || "bilibili",
+      roomKey: state.live.roomKey || state.page.roomKey || String(state.live.roomId || ""),
       roomId: state.live.roomId,
       title: state.live.title,
       url: state.page.url,
-      quality: Number(qualitySelect.value)
+      quality: Number(qualitySelect.value),
+      tabId: state.tabId
     }
   });
 
@@ -4628,7 +4657,7 @@ function setStatus(text) {
   statusElement.textContent = text;
 }
 
-function isSupportedBilibiliUrl(value) {
+function isSupportedPageUrl(value) {
   return isBilibiliVideoUrl(value) || isBangumiUrl(value) || isLiveUrl(value);
 }
 
@@ -4641,7 +4670,8 @@ function isBangumiUrl(value) {
 }
 
 function isLiveUrl(value) {
-  return /^https:\/\/live\.bilibili\.com\/(?:blanc\/)?\d+/.test(String(value));
+  const site = siteFromUrl(value);
+  return Boolean(extractLiveRoomKey(value, site));
 }
 
 function pageTypeFromUrl(value) {
@@ -4652,7 +4682,7 @@ function pageTypeFromUrl(value) {
 }
 
 function hasSupportedPageId(page) {
-  return Boolean(page?.bvid || page?.epId || page?.seasonId || page?.roomId);
+  return Boolean(page?.bvid || page?.epId || page?.seasonId || page?.roomKey || page?.roomId);
 }
 
 function displayPageId(page) {
@@ -4665,8 +4695,8 @@ function displayPageId(page) {
   if (page?.seasonId) {
     return `ss${page.seasonId}`;
   }
-  if (page?.roomId) {
-    return `live ${page.roomId}`;
+  if (page?.roomKey || page?.roomId) {
+    return String(page.roomKey || page.roomId);
   }
   return "";
 }
@@ -4686,7 +4716,44 @@ function extractEpId(value) {
   return match ? Number(match[1]) : null;
 }
 
-function extractLiveRoomId(value) {
-  const match = String(value || "").match(/:\/\/live\.bilibili\.com\/(?:blanc\/)?(\d+)/);
-  return match ? Number(match[1]) : null;
+function extractLiveRoomKey(value, site = siteFromUrl(value)) {
+  const source = String(value || "");
+  if (site === "bilibili") {
+    return source.match(/:\/\/live\.bilibili\.com\/(?:blanc\/)?(\d+)/)?.[1] || "";
+  }
+  if (site === "douyu") {
+    return source.match(/:\/\/www\.douyu\.com\/(\d+)(?:[/?#]|$)/)?.[1] || "";
+  }
+  if (site === "huya") {
+    const roomKey = source.match(/:\/\/www\.huya\.com\/([A-Za-z0-9_-]+)(?:[/?#]|$)/)?.[1] || "";
+    return ["g", "l", "m", "all", "index", "search"].includes(roomKey.toLowerCase()) ? "" : roomKey;
+  }
+  return "";
+}
+
+function siteFromUrl(value) {
+  const source = String(value || "");
+  if (/^https:\/\/(?:www|m)\.bilibili\.com\//.test(source) || /^https:\/\/live\.bilibili\.com\//.test(source)) {
+    return "bilibili";
+  }
+  if (/^https:\/\/www\.douyu\.com\//.test(source)) {
+    return "douyu";
+  }
+  if (/^https:\/\/www\.huya\.com\//.test(source)) {
+    return "huya";
+  }
+  return "";
+}
+
+function normalizeSite(value) {
+  const site = String(value || "").toLowerCase();
+  return ["bilibili", "douyu", "huya"].includes(site) ? site : "bilibili";
+}
+
+function siteDisplayName(site) {
+  return {
+    bilibili: "Bilibili",
+    douyu: "\u6597\u9c7c",
+    huya: "\u864e\u7259"
+  }[normalizeSite(site)];
 }

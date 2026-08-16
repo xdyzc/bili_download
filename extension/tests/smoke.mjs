@@ -27,6 +27,11 @@ test("manifest declares the MV3 side panel extension and optional native compani
     "https://www.bilibili.com/*",
     "https://m.bilibili.com/*",
     "https://live.bilibili.com/*",
+    "https://www.douyu.com/*",
+    "https://www.huya.com/*",
+    "https://*.douyucdn.cn/*",
+    "https://*.flv.huya.com/*",
+    "https://*.mobgslb.tbcache.com/*",
     "https://*.bilivideo.com/*",
     "https://*.bilivideo.cn/*",
     "https://*.hdslb.com/*",
@@ -34,9 +39,15 @@ test("manifest declares the MV3 side panel extension and optional native compani
   ]);
   assert.ok(manifest.content_scripts[0].matches.includes("https://www.bilibili.com/bangumi/play/*"));
   assert.ok(manifest.content_scripts[0].matches.includes("https://live.bilibili.com/*"));
+  assert.ok(manifest.content_scripts[0].matches.includes("https://www.douyu.com/*"));
+  assert.ok(manifest.content_scripts[0].matches.includes("https://www.huya.com/*"));
   assert.equal(
     manifest.declarative_net_request.rule_resources[0].path,
     "rules/bili-media-headers.json"
+  );
+  assert.equal(
+    manifest.declarative_net_request.rule_resources[1].path,
+    "rules/live-media-headers.json"
   );
   assert.ok(!manifest.host_permissions.some((item) => /127\.0\.0\.1|localhost|<all_urls>|^\*:\/\//.test(item)));
 });
@@ -428,6 +439,7 @@ test("content script forwards page progress events", async () => {
 
   assert.deepEqual(toPlain(sandbox.readPage()), {
     type: "video",
+    site: "bilibili",
     bvid: "BV1KGj36QEG3",
     seasonId: null,
     epId: null,
@@ -439,6 +451,7 @@ test("content script forwards page progress events", async () => {
   sandbox.document.title = "Bangumi Season_bilibili";
   assert.deepEqual(toPlain(sandbox.readPage()), {
     type: "bangumi",
+    site: "bilibili",
     bvid: "",
     seasonId: 1512,
     epId: null,
@@ -456,6 +469,31 @@ test("content script forwards page progress events", async () => {
   assert.equal(pageMessageResult, false);
   assert.equal(pageMessageResponse.type, "bangumi");
   assert.equal(pageMessageResponse.epId, 28160);
+
+  sandbox.location.href = "https://www.douyu.com/999001";
+  sandbox.document.title = "Fixture Douyu Room - 斗鱼直播";
+  assert.deepEqual(toPlain(sandbox.readPage()), {
+    type: "live",
+    site: "douyu",
+    roomKey: "999001",
+    roomId: 999001,
+    title: "Fixture Douyu Room",
+    url: "https://www.douyu.com/999001"
+  });
+
+  sandbox.location.href = "https://www.huya.com/fixture-anchor";
+  sandbox.document.title = "Fixture Huya Room - 虎牙直播";
+  assert.deepEqual(toPlain(sandbox.readPage()), {
+    type: "live",
+    site: "huya",
+    roomKey: "fixture-anchor",
+    roomId: null,
+    title: "Fixture Huya Room",
+    url: "https://www.huya.com/fixture-anchor"
+  });
+
+  sandbox.location.href = "https://www.huya.com/search";
+  assert.equal(sandbox.readPage().type, "video");
 
   listeners["bili-download-progress"]({
     detail: {
@@ -1954,6 +1992,136 @@ test("background loads live rooms and prepares FLV recording streams", async () 
   assert.match(preparedResponse.payload.segments[0].url, /^https:\/\/live-primary\.bilivideo\.com\/live\/test\.flv\?token=1$/);
   assert.equal(preparedResponse.payload.segments[0].candidates.length, 2);
   assert.match(preparedResponse.payload.segments[0].filename, /^BiliDownload\/Live Page_\d{8}_\d{6}\.flv$/);
+});
+
+
+test("background normalizes Douyu rooms and uses only HTTPS FLV CDN streams", async () => {
+  const fixture = JSON.parse(await readFile("extension/tests/fixtures/douyu-betard.json", "utf8"));
+  const streamFixture = JSON.parse(await readFile("extension/tests/fixtures/douyu-stream.json", "utf8"));
+  const sandbox = await backgroundUnitSandbox();
+
+  const room = sandbox.normalizeDouyuRoom(fixture, "999001");
+  assert.deepEqual(toPlain(room), {
+    roomId: 999001,
+    ownerUid: 88001,
+    title: "Fixture Douyu Room",
+    anchorName: "Fixture Anchor",
+    liveStatus: 1,
+    multirates: fixture.room.multirates
+  });
+  assert.deepEqual(
+    toPlain(sandbox.normalizeDouyuQualities(room.multirates).map(({ code, siteCode, label }) => ({ code, siteCode, label }))),
+    [
+      { code: 10000, siteCode: 0, label: "蓝光10M" },
+      { code: 4, siteCode: 4, label: "蓝光4M" },
+      { code: 2, siteCode: 2, label: "高清" },
+      { code: 1, siteCode: 1, label: "流畅" }
+    ]
+  );
+  assert.equal(
+    sandbox.buildDouyuFlvUrl(streamFixture),
+    "https://fixture.douyucdn.cn/live/fixture-stream.flv?token=redacted"
+  );
+  assert.equal(sandbox.buildDouyuFlvUrl({ ...streamFixture, rtmpUrl: "https://evil.example/live" }), "");
+  assert.equal(sandbox.buildDouyuFlvUrl({ ...streamFixture, rtmpLive: "fixture.m3u8" }), "");
+  assert.equal(sandbox.buildDouyuFlvUrl({ ...streamFixture, rtcUrl: "https://rtc.example/stream" }), "");
+  assert.equal(sandbox.buildDouyuFlvUrl({ ...streamFixture, isMixed: true }), "");
+
+  const offline = sandbox.normalizeDouyuRoom({
+    room: { ...fixture.room, show_status: 2 }
+  }, "999001");
+  assert.equal(offline.liveStatus, 0);
+});
+
+
+test("Douyu page stream resolver scopes and restores its temporary fetch wrapper", async () => {
+  const streamFixture = JSON.parse(await readFile("extension/tests/fixtures/douyu-stream.json", "utf8"));
+  const fetchCalls = [];
+  const originalFetch = async (input, init = {}) => {
+    fetchCalls.push({ input: String(input), body: String(init.body || "") });
+    return { json: async () => ({ error: 0, data: streamFixture }) };
+  };
+  const sandbox = await backgroundUnitSandbox({ fetch: originalFetch });
+  sandbox.douyuStreamFixture = streamFixture;
+  vm.runInContext(`
+    getLegacyFirstStream = async () => {
+      await fetch("/lapi/live/getH5PlayV1/other", { method: "POST", body: "rate=9&hevc=1&fa=1" });
+      await fetch("/lapi/live/getH5PlayV1/999001", { method: "POST", body: "rate=9&hevc=1&fa=1" });
+      return douyuStreamFixture;
+    };
+  `, sandbox);
+
+  const resolved = await sandbox.resolveDouyuStreamInPage(999001, 88001, 4);
+  assert.equal(resolved.ok, true);
+  assert.equal(sandbox.fetch, originalFetch);
+  assert.equal(new URLSearchParams(fetchCalls[0].body).get("rate"), "9");
+  const targetBody = new URLSearchParams(fetchCalls[1].body);
+  assert.equal(targetBody.get("rate"), "4");
+  assert.equal(targetBody.get("hevc"), "0");
+  assert.equal(targetBody.get("fa"), "0");
+
+  vm.runInContext(`getLegacyFirstStream = async () => { throw new Error("fixture failure"); };`, sandbox);
+  const failed = await sandbox.resolveDouyuStreamInPage(999001, 88001, 4);
+  assert.equal(failed.ok, false);
+  assert.equal(sandbox.fetch, originalFetch);
+
+  delete sandbox.getLegacyFirstStream;
+  sandbox.setTimeout = (callback) => {
+    callback();
+    return 1;
+  };
+  const timedOut = await sandbox.resolveDouyuStreamInPage(999001, 88001, 4);
+  assert.equal(timedOut.ok, false);
+  assert.match(timedOut.error, /刷新直播页/);
+  assert.equal(sandbox.fetch, originalFetch);
+});
+
+
+test("Huya page adapter filters AVC qualities and builds three HTTPS CDN candidates", async () => {
+  const fixture = JSON.parse(await readFile("extension/tests/fixtures/huya-player.json", "utf8"));
+  const sandbox = await backgroundUnitSandbox();
+  sandbox.hyPlayerConfig = { stream: fixture };
+  sandbox.location.pathname = "/fixture-anchor";
+
+  const result = await sandbox.readHuyaLiveStateInPage(2000, true);
+  assert.equal(result.ok, true);
+  assert.equal(result.payload.roomKey, "999002");
+  assert.equal(result.payload.liveStatus, 1);
+  const qualities = sandbox.normalizeHuyaQualities(result.payload.qualities);
+  assert.deepEqual(
+    toPlain(qualities.map(({ code, siteCode, label }) => ({ code, siteCode, label }))),
+    [
+      { code: 10000, siteCode: 0, label: "蓝光10M" },
+      { code: 4000, siteCode: 4000, label: "蓝光4M" },
+      { code: 2000, siteCode: 2000, label: "超清" }
+    ]
+  );
+  assert.equal(result.payload.candidates.length, 3);
+  for (const candidate of result.payload.candidates) {
+    const url = new URL(candidate.url);
+    assert.equal(url.protocol, "https:");
+    assert.ok(url.hostname.endsWith(".flv.huya.com"));
+    assert.equal(url.searchParams.get("ratio"), "2000");
+    assert.equal(url.searchParams.getAll("ratio").length, 1);
+  }
+
+  const sourceResult = await sandbox.readHuyaLiveStateInPage(10000, true);
+  assert.equal(new URL(sourceResult.payload.candidates[0].url).searchParams.has("ratio"), false);
+
+  sandbox.hyPlayerConfig = { stream: { data: [] } };
+  const offline = await sandbox.readHuyaLiveStateInPage(0, false);
+  assert.equal(offline.ok, true);
+  assert.equal(offline.payload.liveStatus, 0);
+  assert.equal(offline.payload.roomKey, "fixture-anchor");
+
+  delete sandbox.hyPlayerConfig;
+  sandbox.setTimeout = (callback) => {
+    callback();
+    return 1;
+  };
+  const missing = await sandbox.readHuyaLiveStateInPage(0, false);
+  assert.equal(missing.ok, false);
+  assert.match(missing.error, /播放器尚未准备好/);
 });
 
 
@@ -5438,7 +5606,7 @@ test("popup records a live FLV stream until the user stops it", async () => {
   vm.runInContext(code, sandbox);
 
   await sandbox.initialize();
-  assert.equal(bvidInput.value, "live 7734200");
+  assert.equal(bvidInput.value, "7734200");
   assert.equal(downloadButton.hidden, true);
   assert.equal(downloadAudioButton.hidden, true);
   assert.equal(liveRecordButton.hidden, false);
@@ -6648,6 +6816,52 @@ function trackingBlob(blob) {
       return blob.slice(start, end);
     }
   };
+}
+
+
+async function backgroundUnitSandbox(overrides = {}) {
+  const code = await readFile("extension/src/background.js", "utf8");
+  const sandbox = {
+    Array,
+    Date,
+    Error,
+    Number,
+    Promise,
+    Set,
+    String,
+    URL,
+    URLSearchParams,
+    clearTimeout,
+    setTimeout,
+    location: {
+      href: "https://www.douyu.com/999001",
+      origin: "https://www.douyu.com",
+      pathname: "/999001"
+    },
+    fetch: overrides.fetch || (async () => {
+      throw new Error("unexpected fixture fetch");
+    }),
+    chrome: {
+      runtime: {
+        lastError: null,
+        onMessage: { addListener() {} },
+        onConnect: { addListener() {} },
+        onInstalled: { addListener() {} }
+      },
+      declarativeNetRequest: {
+        onRuleMatchedDebug: { addListener() {} }
+      },
+      storage: {
+        local: {
+          async get() { return {}; },
+          async set() {}
+        }
+      }
+    }
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(code, sandbox);
+  return sandbox;
 }
 
 

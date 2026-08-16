@@ -1,0 +1,15 @@
+{
+  "room": {
+    "room_id": 999001,
+    "owner_uid": 88001,
+    "room_name": "Fixture Douyu Room",
+    "owner_name": "Fixture Anchor",
+    "show_status": 1,
+    "multirates": [
+      { "name": "蓝光10M", "type": 0 },
+      { "name": "蓝光4M", "type": 4 },
+      { "name": "高清", "type": 2 },
+      { "name": "流畅", "type": 1 }
+    ]
+  }
+}

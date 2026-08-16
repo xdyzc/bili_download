@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Bili Download",
-  "version": "0.5.0",
-  "description": "Download Bilibili streams from a persistent side panel and mux DASH video/audio into MP4 in the browser.",
+  "version": "0.6.0",
+  "description": "Download Bilibili media and record Bilibili, Douyu, and Huya live streams from a persistent side panel.",
   "action": {
     "default_title": "Bili Download"
   },
@@ -18,7 +18,9 @@
         "https://www.bilibili.com/video/*",
         "https://m.bilibili.com/video/*",
         "https://www.bilibili.com/bangumi/play/*",
-        "https://live.bilibili.com/*"
+        "https://live.bilibili.com/*",
+        "https://www.douyu.com/*",
+        "https://www.huya.com/*"
       ],
       "js": [
         "src/content.js"
@@ -41,6 +43,11 @@
         "id": "bili_media_headers",
         "enabled": true,
         "path": "rules/bili-media-headers.json"
+      },
+      {
+        "id": "live_media_headers",
+        "enabled": true,
+        "path": "rules/live-media-headers.json"
       }
     ]
   },
@@ -50,6 +57,11 @@
     "https://www.bilibili.com/*",
     "https://m.bilibili.com/*",
     "https://live.bilibili.com/*",
+    "https://www.douyu.com/*",
+    "https://www.huya.com/*",
+    "https://*.douyucdn.cn/*",
+    "https://*.flv.huya.com/*",
+    "https://*.mobgslb.tbcache.com/*",
     "https://*.bilivideo.com/*",
     "https://*.bilivideo.cn/*",
     "https://*.hdslb.com/*",

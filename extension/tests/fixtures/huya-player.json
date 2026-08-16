@@ -1,0 +1,51 @@
+{
+  "data": [
+    {
+      "gameLiveInfo": {
+        "codecType": 0,
+        "profileRoom": 999002,
+        "privateHost": "fixture-anchor",
+        "roomName": "Fixture Huya Room",
+        "nick": "Fixture Anchor"
+      },
+      "gameStreamInfoList": [
+        {
+          "sFlvUrl": "http://invalid.example/src",
+          "sStreamName": "ignored",
+          "sFlvUrlSuffix": "flv",
+          "sFlvAntiCode": "token=redacted"
+        },
+        {
+          "sFlvUrl": "http://al-game.flv.huya.com/src",
+          "sStreamName": "fixture-stream",
+          "sFlvUrlSuffix": "flv",
+          "sFlvAntiCode": "token=redacted&ratio=9999"
+        },
+        {
+          "sFlvUrl": "https://tx.flv.huya.com/src",
+          "sStreamName": "fixture-stream",
+          "sFlvUrlSuffix": "flv",
+          "sFlvAntiCode": "token=redacted"
+        },
+        {
+          "sFlvUrl": "https://hw.flv.huya.com/src",
+          "sStreamName": "fixture-stream",
+          "sFlvUrlSuffix": "flv",
+          "sFlvAntiCode": "token=redacted"
+        },
+        {
+          "sFlvUrl": "https://fourth.flv.huya.com/src",
+          "sStreamName": "fixture-stream",
+          "sFlvUrlSuffix": "flv",
+          "sFlvAntiCode": "token=redacted"
+        }
+      ],
+      "vMultiStreamInfo": [
+        { "sDisplayName": "HDR", "iBitRate": 4200, "iCodecType": 1 },
+        { "sDisplayName": "蓝光10M", "iBitRate": 0, "iCodecType": 0 },
+        { "sDisplayName": "蓝光4M", "iBitRate": 4000, "iCodecType": 0 },
+        { "sDisplayName": "超清", "iBitRate": 2000, "iCodecType": 0 }
+      ]
+    }
+  ]
+}

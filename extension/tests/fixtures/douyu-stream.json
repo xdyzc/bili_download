@@ -1,0 +1,8 @@
+{
+  "room_id": 999001,
+  "rate": 4,
+  "rtmp_url": "http://fixture.douyucdn.cn/live",
+  "rtmp_live": "fixture-stream.flv?token=redacted",
+  "is_mixed": false,
+  "rtc_stream_url": ""
+}

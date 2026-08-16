@@ -32,10 +32,14 @@ function normalizeProgressPayload(value) {
 }
 
 function readPage() {
+  const site = siteFromUrl(location.href);
   if (isLivePage(location.href)) {
+    const roomKey = extractLiveRoomKey(location.href, site);
     return {
       type: "live",
-      roomId: extractLiveRoomId(location.href),
+      site,
+      roomKey,
+      roomId: /^\d+$/.test(roomKey) ? Number(roomKey) : null,
       title: readTitle(),
       url: location.href
     };
@@ -43,6 +47,7 @@ function readPage() {
 
   return {
     type: isBangumiPage(location.href) ? "bangumi" : "video",
+    site: "bilibili",
     bvid: extractBvid(location.href),
     seasonId: extractSeasonId(location.href),
     epId: extractEpId(location.href),
@@ -58,7 +63,11 @@ function readTitle() {
     document.querySelector("h1");
 
   const title = titleElement?.textContent?.trim() || document.title;
-  return title.replace(/\s*[-_].*bilibili.*$/i, "").trim();
+  return title
+    .replace(/\s*[-_].*bilibili.*$/i, "")
+    .replace(/\s*[-_].*斗鱼直播.*$/i, "")
+    .replace(/\s*[-_].*虎牙直播.*$/i, "")
+    .trim();
 }
 
 function extractBvid(value) {
@@ -76,9 +85,19 @@ function extractEpId(value) {
   return match ? Number(match[1]) : null;
 }
 
-function extractLiveRoomId(value) {
-  const match = String(value || "").match(/:\/\/live\.bilibili\.com\/(?:blanc\/)?(\d+)/);
-  return match ? Number(match[1]) : null;
+function extractLiveRoomKey(value, site = siteFromUrl(value)) {
+  const source = String(value || "");
+  if (site === "bilibili") {
+    return source.match(/:\/\/live\.bilibili\.com\/(?:blanc\/)?(\d+)/)?.[1] || "";
+  }
+  if (site === "douyu") {
+    return source.match(/:\/\/www\.douyu\.com\/(\d+)(?:[/?#]|$)/)?.[1] || "";
+  }
+  if (site === "huya") {
+    const roomKey = source.match(/:\/\/www\.huya\.com\/([A-Za-z0-9_-]+)(?:[/?#]|$)/)?.[1] || "";
+    return ["g", "l", "m", "all", "index", "search"].includes(roomKey.toLowerCase()) ? "" : roomKey;
+  }
+  return "";
 }
 
 function isBangumiPage(value) {
@@ -86,5 +105,20 @@ function isBangumiPage(value) {
 }
 
 function isLivePage(value) {
-  return /:\/\/live\.bilibili\.com\/(?:blanc\/)?\d+/.test(String(value || ""));
+  const site = siteFromUrl(value);
+  return Boolean(extractLiveRoomKey(value, site));
+}
+
+function siteFromUrl(value) {
+  const source = String(value || "");
+  if (/^https:\/\/live\.bilibili\.com\//.test(source) || /^https:\/\/(?:www|m)\.bilibili\.com\//.test(source)) {
+    return "bilibili";
+  }
+  if (/^https:\/\/www\.douyu\.com\//.test(source)) {
+    return "douyu";
+  }
+  if (/^https:\/\/www\.huya\.com\//.test(source)) {
+    return "huya";
+  }
+  return "";
 }

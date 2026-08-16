@@ -7,28 +7,38 @@ const { Muxer, ArrayBufferTarget } = await import("../vendor/mp4-muxer/mp4-muxer
 const MP4Box = await import("../vendor/mp4box/mp4box.all.mjs");
 
 
-test("manifest declares a pure browser side panel extension", async () => {
+test("manifest declares the MV3 side panel extension and optional native companion permission", async () => {
   const manifest = JSON.parse(await readFile("extension/manifest.json", "utf8"));
 
   assert.equal(manifest.manifest_version, 3);
   assert.equal(manifest.action.default_popup, undefined);
   assert.equal(manifest.side_panel.default_path, "src/popup.html");
+  assert.ok(!manifest.permissions.includes("activeTab"));
   assert.ok(manifest.permissions.includes("downloads"));
   assert.ok(manifest.permissions.includes("declarativeNetRequest"));
   assert.ok(manifest.permissions.includes("declarativeNetRequestFeedback"));
   assert.ok(manifest.permissions.includes("scripting"));
   assert.ok(manifest.permissions.includes("sidePanel"));
   assert.ok(manifest.permissions.includes("storage"));
-  assert.ok(manifest.host_permissions.includes("https://api.bilibili.com/*"));
-  assert.ok(manifest.host_permissions.includes("https://api.live.bilibili.com/*"));
-  assert.ok(manifest.host_permissions.includes("https://*.edge.mountaintoys.cn/*"));
+  assert.ok(manifest.permissions.includes("nativeMessaging"));
+  assert.deepEqual(manifest.host_permissions, [
+    "https://api.bilibili.com/*",
+    "https://api.live.bilibili.com/*",
+    "https://www.bilibili.com/*",
+    "https://m.bilibili.com/*",
+    "https://live.bilibili.com/*",
+    "https://*.bilivideo.com/*",
+    "https://*.bilivideo.cn/*",
+    "https://*.hdslb.com/*",
+    "https://*.edge.mountaintoys.cn/*"
+  ]);
   assert.ok(manifest.content_scripts[0].matches.includes("https://www.bilibili.com/bangumi/play/*"));
   assert.ok(manifest.content_scripts[0].matches.includes("https://live.bilibili.com/*"));
   assert.equal(
     manifest.declarative_net_request.rule_resources[0].path,
     "rules/bili-media-headers.json"
   );
-  assert.ok(!manifest.host_permissions.some((item) => item.includes("127.0.0.1")));
+  assert.ok(!manifest.host_permissions.some((item) => /127\.0\.0\.1|localhost|<all_urls>|^\*:\/\//.test(item)));
 });
 
 
@@ -120,9 +130,12 @@ test("media header rules use declarative request modification", async () => {
     ["||bilivideo.com/", "||bilivideo.cn/", "||hdslb.com/", "||edge.mountaintoys.cn/"]
   );
   assert.equal(rule.action.type, "modifyHeaders");
-  assert.ok(rule.condition.resourceTypes.includes("main_frame"));
-  assert.ok(rule.condition.resourceTypes.includes("image"));
-  assert.ok(rule.condition.resourceTypes.includes("other"));
+  for (const item of rules) {
+    assert.deepEqual(item.condition.resourceTypes, ["xmlhttprequest", "media", "other"]);
+    assert.ok(!item.condition.resourceTypes.some((type) => (
+      ["main_frame", "sub_frame", "image", "object"].includes(type)
+    )));
+  }
   assert.deepEqual(
     rule.action.requestHeaders.map((item) => [item.header, item.operation]),
     [
@@ -160,7 +173,19 @@ test("popup contains MVP controls", async () => {
     "progress-speed",
     "download-controls",
     "pause",
-    "cancel"
+    "cancel",
+    "dash-max-file-mb",
+    "dash-max-memory-mb",
+    "live-max-duration-minutes",
+    "live-max-file-mb",
+    "live-max-memory-mb",
+    "safety-settings-summary",
+    "safety-save",
+    "companion-status",
+    "companion-check",
+    "companion-prefer-dash",
+    "companion-prefer-live",
+    "companion-save"
   ]) {
     assert.match(html, new RegExp(`id="${id}"`));
   }
@@ -904,18 +929,22 @@ test("background loads qualities and starts direct browser downloads", async () 
     title: "Smoke Video"
   });
   assert.equal(result.count, 1);
-  assert.equal(result.method, "background-download");
+  assert.match(result.taskId, /^direct-/);
+  assert.equal(result.mode, "durl");
+  assert.equal(result.state, "in_progress");
+  assert.deepEqual(toPlain(result.downloadIds), [1]);
   assert.equal(downloadOptions.length, 1);
   assert.equal(downloadOptions[0].filename, "BiliDownload/Smoke Video_80.mp4");
   assert.equal(downloadOptions[0].url, "https://primary.hdslb.test/video.mp4");
   assert.equal(downloadOptions[0].headers, undefined);
-  assert.equal(result.diagnostics[0].initialItem.url.sample, "https://primary.hdslb.test/video.mp4");
-  assert.equal(result.diagnostics[0].initialItem.referrer, undefined);
-  assert.equal(result.diagnostics[0].phase, "complete");
-  assert.equal(result.diagnostics[0].latestItem.state, "complete");
-  assert.deepEqual(toPlain(result.diagnostics[0].dnr.checks[0].matchedRules), [
-    { ruleId: 3, rulesetId: "bili_media_headers" }
-  ]);
+  assert.equal(result.segments[0].context.downloadMethod, "native-download");
+  assert.equal(JSON.stringify(storage.directDownloadTasks[0]).includes("primary.hdslb.test"), false);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const completedTask = await sandbox.getDirectDownloadTask(result.taskId);
+  assert.equal(completedTask.state, "complete");
+  assert.equal(completedTask.completedCount, 1);
+  assert.equal(completedTask.segments[0].state, "complete");
+  assert.equal(completedTask.segments[0].receivedBytes, 10);
   assert.ok(fetchUrls.some((url) => url.includes("/x/web-interface/nav")));
   assert.ok(fetchUrls.some((url) => url.includes("fnval=4048")));
 
@@ -924,6 +953,10 @@ test("background loads qualities and starts direct browser downloads", async () 
   });
   assert.equal(diagnosticResponse.ok, true);
   assert.equal(diagnosticResponse.payload.phase, "complete");
+  assert.equal(diagnosticResponse.payload.initialItem.referrer, undefined);
+  assert.deepEqual(toPlain(diagnosticResponse.payload.dnr.checks[0].matchedRules), [
+    { ruleId: 3, rulesetId: "bili_media_headers" }
+  ]);
 
   const preparedResponse = await sendRuntimeMessage(messageListener, {
     type: "BILI_DOWNLOAD_PREPARE_DIRECT",
@@ -937,7 +970,7 @@ test("background loads qualities and starts direct browser downloads", async () 
   assert.equal(preparedResponse.ok, true);
   assert.equal(preparedResponse.payload.count, 1);
   assert.equal(preparedResponse.payload.mode, "durl");
-  assert.equal(preparedResponse.payload.segments[0].context.downloadMethod, "page-blob");
+  assert.equal(preparedResponse.payload.segments[0].context.downloadMethod, "native-download");
   assert.deepEqual(
     toPlain(preparedResponse.payload.segments[0].candidates),
     [
@@ -959,7 +992,8 @@ test("background loads qualities and starts direct browser downloads", async () 
       candidateCount: 2
     }
   });
-  assert.deepEqual(toPlain(portMessages), [{
+  const manualProgress = portMessages.at(-1);
+  assert.deepEqual(toPlain(manualProgress), {
     type: "BILI_DOWNLOAD_PAGE_PROGRESS",
     payload: {
       receivedBytes: 1024,
@@ -969,9 +1003,175 @@ test("background loads qualities and starts direct browser downloads", async () 
       candidateIndex: 1,
       candidateCount: 2,
       done: false,
+      taskId: "",
+      taskState: "",
+      nativeDownload: false,
+      downloadIds: [],
+      error: "",
       tabId: 0
     }
-  }]);
+  });
+  assert.ok(portMessages.some((message) => (
+    message.payload.nativeDownload && message.payload.taskId === result.taskId && message.payload.taskState === "complete"
+  )));
+
+  const canceledTask = await sandbox.startDirectDownload({
+    prepared: {
+      mode: "durl",
+      format: "mp4",
+      count: 1,
+      segments: [{
+        filename: "BiliDownload/Canceled.mp4",
+        size: 10,
+        candidates: [
+          { url: "https://primary.hdslb.test/canceled.mp4?token=primary-secret", kind: "primary", size: 10 },
+          { url: "https://backup.hdslb.test/canceled.mp4?token=backup-secret", kind: "backup", size: 10 }
+        ],
+        context: { bvid: "BV1KGj36QEG3", cid: 123, segmentIndex: 1, segmentCount: 1 }
+      }]
+    }
+  });
+  const canceledItem = downloadItems.get(2);
+  canceledItem.state = "interrupted";
+  canceledItem.error = "USER_CANCELED";
+  for (const listener of changeListeners) {
+    listener({
+      id: 2,
+      state: { previous: "in_progress", current: "interrupted" },
+      error: { current: "USER_CANCELED" }
+    });
+  }
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const canceledSnapshot = await sandbox.getDirectDownloadTask(canceledTask.taskId);
+  assert.equal(canceledSnapshot.state, "canceled");
+  assert.equal(canceledSnapshot.segments[0].state, "canceled");
+  assert.equal(downloadOptions.length, 2, "a browser-side cancel must not retry a backup CDN");
+  assert.doesNotMatch(JSON.stringify(storage.directDownloadTasks), /primary-secret|backup-secret/);
+
+  const restoredTask = sandbox.restoreDirectDownloadTask({
+    taskId: "restored-direct-task",
+    state: "in_progress",
+    segments: [
+      {
+        index: 1,
+        state: "in_progress",
+        downloadId: 99,
+        filename: "BiliDownload/current.mp4",
+        context: { bvid: "BV1KGj36QEG3", cid: 123, quality: 80, title: "Smoke Video" }
+      },
+      {
+        index: 2,
+        state: "queued",
+        filename: "BiliDownload/next.mp4",
+        context: { bvid: "BV1KGj36QEG3", cid: 123, quality: 80, title: "Smoke Video" }
+      }
+    ]
+  });
+  assert.equal(restoredTask.segments[1].candidates.length, 0);
+  restoredTask.segments[0].state = "complete";
+  sandbox.restoredTask = restoredTask;
+  sandbox.recoveryPrepared = {
+    mode: "durl",
+    format: "mp4",
+    segments: [
+      {
+        filename: "BiliDownload/current.mp4",
+        size: 10,
+        candidates: [{ url: "https://recovered-primary.hdslb.test/current.mp4?token=current-secret", kind: "primary", size: 10 }],
+        context: { bvid: "BV1KGj36QEG3", cid: 123, quality: 80, title: "Smoke Video" }
+      },
+      {
+        filename: "BiliDownload/next.mp4",
+        size: 10,
+        candidates: [{ url: "https://recovered-primary.hdslb.test/next.mp4?token=next-secret", kind: "primary", size: 10 }],
+        context: { bvid: "BV1KGj36QEG3", cid: 123, quality: 80, title: "Smoke Video" }
+      }
+    ]
+  };
+  vm.runInContext("directDownloadTasks.set(restoredTask.id, restoredTask)", sandbox);
+  vm.runInContext("rebuildDirectDownloadTaskPayload = async () => recoveryPrepared", sandbox);
+  await sandbox.advanceDirectDownloadTask(restoredTask);
+  assert.equal(restoredTask.state, "in_progress");
+  assert.equal(restoredTask.segments[1].state, "in_progress");
+  assert.equal(downloadOptions.length, 3);
+  assert.equal(downloadOptions[2].url, "https://recovered-primary.hdslb.test/next.mp4?token=next-secret");
+  assert.doesNotMatch(JSON.stringify(storage.directDownloadTasks), /current-secret|next-secret/);
+});
+
+
+test("background honors a queued native cancellation before starting a media request", async () => {
+  const code = await readFile("extension/src/background.js", "utf8");
+  const storage = {};
+  let downloadCalls = 0;
+
+  const sandbox = {
+    Array,
+    Date,
+    Error,
+    Number,
+    Promise,
+    String,
+    URL,
+    URLSearchParams,
+    chrome: {
+      runtime: {
+        lastError: null,
+        onMessage: {
+          addListener() {}
+        },
+        onConnect: {
+          addListener() {}
+        }
+      },
+      downloads: {
+        download() {
+          downloadCalls += 1;
+        },
+        onChanged: {
+          addListener() {}
+        }
+      },
+      storage: {
+        local: {
+          async get(key) {
+            return { [key]: storage[key] };
+          },
+          async set(values) {
+            Object.assign(storage, values);
+          }
+        }
+      }
+    }
+  };
+
+  vm.createContext(sandbox);
+  vm.runInContext(code, sandbox);
+  const task = sandbox.createDirectDownloadTask({
+    mode: "durl",
+    format: "mp4",
+    segments: [{
+      filename: "BiliDownload/canceled.mp4",
+      size: 1024,
+      candidates: [{
+        url: "https://primary.hdslb.test/canceled.mp4?token=should-not-persist",
+        kind: "primary",
+        size: 1024
+      }],
+      context: { bvid: "BV1KGj36QEG3", cid: 123, title: "Canceled" }
+    }]
+  });
+  sandbox.taskForNativeCancelTest = task;
+  vm.runInContext("directDownloadTasks.set(taskForNativeCancelTest.id, taskForNativeCancelTest)", sandbox);
+  task.requestedAction = "cancel";
+
+  await sandbox.startDirectDownloadSegment(task, task.segments[0]);
+
+  assert.equal(downloadCalls, 0);
+  assert.equal(task.state, "canceled");
+  assert.equal(task.segments[0].state, "canceled");
+  assert.equal(task.segments[0].candidates.length, 0);
+  assert.equal(JSON.stringify(storage.directDownloadTasks[0]).includes("token=should-not-persist"), false);
+  assert.equal(JSON.stringify(storage.directDownloadTasks[0]).includes("primary.hdslb.test"), false);
 });
 
 
@@ -2273,6 +2473,7 @@ test("popup lets users choose specific multi-page videos to download", async () 
   const code = await readFile("extension/src/popup.js", "utf8");
   const runtimeMessages = [];
   const scriptCalls = [];
+  const mockBatchResponse = createMockBatchJobHandler();
   const statusElement = textElement();
   const accountElement = textElement();
   const qualitySelect = selectElement();
@@ -2369,6 +2570,10 @@ test("popup lets users choose specific multi-page videos to download", async () 
         },
         async sendMessage(message) {
           runtimeMessages.push(message);
+          const batchResponse = mockBatchResponse(message);
+          if (batchResponse) {
+            return batchResponse;
+          }
           if (message.type === "BILI_DOWNLOAD_GET_DIAGNOSTIC") {
             return { ok: true, payload: null };
           }
@@ -2441,6 +2646,28 @@ test("popup lets users choose specific multi-page videos to download", async () 
               }
             };
           }
+          if (message.type === "BILI_DOWNLOAD_START_DIRECT") {
+            const segment = message.payload.prepared.segments[0];
+            return {
+              ok: true,
+              payload: {
+                taskId: `native-${segment.context.cid}`,
+                state: "complete",
+                count: 1,
+                receivedBytes: segment.size,
+                totalBytes: segment.size,
+                segments: [{
+                  index: 1,
+                  state: "complete",
+                  filename: segment.filename,
+                  receivedBytes: segment.size,
+                  totalBytes: segment.size,
+                  candidateIndex: 1,
+                  candidateCount: 1
+                }]
+              }
+            };
+          }
           if (message.type === "BILI_DOWNLOAD_SAVE_DIAGNOSTIC") {
             return { ok: true };
           }
@@ -2504,9 +2731,14 @@ test("popup lets users choose specific multi-page videos to download", async () 
     "Multi Page Video_P01_Opening",
     "Multi Page Video_P03_Ending"
   ]);
-  assert.equal(scriptCalls.length, 2);
-  assert.equal(scriptCalls[0].args[1], "Multi Page Video_P01_Opening_64.mp4");
-  assert.equal(scriptCalls[1].args[1], "Multi Page Video_P03_Ending_64.mp4");
+  const directStartPayloads = runtimeMessages
+    .filter((message) => message.type === "BILI_DOWNLOAD_START_DIRECT")
+    .map((message) => message.payload.prepared);
+  assert.deepEqual(directStartPayloads.map((prepared) => prepared.segments[0].filename), [
+    "BiliDownload/Multi Page Video_P01_Opening_64.mp4",
+    "BiliDownload/Multi Page Video_P03_Ending_64.mp4"
+  ]);
+  assert.equal(scriptCalls.length, 0);
   assert.match(statusElement.textContent, /2$/);
 
   scriptCalls.length = 0;
@@ -2521,9 +2753,14 @@ test("popup lets users choose specific multi-page videos to download", async () 
     "Multi Page Video_P01_Opening_audio",
     "Multi Page Video_P03_Ending_audio"
   ]);
-  assert.equal(scriptCalls.length, 2);
-  assert.equal(scriptCalls[0].args[1], "Multi Page Video_P01_Opening_audio.m4a");
-  assert.equal(scriptCalls[1].args[1], "Multi Page Video_P03_Ending_audio.m4a");
+  const audioStartPayloads = runtimeMessages
+    .filter((message) => message.type === "BILI_DOWNLOAD_START_DIRECT")
+    .map((message) => message.payload.prepared);
+  assert.deepEqual(audioStartPayloads.map((prepared) => prepared.segments[0].filename), [
+    "BiliDownload/Multi Page Video_P01_Opening_audio.m4a",
+    "BiliDownload/Multi Page Video_P03_Ending_audio.m4a"
+  ]);
+  assert.equal(scriptCalls.length, 0);
   assert.match(statusElement.textContent, /2$/);
 });
 
@@ -2532,6 +2769,7 @@ test("popup sends Bangumi episode ids for selected episode downloads", async () 
   const code = await readFile("extension/src/popup.js", "utf8");
   const runtimeMessages = [];
   const scriptCalls = [];
+  const mockBatchResponse = createMockBatchJobHandler();
   const statusElement = textElement();
   const qualitySelect = selectElement();
   const bvidInput = textElement();
@@ -2627,6 +2865,10 @@ test("popup sends Bangumi episode ids for selected episode downloads", async () 
         },
         async sendMessage(message) {
           runtimeMessages.push(message);
+          const batchResponse = mockBatchResponse(message);
+          if (batchResponse) {
+            return batchResponse;
+          }
           if (message.type === "BILI_DOWNLOAD_GET_DIAGNOSTIC") {
             return { ok: true, payload: null };
           }
@@ -2705,6 +2947,28 @@ test("popup sends Bangumi episode ids for selected episode downloads", async () 
               }
             };
           }
+          if (message.type === "BILI_DOWNLOAD_START_DIRECT") {
+            const segment = message.payload.prepared.segments[0];
+            return {
+              ok: true,
+              payload: {
+                taskId: `native-${segment.context.epId}`,
+                state: "complete",
+                count: 1,
+                receivedBytes: segment.size,
+                totalBytes: segment.size,
+                segments: [{
+                  index: 1,
+                  state: "complete",
+                  filename: segment.filename,
+                  receivedBytes: segment.size,
+                  totalBytes: segment.size,
+                  candidateIndex: 1,
+                  candidateCount: 1
+                }]
+              }
+            };
+          }
           if (message.type === "BILI_DOWNLOAD_SAVE_DIAGNOSTIC") {
             return { ok: true };
           }
@@ -2757,8 +3021,16 @@ test("popup sends Bangumi episode ids for selected episode downloads", async () 
   assert.equal(audioPayload.epId, 28161);
   assert.equal(audioPayload.cid, 49052510);
   assert.equal(audioPayload.title, "Bangumi Season_P02_Episode One_audio");
-  assert.equal(scriptCalls[0].args[1], "Bangumi Season_P02_Episode One_64.mp4");
-  assert.equal(scriptCalls[1].args[1], "Bangumi Season_P02_Episode One_audio.m4a");
+  const directStarts = runtimeMessages.filter((message) => message.type === "BILI_DOWNLOAD_START_DIRECT");
+  assert.equal(
+    directStarts[0].payload.prepared.segments[0].filename,
+    "BiliDownload/Bangumi Season_P02_Episode One_64.mp4"
+  );
+  assert.equal(
+    directStarts[1].payload.prepared.segments[0].filename,
+    "BiliDownload/Bangumi Season_P02_Episode One_audio.m4a"
+  );
+  assert.equal(scriptCalls.length, 0);
 });
 
 
@@ -2885,6 +3157,28 @@ test("popup downloads current page audio as a standalone file", async () => {
               }
             };
           }
+          if (message.type === "BILI_DOWNLOAD_START_DIRECT") {
+            const segment = message.payload.prepared.segments[0];
+            return {
+              ok: true,
+              payload: {
+                taskId: "native-audio-123",
+                state: "complete",
+                count: 1,
+                receivedBytes: segment.size,
+                totalBytes: segment.size,
+                segments: [{
+                  index: 1,
+                  state: "complete",
+                  filename: segment.filename,
+                  receivedBytes: segment.size,
+                  totalBytes: segment.size,
+                  candidateIndex: 1,
+                  candidateCount: 1
+                }]
+              }
+            };
+          }
           if (message.type === "BILI_DOWNLOAD_SAVE_DIAGNOSTIC") {
             return { ok: true };
           }
@@ -2922,8 +3216,9 @@ test("popup downloads current page audio as a standalone file", async () => {
   const audioPayload = runtimeMessages.find((message) => message.type === "BILI_DOWNLOAD_PREPARE_AUDIO").payload;
   assert.equal(audioPayload.cid, 123);
   assert.equal(audioPayload.title, "Smoke Video_audio");
-  assert.equal(scriptCalls.length, 1);
-  assert.equal(scriptCalls[0].args[1], "Smoke Video_audio.m4a");
+  const directStart = runtimeMessages.find((message) => message.type === "BILI_DOWNLOAD_START_DIRECT");
+  assert.equal(directStart.payload.prepared.segments[0].filename, "BiliDownload/Smoke Video_audio.m4a");
+  assert.equal(scriptCalls.length, 0);
   assert.match(statusElement.textContent, /1$/);
 });
 
@@ -3424,6 +3719,10 @@ test("popup uses parallel extension range download for bilivideo media", async (
   const savedAnchors = [];
   const objectUrls = [];
   const totalSize = 12 * 1024 * 1024;
+  let rangeResponseMode = "normal";
+  let rangeCancelCalls = 0;
+  let rangeBlobCalls = 0;
+  let singleBlobCalls = 0;
   class TestURL extends URL {
     static createObjectURL(blob) {
       const value = `blob:range-test/${objectUrls.length + 1}`;
@@ -3445,29 +3744,76 @@ test("popup uses parallel extension range download for bilivideo media", async (
     async fetch(url, options = {}) {
       fetchCalls.push({ url, headers: options.headers || {} });
       const rangeHeader = options.headers?.Range || options.headers?.range;
+      if (!rangeHeader) {
+        return {
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          headers: {
+            get(name) {
+              return String(name).toLowerCase() === "content-length" ? "4" : "video/mp4";
+            }
+          },
+          async blob() {
+            singleBlobCalls += 1;
+            return new Blob([new Uint8Array(4)], { type: "video/mp4" });
+          }
+        };
+      }
       assert.ok(rangeHeader, "parallel download should use Range requests");
       const match = String(rangeHeader).match(/bytes=(\d+)-(\d+)/);
       assert.ok(match, `invalid range header: ${rangeHeader}`);
       const start = Number(match[1]);
       const end = Number(match[2]);
       const length = end - start + 1;
+      const headers = {
+        get(name) {
+          if (name.toLowerCase() === "content-type") {
+            return "video/mp4";
+          }
+          if (name.toLowerCase() === "content-length") {
+            return String(length);
+          }
+          return null;
+        }
+      };
+      if (rangeResponseMode === "no-reader") {
+        return {
+          ok: true,
+          status: 206,
+          statusText: "Partial Content",
+          headers,
+          async blob() {
+            rangeBlobCalls += 1;
+            return new Blob([new Uint8Array(length)], { type: "video/mp4" });
+          }
+        };
+      }
       return {
         ok: true,
         status: 206,
         statusText: "Partial Content",
-        headers: {
-          get(name) {
-            if (name.toLowerCase() === "content-type") {
-              return "video/mp4";
-            }
-            if (name.toLowerCase() === "content-length") {
-              return String(length);
-            }
-            return null;
+        headers,
+        body: {
+          getReader() {
+            let sent = false;
+            return {
+              async read() {
+                if (sent) {
+                  return { done: true };
+                }
+                sent = true;
+                return {
+                  done: false,
+                  value: new Uint8Array(rangeResponseMode === "oversized" ? length + 1 : length)
+                };
+              },
+              cancel() {
+                rangeCancelCalls += 1;
+                return Promise.resolve();
+              }
+            };
           }
-        },
-        async blob() {
-          return new Blob([new Uint8Array(length)], { type: "video/mp4" });
         }
       };
     },
@@ -3648,6 +3994,30 @@ test("popup uses parallel extension range download for bilivideo media", async (
   assert.equal(savedDiagnostic.extensionCandidateAttempts[0].fetch.concurrency, 3);
   assert.equal(savedDiagnostic.saved.method, "extension-blob");
   assert.equal(savedDiagnostic.saved.mode, "extension-range");
+
+  rangeResponseMode = "oversized";
+  await assert.rejects(
+    sandbox.fetchRangeChunk("https://range.test/media", { start: 0, end: 3 }, () => {}),
+    (error) => error?.name === "MediaSafetyLimitError"
+  );
+  assert.equal(rangeCancelCalls, 1);
+
+  rangeResponseMode = "no-reader";
+  await assert.rejects(
+    sandbox.fetchRangeChunk("https://range.test/media", { start: 0, end: 3 }, () => {}),
+    /不支持安全的流式读取/
+  );
+  assert.equal(rangeBlobCalls, 0);
+
+  const singleNoReader = await sandbox.fetchMediaInExtensionSingle(
+    "https://range.test/media",
+    "BiliDownload/safe.mp4",
+    false,
+    { totalBytes: 4 },
+    { maxBytes: 4, limitMessage: "stream required" }
+  );
+  assert.equal(singleNoReader.limitReached, true);
+  assert.equal(singleBlobCalls, 0);
 });
 
 
@@ -4160,6 +4530,7 @@ test("popup muxes DASH segments into one MP4 download", async () => {
       const body = String(url).includes("video")
         ? new Blob([makeFragmentedVideoTrack()], { type: "video/mp4" })
         : new Blob([makeFragmentedAudioTrack()], { type: "audio/mp4" });
+      const bodyBytes = new Uint8Array(await body.arrayBuffer());
       return {
         ok: true,
         status: options.headers?.Range ? 206 : 200,
@@ -4173,6 +4544,20 @@ test("popup muxes DASH segments into one MP4 download", async () => {
               return body.type;
             }
             return null;
+          }
+        },
+        body: {
+          getReader() {
+            let sent = false;
+            return {
+              async read() {
+                if (sent) {
+                  return { done: true };
+                }
+                sent = true;
+                return { done: false, value: bodyBytes };
+              }
+            };
           }
         },
         async blob() {
@@ -4378,6 +4763,94 @@ test("popup muxes DASH segments into one MP4 download", async () => {
 });
 
 
+test("popup blocks oversized DASH media before buffering it in memory", async () => {
+  const code = await readFile("extension/src/popup.js", "utf8");
+  const elements = {
+    "#status": textElement(),
+    "#account": textElement(),
+    "#bvid": textElement(),
+    "#title": textElement(),
+    "#quality": selectElement(),
+    "#quality-size": textElement(),
+    "#copy": buttonElement(),
+    "#download": buttonElement(),
+    "#download-audio": buttonElement(),
+    "#live-record": buttonElement(),
+    "#page-picker-toggle": buttonElement(),
+    "#page-picker": panelElement(),
+    "#page-list": containerElement(),
+    "#page-select-all": buttonElement(),
+    "#download-selected-pages": buttonElement(),
+    "#download-selected-page-audio": buttonElement(),
+    "#diagnostic": buttonElement(),
+    "#progress": panelElement(),
+    "#progress-percent": textElement(),
+    "#progress-bar": styleElement(),
+    "#progress-size": textElement(),
+    "#progress-speed": textElement(),
+    "#download-controls": panelElement(),
+    "#pause": buttonElement(),
+    "#cancel": buttonElement()
+  };
+  let fetchCalls = 0;
+  const sandbox = {
+    AbortController,
+    Blob,
+    Date,
+    Error,
+    RegExp,
+    String,
+    URL,
+    console,
+    setTimeout,
+    document: {
+      addEventListener() {},
+      querySelector(selector) {
+        return elements[selector];
+      }
+    },
+    fetch() {
+      fetchCalls += 1;
+      throw new Error("oversized DASH must be rejected before fetching");
+    },
+    chrome: {
+      runtime: {
+        connect() {
+          return {
+            onMessage: {
+              addListener() {}
+            }
+          };
+        }
+      },
+      tabs: {
+        onActivated: { addListener() {} },
+        onUpdated: { addListener() {} }
+      }
+    }
+  };
+
+  vm.createContext(sandbox);
+  vm.runInContext(code, sandbox);
+  vm.runInContext(`state.safetySettings = {
+    dashMaxFileMb: 16,
+    dashMaxMemoryMb: 128,
+    liveMaxDurationMinutes: 120,
+    liveMaxFileMb: 1024
+  };`, sandbox);
+
+  const oversized = 17 * 1024 * 1024;
+  await assert.rejects(
+    sandbox.downloadDashAsMp4({
+      count: 2,
+      segments: [{ size: oversized }, { size: 1024 }]
+    }),
+    /DASH/
+  );
+  assert.equal(fetchCalls, 0);
+});
+
+
 test("popup records a live FLV stream until the user stops it", async () => {
   const code = await readFile("extension/src/popup.js", "utf8");
   const runtimeMessages = [];
@@ -4396,12 +4869,31 @@ test("popup records a live FLV stream until the user stops it", async () => {
   const progressBar = styleElement();
   const progressSize = textElement();
   let pendingRead = null;
+  let rejectPendingRead = null;
   let abortListener = null;
+  let livePacket = new Uint8Array([1, 2, 3, 4]);
+  let blockFirstLivePacket = false;
+  let abortLiveReadWithNetworkError = false;
+  let liveLimitTimer = null;
+  let liveLimitDelay = 0;
+  let liveCandidates = [{
+    url: "https://live-primary.bilivideo.com/live/test.flv?token=1",
+    kind: "primary",
+    size: 0
+  }];
+  let failingLiveCandidate = "";
+  const liveFetchUrls = [];
+  let fakeNow = Date.now();
+  class TestDate extends Date {
+    static now() {
+      return fakeNow;
+    }
+  }
 
   const sandbox = {
     AbortController,
     Blob,
-    Date,
+    Date: TestDate,
     Error,
     RegExp,
     String,
@@ -4418,12 +4910,15 @@ test("popup records a live FLV stream until the user stops it", async () => {
       }
     },
     setTimeout(callback, delay) {
-      if (delay) {
+      if (delay === 30000) {
         callback();
-        return 1;
+      } else if (delay > 0) {
+        liveLimitTimer = callback;
+        liveLimitDelay = delay;
       }
-      return setTimeout(callback, delay);
+      return 1;
     },
+    clearTimeout() {},
     document: {
       addEventListener() {},
       body: {
@@ -4474,10 +4969,20 @@ test("popup records a live FLV stream until the user stops it", async () => {
         }[selector];
       }
     },
-    fetch: async (_url, options = {}) => {
+    fetch: async (url, options = {}) => {
+      liveFetchUrls.push(url);
+      if (url === failingLiveCandidate) {
+        fakeNow += 55 * 1000;
+        throw new Error("primary live candidate failed");
+      }
       abortListener = () => {
-        pendingRead?.({ done: true });
+        if (abortLiveReadWithNetworkError) {
+          rejectPendingRead?.(new Error("live stream disconnected after abort"));
+        } else {
+          pendingRead?.({ done: true });
+        }
         pendingRead = null;
+        rejectPendingRead = null;
       };
       options.signal?.addEventListener?.("abort", abortListener);
       return {
@@ -4496,10 +5001,17 @@ test("popup records a live FLV stream until the user stops it", async () => {
               async read() {
                 count += 1;
                 if (count === 1) {
-                  return { done: false, value: new Uint8Array([1, 2, 3, 4]) };
+                  if (blockFirstLivePacket) {
+                    return new Promise((resolve, reject) => {
+                      pendingRead = resolve;
+                      rejectPendingRead = reject;
+                    });
+                  }
+                  return { done: false, value: livePacket };
                 }
-                return new Promise((resolve) => {
+                return new Promise((resolve, reject) => {
                   pendingRead = resolve;
+                  rejectPendingRead = reject;
                 });
               }
             };
@@ -4581,10 +5093,10 @@ test("popup records a live FLV stream until the user stops it", async () => {
                 format: "flv",
                 live: { roomId: 7734200, title: "Live Test" },
                 segments: [{
-                  url: "https://live-primary.bilivideo.com/live/test.flv?token=1",
+                  url: liveCandidates[0].url,
                   filename: "BiliDownload/Live Test_20260628_120000.flv",
-                  size: 0,
-                  candidates: [{ url: "https://live-primary.bilivideo.com/live/test.flv?token=1", kind: "primary", size: 0 }],
+                  size: liveCandidates[0].size,
+                  candidates: liveCandidates,
                   context: {
                     roomId: 7734200,
                     source: "live",
@@ -4651,14 +5163,92 @@ test("popup records a live FLV stream until the user stops it", async () => {
   assert.equal(savedDiagnostic.phase, "complete");
   assert.equal(savedDiagnostic.saved.mode, "live-flv");
   assert.equal(savedDiagnostic.saved.size, 4);
+
+  const savedCountBeforeImmediateStop = savedAnchors.length;
+  const immediateStop = sandbox.startLiveRecording();
+  sandbox.stopLiveRecording();
+  await immediateStop;
+
+  assert.equal(savedAnchors.length, savedCountBeforeImmediateStop);
+  assert.match(statusElement.textContent, /未保存文件/);
+
+  vm.runInContext(`state.safetySettings = {
+    dashMaxFileMb: 512,
+    dashMaxMemoryMb: 1536,
+    liveMaxDurationMinutes: 120,
+    liveMaxFileMb: 1024,
+    liveMaxMemoryMb: 32
+  };`, sandbox);
+  livePacket = new Uint8Array(17 * 1024 * 1024);
+  const savedCountBeforeLimit = savedAnchors.length;
+  await sandbox.startLiveRecording();
+
+  assert.equal(savedAnchors.length, savedCountBeforeLimit);
+  assert.match(statusElement.textContent, /安全上限/);
+
+  vm.runInContext(`state.safetySettings = {
+    dashMaxFileMb: 512,
+    dashMaxMemoryMb: 1536,
+    liveMaxDurationMinutes: 1,
+    liveMaxFileMb: 1024,
+    liveMaxMemoryMb: 1536
+  };`, sandbox);
+  blockFirstLivePacket = true;
+  pendingRead = null;
+  const savedCountBeforeDurationLimit = savedAnchors.length;
+  const durationLimited = sandbox.startLiveRecording();
+  for (let index = 0; index < 20 && !pendingRead; index += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  assert.equal(typeof liveLimitTimer, "function");
+  liveLimitTimer();
+  await durationLimited;
+
+  assert.equal(savedAnchors.length, savedCountBeforeDurationLimit);
+  assert.match(statusElement.textContent, /安全上限/);
+
+  liveCandidates = [{
+    url: "https://live-primary.bilivideo.com/live/test.flv?token=1",
+    kind: "primary",
+    size: 0
+  }, {
+    url: "https://live-backup.bilivideo.com/live/test.flv?token=2",
+    kind: "backup",
+    size: 0
+  }];
+  failingLiveCandidate = liveCandidates[0].url;
+  blockFirstLivePacket = true;
+  pendingRead = null;
+  liveLimitTimer = null;
+  liveLimitDelay = 0;
+  abortLiveReadWithNetworkError = true;
+  fakeNow = Date.now();
+  const savedCountBeforeCandidateDeadline = savedAnchors.length;
+  const candidateDeadline = sandbox.startLiveRecording();
+  for (let index = 0; index < 20 && !pendingRead; index += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  assert.deepEqual(liveFetchUrls.slice(-2), liveCandidates.map((candidate) => candidate.url));
+  assert.equal(typeof liveLimitTimer, "function");
+  assert.equal(liveLimitDelay, 5000);
+  liveLimitTimer();
+  await candidateDeadline;
+
+  assert.equal(savedAnchors.length, savedCountBeforeCandidateDeadline);
+  assert.match(statusElement.textContent, /安全上限/);
+  abortLiveReadWithNetworkError = false;
 });
 
 
-test("background captures interrupted download diagnostics", async () => {
+test("background redacts signed download URLs and local paths before persisting diagnostics", async () => {
   const code = await readFile("extension/src/background.js", "utf8");
-  const downloadItems = new Map();
-  const changeListeners = new Set();
   const storage = {};
+  const signedUrl = "https://cdn.hdslb.test/media/video.mp4?token=secret-token&deadline=123456";
+  const redirectedUrl = "https://backup.hdslb.test/media/video.mp4?sign=private-signature";
+  const localPath = "C:\\Users\\Alice\\Downloads\\private-video.mp4";
+  const unixPath = "/home/alice/Videos/private-unix-video.mp4";
+  const fileUrl = "file:///C:/Users/Alice/Documents/private-file-video.mp4";
+  const sensitiveValue = "diagnostic-token-value";
 
   const sandbox = {
     Array,
@@ -4669,8 +5259,6 @@ test("background captures interrupted download diagnostics", async () => {
     String,
     URL,
     URLSearchParams,
-    clearTimeout,
-    setTimeout,
     chrome: {
       runtime: {
         lastError: null,
@@ -4681,54 +5269,6 @@ test("background captures interrupted download diagnostics", async () => {
       declarativeNetRequest: {
         onRuleMatchedDebug: {
           addListener() {}
-        },
-        async testMatchOutcome() {
-          return { matchedRules: [] };
-        }
-      },
-      downloads: {
-        download(options, callback) {
-          const id = 8;
-          downloadItems.set(id, {
-            id,
-            url: options.url,
-            finalUrl: options.url,
-            filename: options.filename,
-            mime: "video/mp4",
-            state: "in_progress",
-            danger: "safe",
-            error: null,
-            totalBytes: 0,
-            bytesReceived: 0
-          });
-          callback(id);
-          setTimeout(() => {
-            const item = downloadItems.get(id);
-            Object.assign(item, {
-              state: "interrupted",
-              error: "SERVER_FORBIDDEN",
-              danger: "file"
-            });
-            for (const listener of changeListeners) {
-              listener({
-                id,
-                state: { previous: "in_progress", current: "interrupted" },
-                error: { current: "SERVER_FORBIDDEN" },
-                danger: { previous: "safe", current: "file" }
-              });
-            }
-          }, 0);
-        },
-        search(query, callback) {
-          callback([downloadItems.get(query.id)].filter(Boolean));
-        },
-        onChanged: {
-          addListener(listener) {
-            changeListeners.add(listener);
-          },
-          removeListener(listener) {
-            changeListeners.delete(listener);
-          }
         }
       },
       storage: {
@@ -4747,31 +5287,321 @@ test("background captures interrupted download diagnostics", async () => {
   vm.createContext(sandbox);
   vm.runInContext(code, sandbox);
 
-  let error = null;
-  try {
-    await sandbox.downloadFileWithDiagnostics({
-      options: {
-        url: "https://example.hdslb.test/forbidden.mp4",
-        filename: "BiliDownload/forbidden.mp4",
-        conflictAction: "uniquify",
-        saveAs: false
-      },
-      context: { bvid: "BV1KGj36QEG3" }
-    });
-  } catch (caught) {
-    error = caught;
-  }
+  const delta = sandbox.pickDownloadDelta({
+    id: 42,
+    url: { previous: signedUrl, current: redirectedUrl },
+    finalUrl: { current: redirectedUrl },
+    filename: { previous: localPath, current: "C:\\Users\\Alice\\Downloads\\renamed-video.mp4" }
+  });
+  assert.equal(delta.url.previous.sample, "https://cdn.hdslb.test/media/video.mp4?...");
+  assert.equal(delta.url.current.sample, "https://backup.hdslb.test/media/video.mp4?...");
+  assert.equal(delta.finalUrl.current.sample, "https://backup.hdslb.test/media/video.mp4?...");
+  assert.equal(delta.filename.previous, "private-video.mp4");
+  assert.equal(delta.filename.current, "renamed-video.mp4");
 
-  assert.ok(error);
-  assert.match(error.message, /SERVER_FORBIDDEN/);
-  assert.equal(error.diagnostic.phase, "interrupted");
-  assert.equal(error.diagnostic.latestItem.error, "SERVER_FORBIDDEN");
-  assert.equal(error.diagnostic.events[0].delta.error.current, "SERVER_FORBIDDEN");
-  assert.equal(storage.lastDiagnostic.latestItem.error, "SERVER_FORBIDDEN");
+  const item = sandbox.pickDownloadItem({
+    id: 42,
+    url: signedUrl,
+    finalUrl: redirectedUrl,
+    filename: localPath,
+    state: "interrupted"
+  });
+  assert.equal(item.filename, "private-video.mp4");
+
+  await sandbox.setLastDiagnostic({
+    phase: "interrupted",
+    request: {
+      media: signedUrl,
+      filename: localPath,
+      unixPath,
+      fileUrl
+    },
+    latestItem: item,
+    events: [{ delta }],
+    accessToken: sensitiveValue,
+    requestSignature: "diagnostic-signature-value",
+    accessKey: "diagnostic-access-key-value",
+    nested: {
+      cookie: "SESSDATA=diagnostic-cookie-value",
+      authorization: "Bearer diagnostic-authorization-value",
+      sessionCredential: "diagnostic-session-value"
+    },
+    error: `Failed to fetch ${signedUrl}; token=${sensitiveValue}; signature=diagnostic-signature-text-value; Authorization: Bearer diagnostic-authorization-value; ` +
+      `paths: ${localPath}, ${unixPath}, ${fileUrl}`
+  });
+
+  const persisted = JSON.stringify(storage.lastDiagnostic);
+  assert.doesNotMatch(
+    persisted,
+    /secret-token|private-signature|diagnostic-token-value|diagnostic-signature-value|diagnostic-signature-text-value|diagnostic-access-key-value|diagnostic-cookie-value|diagnostic-authorization-value|diagnostic-session-value|Alice|\/home\/alice|file:\/\//
+  );
+  assert.equal(storage.lastDiagnostic.request.filename, "private-video.mp4");
+  assert.equal(storage.lastDiagnostic.latestItem.filename, "private-video.mp4");
+  assert.equal(storage.lastDiagnostic.accessToken, "[Sensitive value redacted]");
+  assert.equal(storage.lastDiagnostic.requestSignature, "[Sensitive value redacted]");
+  assert.equal(storage.lastDiagnostic.accessKey, "[Sensitive value redacted]");
+  assert.equal(storage.lastDiagnostic.nested.cookie, "[Sensitive value redacted]");
+  assert.equal(storage.lastDiagnostic.nested.authorization, "[Sensitive value redacted]");
+  assert.equal(storage.lastDiagnostic.nested.sessionCredential, "[Sensitive value redacted]");
+  assert.equal(storage.lastDiagnostic.request.unixPath, "[local path private-unix-video.mp4]");
+  assert.equal(storage.lastDiagnostic.request.fileUrl.sample, "[local path private-file-video.mp4]");
+
+  // Reading an older diagnostic also rewrites it through the same safe boundary.
+  storage.lastDiagnostic = {
+    request: { media: signedUrl, filename: localPath },
+    secret: "legacy-secret-value",
+    error: `Failed to fetch ${redirectedUrl} at ${unixPath}`
+  };
+  vm.runInContext("lastDiagnostic = null", sandbox);
+  const recovered = await sandbox.getLastDiagnostic();
+  assert.doesNotMatch(JSON.stringify(recovered), /secret-token|private-signature|legacy-secret-value|Alice|\/home\/alice/);
+  assert.doesNotMatch(JSON.stringify(storage.lastDiagnostic), /secret-token|private-signature|legacy-secret-value|Alice|\/home\/alice/);
 });
 
 
-test("background error responses are message-serializable", async () => {
+test("background task snapshots redact error credentials and local paths before storage", async () => {
+  const code = await readFile("extension/src/background.js", "utf8");
+  const storage = {};
+  const windowsPath = "C:\\Users\\Alice\\Downloads\\snapshot-video.mp4";
+  const unixPath = "/Users/alice/Movies/snapshot-unix-video.mp4";
+  const fileUrl = "file:///C:/Users/Alice/Documents/snapshot-file-video.mp4";
+  const sandbox = {
+    Array,
+    Date,
+    Error,
+    Number,
+    Promise,
+    String,
+    URL,
+    URLSearchParams,
+    chrome: {
+      runtime: {
+        lastError: null,
+        onMessage: {
+          addListener() {}
+        }
+      },
+      declarativeNetRequest: {
+        onRuleMatchedDebug: {
+          addListener() {}
+        }
+      },
+      storage: {
+        local: {
+          async get(key) {
+            return { [key]: storage[key] };
+          },
+          async set(values) {
+            Object.assign(storage, values);
+          }
+        }
+      }
+    }
+  };
+
+  vm.createContext(sandbox);
+  vm.runInContext(code, sandbox);
+
+  sandbox.rawTask = {
+    id: "direct-privacy-smoke",
+    state: "interrupted",
+    mode: "durl",
+    format: "flv",
+    createdAt: "2026-08-09T00:00:00.000Z",
+    updatedAt: "2026-08-09T00:00:00.000Z",
+    error: `token=task-token-value at ${unixPath}`,
+    segments: [{
+      index: 1,
+      downloadId: 42,
+      state: "interrupted",
+      filename: windowsPath,
+      size: 10,
+      receivedBytes: 0,
+      totalBytes: 10,
+      candidateIndex: 1,
+      candidateCount: 1,
+      error: `Authorization: Bearer task-authorization-value from ${fileUrl}`,
+      context: {
+        bvid: "BV1KGj36QEG3",
+        title: `Failed output ${windowsPath}`
+      }
+    }]
+  };
+
+  await vm.runInContext(
+    "(async () => { directDownloadTasks.set(rawTask.id, rawTask); await persistDirectDownloadTasks(); })()",
+    sandbox
+  );
+
+  const snapshot = storage.directDownloadTasks?.[0];
+  assert.ok(snapshot);
+  assert.equal(snapshot.error, "token=[Sensitive value redacted] at [local path snapshot-unix-video.mp4]");
+  assert.equal(snapshot.segments[0].filename, "snapshot-video.mp4");
+  assert.doesNotMatch(
+    JSON.stringify(snapshot),
+    /task-token-value|task-authorization-value|Alice|\/Users\/alice|file:\/\//
+  );
+});
+
+
+test("popup redacts signed diagnostics before sending them or copying them", async () => {
+  const code = await readFile("extension/src/popup.js", "utf8");
+  const runtimeMessages = [];
+  const clipboardWrites = [];
+  const statusElement = textElement();
+  const qualitySelect = selectElement();
+  qualitySelect.value = "80";
+  const signedUrl = "https://cdn.hdslb.test/media/video.mp4?token=popup-secret&deadline=123456";
+  const redirectedUrl = "https://backup.hdslb.test/media/video.mp4?sign=popup-signature";
+  const localPath = "C:\\Users\\Alice\\Downloads\\private-video.mp4";
+  const unixPath = "/home/alice/Videos/popup-unix-video.mp4";
+  const fileUrl = "file:///C:/Users/Alice/Documents/popup-file-video.mp4";
+  const elements = {
+    "#status": statusElement,
+    "#account": textElement(),
+    "#bvid": textElement(),
+    "#title": textElement(),
+    "#quality": qualitySelect,
+    "#quality-size": textElement(),
+    "#copy": buttonElement(),
+    "#download": buttonElement(),
+    "#download-audio": buttonElement(),
+    "#live-record": buttonElement(),
+    "#page-picker-toggle": buttonElement(),
+    "#page-picker": panelElement(),
+    "#page-list": containerElement(),
+    "#page-select-all": buttonElement(),
+    "#download-selected-pages": buttonElement(),
+    "#download-selected-page-audio": buttonElement(),
+    "#diagnostic": buttonElement(),
+    "#progress": panelElement(),
+    "#progress-percent": textElement(),
+    "#progress-bar": styleElement(),
+    "#progress-size": textElement(),
+    "#progress-speed": textElement(),
+    "#download-controls": panelElement(),
+    "#pause": buttonElement(),
+    "#cancel": buttonElement()
+  };
+
+  const sandbox = {
+    Blob,
+    Date,
+    Error,
+    RegExp,
+    String,
+    URL,
+    navigator: {
+      clipboard: {
+        async writeText(value) {
+          clipboardWrites.push(value);
+        }
+      }
+    },
+    document: {
+      addEventListener() {},
+      querySelector(selector) {
+        return elements[selector];
+      }
+    },
+    chrome: {
+      runtime: {
+        connect() {
+          return {
+            onMessage: {
+              addListener() {}
+            }
+          };
+        },
+        async sendMessage(message) {
+          runtimeMessages.push(message);
+          return { ok: true };
+        }
+      }
+    }
+  };
+
+  vm.createContext(sandbox);
+  vm.runInContext(code, sandbox);
+
+  const rawDiagnostic = {
+    phase: "interrupted",
+    request: {
+      media: signedUrl,
+      filename: localPath
+    },
+    events: [{
+      delta: {
+        url: { current: signedUrl },
+        finalUrl: { current: redirectedUrl },
+        filename: { current: localPath }
+      }
+    }],
+    saved: {
+      filename: localPath
+    },
+    accessToken: "popup-access-token",
+    requestSignature: "popup-signature-value",
+    accessKey: "popup-access-key-value",
+    headers: {
+      cookie: "SESSDATA=popup-cookie-value",
+      authorization: "Bearer popup-authorization-value"
+    },
+    sessionCredential: "popup-session-value",
+    outputPath: unixPath,
+    localFileUrl: fileUrl,
+    error: `Failed to fetch ${signedUrl}; secret=popup-error-secret; sign=popup-signature-text-value; Credential: popup-credential-value; ` +
+      `paths: ${localPath}, ${unixPath}, ${fileUrl}`
+  };
+
+  const exported = sandbox.sanitizeDiagnosticForExport(rawDiagnostic);
+  assert.equal(exported.accessToken, "[Sensitive value redacted]");
+  assert.equal(exported.requestSignature, "[Sensitive value redacted]");
+  assert.equal(exported.accessKey, "[Sensitive value redacted]");
+  assert.equal(exported.headers.cookie, "[Sensitive value redacted]");
+  assert.equal(exported.headers.authorization, "[Sensitive value redacted]");
+  assert.equal(exported.sessionCredential, "[Sensitive value redacted]");
+  assert.equal(exported.outputPath, "[local path popup-unix-video.mp4]");
+  assert.equal(exported.localFileUrl.sample, "[local path popup-file-video.mp4]");
+  assert.doesNotMatch(
+    JSON.stringify(exported),
+    /popup-access-token|popup-signature-value|popup-access-key-value|popup-cookie-value|popup-authorization-value|popup-session-value|popup-error-secret|popup-signature-text-value|popup-credential-value|Alice|\/home\/alice|file:\/\//
+  );
+
+  await sandbox.saveDiagnostic(rawDiagnostic);
+  const outbound = runtimeMessages.find((message) => message.type === "BILI_DOWNLOAD_SAVE_DIAGNOSTIC");
+  assert.ok(outbound);
+  assert.equal(outbound.payload.request.filename, "private-video.mp4");
+  assert.doesNotMatch(
+    JSON.stringify(outbound.payload),
+    /popup-secret|popup-signature|popup-access-token|popup-access-key-value|popup-cookie-value|popup-authorization-value|popup-session-value|popup-error-secret|popup-credential-value|Alice|\/home\/alice|file:\/\//
+  );
+
+  sandbox.rawDiagnostic = rawDiagnostic;
+  sandbox.rawPage = {
+    type: "video",
+    bvid: "BV1KGj36QEG3",
+    title: "Smoke Video",
+    url: "https://www.bilibili.com/video/BV1KGj36QEG3/?token=page-secret",
+    secret: "page-secret-value",
+    filePath: "file:///home/alice/private-page-file.txt"
+  };
+  vm.runInContext("state.lastDiagnostic = rawDiagnostic; state.page = rawPage", sandbox);
+  await sandbox.copyDiagnostic();
+
+  assert.equal(clipboardWrites.length, 1);
+  assert.doesNotMatch(
+    clipboardWrites[0],
+    /popup-secret|popup-signature|page-secret|popup-access-token|popup-access-key-value|popup-cookie-value|popup-authorization-value|popup-session-value|popup-error-secret|popup-credential-value|Alice|\/home\/alice|file:\/\//
+  );
+  const copied = JSON.parse(clipboardWrites[0]);
+  assert.equal(copied.page.url.host, "www.bilibili.com");
+  assert.equal(copied.diagnostic.saved.filename, "private-video.mp4");
+  assert.equal(copied.page.filePath, "[local path private-page-file.txt]");
+});
+
+
+test("background error responses are message-serializable and redact diagnostics safely", async () => {
   const code = await readFile("extension/src/background.js", "utf8");
   const sandbox = {
     Array,
@@ -4813,18 +5643,458 @@ test("background error responses are message-serializable", async () => {
   const diagnostic = {
     phase: "interrupted",
     error: "SERVER_FORBIDDEN",
-    context: { bvid: "BV1KGj36QEG3" }
+    context: {
+      bvid: "BV1KGj36QEG3",
+      sessionToken: "response-session-value",
+      localPath: "/home/alice/Downloads/response-diagnostic.mp4"
+    }
   };
   diagnostic.allCandidateDiagnostics = [diagnostic];
-  const error = new Error("Download failed: SERVER_FORBIDDEN");
+  const signedUrl = "https://cdn.hdslb.test/media/video.mp4?token=response-secret&deadline=123456";
+  const localPath = "C:\\Users\\Alice\\Downloads\\response-error.mp4";
+  const fileUrl = "file:///home/alice/Downloads/response-file.mp4";
+  const error = new Error(
+    `Download failed: SERVER_FORBIDDEN ${signedUrl}; token=response-token-value; ` +
+      `Authorization: Bearer response-authorization-value; paths: ${localPath}, ${fileUrl}`
+  );
   error.diagnostic = diagnostic;
 
   const response = sandbox.errorResponse(error);
 
   assert.equal(response.ok, false);
-  assert.equal(response.error, "Download failed: SERVER_FORBIDDEN");
+  assert.match(response.error, /Download failed: SERVER_FORBIDDEN/);
+  assert.doesNotMatch(
+    JSON.stringify(response),
+    /response-secret|deadline=123456|response-token-value|response-authorization-value|response-session-value|Alice|\/home\/alice|file:\/\//
+  );
   assert.equal(response.diagnostic.phase, "interrupted");
+  assert.equal(response.diagnostic.context.sessionToken, "[Sensitive value redacted]");
+  assert.equal(response.diagnostic.context.localPath, "[local path response-diagnostic.mp4]");
   assert.doesNotThrow(() => JSON.stringify(response));
+});
+
+
+test("background reconciles native tasks, routes progress by tab, and persists safe batch metadata", async () => {
+  const code = await readFile("extension/src/background.js", "utf8");
+  const storage = {
+    directDownloadTasks: [
+      {
+        taskId: "direct-complete",
+        state: "in_progress",
+        mode: "durl",
+        tabId: 77,
+        createdAt: "2026-08-09T00:00:00.000Z",
+        updatedAt: "2026-08-09T00:00:00.000Z",
+        segments: [{
+          index: 1,
+          state: "in_progress",
+          downloadId: 41,
+          filename: "BiliDownload/complete.mp4",
+          size: 100,
+          totalBytes: 100,
+          candidateIndex: 1,
+          candidateCount: 2,
+          context: { bvid: "BV1KGj36QEG3", cid: 123, quality: 80, title: "Complete" }
+        }]
+      },
+      {
+        taskId: "direct-active",
+        state: "in_progress",
+        mode: "durl",
+        tabId: 77,
+        createdAt: "2026-08-09T00:00:00.000Z",
+        updatedAt: "2026-08-09T00:00:00.000Z",
+        segments: [{
+          index: 1,
+          state: "in_progress",
+          downloadId: 42,
+          filename: "BiliDownload/active.mp4",
+          size: 200,
+          totalBytes: 200,
+          candidateIndex: 1,
+          candidateCount: 2,
+          context: { bvid: "BV1KGj36QEG3", cid: 123, quality: 80, title: "Active" }
+        }]
+      }
+    ]
+  };
+  const downloadItems = new Map([
+    [41, {
+      id: 41,
+      state: "complete",
+      bytesReceived: 100,
+      totalBytes: 100,
+      fileSize: 100,
+      filename: "C:\\Users\\Alice\\Downloads\\complete.mp4",
+      url: "https://cdn.hdslb.test/complete.mp4?token=complete-secret",
+      finalUrl: "https://cdn.hdslb.test/complete.mp4?token=complete-secret",
+      paused: false
+    }],
+    [42, {
+      id: 42,
+      state: "in_progress",
+      bytesReceived: 50,
+      totalBytes: 200,
+      filename: "C:\\Users\\Alice\\Downloads\\active.mp4",
+      url: "https://cdn.hdslb.test/active.mp4?token=active-secret",
+      finalUrl: "https://cdn.hdslb.test/active.mp4?token=active-secret",
+      paused: false
+    }]
+  ]);
+  const portMessages = [];
+  let messageListener = null;
+  const sandbox = {
+    Array,
+    Date,
+    Error,
+    Number,
+    Promise,
+    String,
+    URL,
+    URLSearchParams,
+    clearTimeout,
+    setTimeout,
+    chrome: {
+      runtime: {
+        lastError: null,
+        onMessage: {
+          addListener(listener) {
+            messageListener = listener;
+          }
+        },
+        onConnect: {
+          addListener(listener) {
+            listener({
+              name: "BILI_DOWNLOAD_PROGRESS_PORT",
+              postMessage(message) {
+                portMessages.push(message);
+              },
+              onDisconnect: { addListener() {} }
+            });
+          }
+        }
+      },
+      downloads: {
+        search(query, callback) {
+          callback([downloadItems.get(query.id)].filter(Boolean));
+        },
+        onChanged: { addListener() {} }
+      },
+      storage: {
+        local: {
+          async get(key) {
+            return { [key]: storage[key] };
+          },
+          async set(values) {
+            Object.assign(storage, values);
+          }
+        }
+      },
+      declarativeNetRequest: {
+        onRuleMatchedDebug: { addListener() {} }
+      }
+    }
+  };
+
+  vm.createContext(sandbox);
+  vm.runInContext(code, sandbox);
+  await sandbox.restoreDirectDownloadTasks();
+
+  const completed = await sandbox.getDirectDownloadTask("direct-complete");
+  assert.equal(completed.state, "complete");
+  const active = await sandbox.listDirectDownloadTasks({ tabId: 77, activeOnly: true });
+  assert.deepEqual(toPlain(active.map((task) => task.taskId)), ["direct-active"]);
+  assert.ok(portMessages.some((message) => (
+    message.payload.tabId === 77 && message.payload.taskId === "direct-complete" && message.payload.taskState === "complete"
+  )));
+
+  const listResponse = await sendRuntimeMessage(messageListener, {
+    type: "BILI_DOWNLOAD_LIST_DIRECT_TASKS",
+    payload: { tabId: 77, activeOnly: true }
+  });
+  assert.equal(listResponse.ok, true);
+  assert.deepEqual(toPlain(listResponse.payload.map((task) => task.taskId)), ["direct-active"]);
+
+  const batch = await sandbox.createBatchDownloadJob({
+    tabId: 77,
+    title: "Batch https://cdn.hdslb.test/list?token=batch-secret",
+    items: [{
+      bvid: "BV1KGj36QEG3",
+      cid: 123,
+      quality: 80,
+      title: "Page https://cdn.hdslb.test/page?token=page-secret",
+      candidates: [{ url: "https://cdn.hdslb.test/page?token=candidate-secret" }]
+    }]
+  });
+  const updated = await sandbox.updateBatchDownloadJob({
+    batchJobId: batch.batchJobId,
+    patch: {
+      state: "in_progress",
+      currentIndex: 1,
+      itemUpdates: [{ index: 1, state: "in_progress", directTaskId: "direct-active", attempt: 1 }]
+    }
+  });
+  assert.equal(updated.items[0].directTaskId, "direct-active");
+  const batchList = await sandbox.listBatchDownloadJobs({ tabId: 77, activeOnly: true });
+  assert.equal(batchList.length, 1);
+  assert.doesNotMatch(
+    JSON.stringify(storage),
+    /complete-secret|active-secret|batch-secret|page-secret|candidate-secret|Alice/
+  );
+});
+
+
+test("popup uses the explicitly enabled companion for DASH and live without retaining signed sources", async () => {
+  const code = await readFile("extension/src/popup.js", "utf8");
+  const runtimeMessages = [];
+  const statusElement = textElement();
+  const qualitySelect = selectElement();
+  const copyButton = buttonElement();
+  const downloadButton = buttonElement();
+  const liveRecordButton = buttonElement();
+  const diagnosticButton = buttonElement();
+  qualitySelect.value = "80";
+  qualitySelect.children.push({ value: "80", disabled: false });
+  let startSequence = 0;
+  const sandbox = {
+    AbortController,
+    Blob,
+    Date,
+    Error,
+    RegExp,
+    String,
+    URL,
+    console,
+    navigator: { clipboard: { async writeText() {} } },
+    setTimeout,
+    clearTimeout,
+    document: {
+      addEventListener() {},
+      body: { append() {} },
+      querySelector(selector) {
+        return {
+          "#status": statusElement,
+          "#quality": qualitySelect,
+          "#copy": copyButton,
+          "#download": downloadButton,
+          "#live-record": liveRecordButton,
+          "#diagnostic": diagnosticButton
+        }[selector];
+      }
+    },
+    chrome: {
+      runtime: {
+        connect() {
+          return { onMessage: { addListener() {} } };
+        },
+        async sendMessage(message) {
+          runtimeMessages.push(message);
+          if (message.type === "BILI_DOWNLOAD_COMPANION_PING") {
+            return { ok: true, payload: { nativeHost: "com.bili_download.stream_companion", protocolVersion: 1 } };
+          }
+          if (message.type === "BILI_DOWNLOAD_START_COMPANION") {
+            startSequence += 1;
+            return {
+              ok: true,
+              payload: {
+                taskId: `companion-popup-${startSequence}`,
+                tabId: 71,
+                kind: message.payload.prepared.mode,
+                title: message.payload.prepared.segments[0].context.title,
+                outputName: startSequence === 1 ? "Popup Dash.mp4" : "Popup Live.flv",
+                state: "complete",
+                receivedBytes: 168,
+                totalBytes: message.payload.prepared.mode === "dash" ? 168 : 0,
+                segmentIndex: 1,
+                segmentCount: 1
+              }
+            };
+          }
+          if (message.type === "BILI_DOWNLOAD_PREPARE_LIVE_RECORDING") {
+            return {
+              ok: true,
+              payload: {
+                mode: "live",
+                count: 1,
+                live: { roomId: "100", quality: 80, title: "Popup Live" },
+                segments: [{
+                  url: "https://live.example.hdslb.com/live.flv?token=popup-live-secret",
+                  candidates: [{ url: "https://live.example.hdslb.com/live.flv?token=popup-live-secret" }],
+                  filename: "BiliDownload/Popup Live.flv",
+                  context: { roomId: "100", quality: 80, title: "Popup Live", role: "live" }
+                }]
+              }
+            };
+          }
+          if (message.type === "BILI_DOWNLOAD_GET_DIAGNOSTIC") {
+            return { ok: true, payload: null };
+          }
+          throw new Error(`unexpected runtime message: ${message.type}`);
+        }
+      }
+    }
+  };
+
+  vm.createContext(sandbox);
+  vm.runInContext(code, sandbox);
+  vm.runInContext(`
+    state.tabId = 71;
+    state.companionSettings = { preferDash: true, preferLive: true };
+    state.live = {
+      roomId: "100",
+      title: "Popup Live",
+      liveStatus: 1,
+      qualities: [{ code: 80, available: true, mode: "live" }]
+    };
+    state.page = { type: "live", roomId: "100", title: "Popup Live", url: "https://live.bilibili.com/100" };
+  `, sandbox);
+
+  const dashPrepared = {
+    mode: "dash",
+    count: 2,
+    segments: [
+      {
+        url: "https://video.example.hdslb.com/video.m4s?token=popup-dash-secret",
+        candidates: [{ url: "https://video.example.hdslb.com/video.m4s?token=popup-dash-secret" }],
+        size: 123,
+        context: { role: "video", title: "Popup Dash" }
+      },
+      {
+        url: "https://audio.example.hdslb.com/audio.m4s?token=popup-dash-secret",
+        candidates: [{ url: "https://audio.example.hdslb.com/audio.m4s?token=popup-dash-secret" }],
+        size: 45,
+        context: { role: "audio", title: "Popup Dash" }
+      }
+    ]
+  };
+  const dashResult = await sandbox.downloadPreparedPayload(dashPrepared);
+  assert.equal(dashResult.state, "complete");
+  await sandbox.startLiveRecording();
+
+  const starts = runtimeMessages.filter((message) => message.type === "BILI_DOWNLOAD_START_COMPANION");
+  assert.equal(starts.length, 2, statusElement.textContent);
+  assert.equal(starts[0].payload.prepared.mode, "dash");
+  assert.equal(starts[1].payload.prepared.mode, "live");
+  assert.equal(runtimeMessages.some((message) => message.type === "BILI_DOWNLOAD_COMPANION_PING"), true);
+  const popupTaskState = vm.runInContext("JSON.stringify(Array.from(state.companionTasks.values()))", sandbox);
+  assert.equal(popupTaskState.includes("popup-dash-secret"), false);
+  assert.equal(popupTaskState.includes("popup-live-secret"), false);
+  assert.match(statusElement.textContent, /本地流式助手/);
+});
+
+
+test("popup keeps task recovery tab-scoped and confirms restored batch downloads before cancellation", async () => {
+  const code = await readFile("extension/src/popup.js", "utf8");
+  const runtimeMessages = [];
+  const statusElement = textElement();
+  const qualitySelect = selectElement();
+  const sandbox = {
+    Date,
+    Error,
+    RegExp,
+    String,
+    URL,
+    console,
+    setTimeout,
+    clearTimeout,
+    document: {
+      addEventListener() {},
+      querySelector(selector) {
+        return {
+          "#status": statusElement,
+          "#quality": qualitySelect
+        }[selector];
+      }
+    },
+    chrome: {
+      runtime: {
+        connect() {
+          return { onMessage: { addListener() {} } };
+        },
+        async sendMessage(message) {
+          runtimeMessages.push(message);
+          if (message.type === "BILI_DOWNLOAD_CONTROL_DIRECT") {
+            return {
+              ok: true,
+              payload: {
+                taskId: message.payload.taskId,
+                tabId: 1,
+                state: "canceled",
+                receivedBytes: 0,
+                totalBytes: 100
+              }
+            };
+          }
+          if (message.type === "BILI_DOWNLOAD_UPDATE_BATCH_JOB") {
+            const patch = message.payload.patch;
+            return {
+              ok: true,
+              payload: {
+                batchJobId: message.payload.batchJobId,
+                tabId: 1,
+                title: "Recovered batch",
+                state: patch.state,
+                error: patch.error || "",
+                currentIndex: patch.currentIndex || 1,
+                count: 2,
+                completedCount: 0,
+                items: (patch.itemUpdates || []).map((item) => ({ ...item }))
+              }
+            };
+          }
+          throw new Error(`unexpected runtime message: ${message.type}`);
+        }
+      }
+    }
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(code, sandbox);
+  vm.runInContext(`
+    state.tabId = 1;
+    state.batchJobs.set("batch-paused", { jobId: "batch-paused", tabId: 1, state: "paused", updatedAt: "2026-08-09T00:00:00.000Z" });
+    state.nativeDirectTasks.set("direct-tab-1", { taskId: "direct-tab-1", tabId: 1, state: "in_progress" });
+    state.nativeDirectTasks.set("direct-tab-2", { taskId: "direct-tab-2", tabId: 2, state: "in_progress" });
+    state.nativeDirectTasks.set("direct-tab-unknown", { taskId: "direct-tab-unknown", tabId: 0, state: "in_progress" });
+  `, sandbox);
+
+  await sandbox.resumeVisibleBatchJobs();
+  assert.equal(runtimeMessages.length, 0, "a paused batch must not auto-resume after reopening the panel");
+  const visibleDirectIds = vm.runInContext(
+    "JSON.stringify(visibleTaskCenterItems().filter((entry) => entry.kind === 'direct').map((entry) => entry.item.taskId))",
+    sandbox
+  );
+  assert.deepEqual(JSON.parse(visibleDirectIds), ["direct-tab-1"]);
+
+  vm.runInContext(`
+    state.batchJobs.set("batch-restored", {
+      jobId: "batch-restored",
+      tabId: 1,
+      title: "Recovered batch",
+      state: "in_progress",
+      currentIndex: 1,
+      items: [
+        { index: 1, state: "in_progress", directTaskId: "direct-restored-a" },
+        { index: 2, state: "in_progress", directTaskId: "direct-restored-b" }
+      ]
+    });
+    state.nativeDirectTasks.set("direct-restored-a", { taskId: "direct-restored-a", tabId: 1, state: "in_progress" });
+    state.nativeDirectTasks.set("direct-restored-b", { taskId: "direct-restored-b", tabId: 1, state: "in_progress" });
+  `, sandbox);
+  await sandbox.cancelBatchJob("batch-restored");
+
+  const controlIndexes = runtimeMessages
+    .map((message, index) => ({ type: message.type, index }))
+    .filter((entry) => entry.type === "BILI_DOWNLOAD_CONTROL_DIRECT")
+    .map((entry) => entry.index);
+  const updateIndex = runtimeMessages.findIndex((message) => message.type === "BILI_DOWNLOAD_UPDATE_BATCH_JOB");
+  assert.equal(controlIndexes.length, 2);
+  assert.ok(controlIndexes.every((index) => index < updateIndex));
+  const finalUpdate = runtimeMessages[updateIndex];
+  assert.equal(finalUpdate.payload.patch.state, "canceled");
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(finalUpdate.payload.patch.itemUpdates.map((item) => item.state))),
+    ["canceled", "canceled"]
+  );
 });
 
 
@@ -4840,6 +6110,82 @@ function toPlain(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
+
+function createMockBatchJobHandler() {
+  const jobs = new Map();
+  let sequence = 0;
+  const snapshot = (job) => ({
+    batchJobId: job.batchJobId,
+    tabId: job.tabId,
+    title: job.title,
+    state: job.state,
+    error: job.error || "",
+    currentIndex: job.currentIndex,
+    count: job.items.length,
+    completedCount: job.items.filter((item) => item.state === "complete").length,
+    items: job.items.map((item) => ({ ...item }))
+  });
+
+  return (message) => {
+    if (message.type === "BILI_DOWNLOAD_LIST_DIRECT_TASKS") {
+      return { ok: true, payload: [] };
+    }
+    if (message.type === "BILI_DOWNLOAD_LIST_BATCH_JOBS") {
+      const tabId = Number(message.payload?.tabId) || 0;
+      return {
+        ok: true,
+        payload: Array.from(jobs.values())
+          .filter((job) => !tabId || job.tabId === tabId)
+          .map(snapshot)
+      };
+    }
+    if (message.type === "BILI_DOWNLOAD_CREATE_BATCH_JOB") {
+      sequence += 1;
+      const job = {
+        batchJobId: `batch-test-${sequence}`,
+        tabId: Number(message.payload?.tabId) || 0,
+        title: String(message.payload?.title || ""),
+        state: "queued",
+        error: "",
+        currentIndex: 1,
+        items: (message.payload?.items || []).map((item, index) => ({
+          ...item,
+          index: index + 1,
+          state: "queued",
+          error: "",
+          directTaskId: "",
+          attempt: 0
+        }))
+      };
+      jobs.set(job.batchJobId, job);
+      return { ok: true, payload: snapshot(job) };
+    }
+    if (message.type === "BILI_DOWNLOAD_GET_BATCH_JOB") {
+      const job = jobs.get(String(message.payload?.batchJobId || ""));
+      return { ok: true, payload: job ? snapshot(job) : null };
+    }
+    if (message.type === "BILI_DOWNLOAD_UPDATE_BATCH_JOB") {
+      const job = jobs.get(String(message.payload?.batchJobId || ""));
+      if (!job) {
+        return { ok: false, error: "mock batch job was not found" };
+      }
+      const patch = message.payload?.patch || {};
+      for (const key of ["state", "error", "currentIndex"]) {
+        if (Object.hasOwn(patch, key)) {
+          job[key] = patch[key];
+        }
+      }
+      for (const itemPatch of patch.itemUpdates || []) {
+        const item = job.items[Number(itemPatch.index) - 1];
+        if (item) {
+          Object.assign(item, itemPatch);
+        }
+      }
+      return { ok: true, payload: snapshot(job) };
+    }
+    return null;
+  };
+}
 
 function textElement() {
   return {

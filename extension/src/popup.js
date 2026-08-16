@@ -22,6 +22,7 @@ const TEXT = {
   pageAudioDownloaded: "\u5df2\u4e0b\u8f7d\u9009\u4e2d\u97f3\u9891",
   muxing: "\u6b63\u5728\u5408\u5e76 MP4...",
   downloadStarted: "\u4e0b\u8f7d\u5df2\u5f00\u59cb",
+  downloadCompleted: "\u4e0b\u8f7d\u5df2\u5b8c\u6210",
   dashMuxed: "DASH \u5df2\u5408\u5e76\u4e3a MP4",
   diagnosticCopied: "\u8bca\u65ad\u4fe1\u606f\u5df2\u590d\u5236",
   noDiagnostic: "\u6682\u65e0\u8bca\u65ad\u4fe1\u606f",
@@ -37,6 +38,32 @@ const PAGE_DOWNLOAD_CONTROL_EVENT = "bili-download-control";
 const PARALLEL_RANGE_MIN_BYTES = 8 * 1024 * 1024;
 const PARALLEL_RANGE_CHUNK_BYTES = 4 * 1024 * 1024;
 const PARALLEL_RANGE_CONCURRENCY = 4;
+const MEBIBYTE = 1024 * 1024;
+const SAFETY_SETTINGS_STORAGE_KEY = "downloadSafetySettings";
+const COMPANION_SETTINGS_STORAGE_KEY = "streamCompanionSettings";
+const DIRECT_TASK_REFRESH_INTERVAL_MS = 2500;
+const BATCH_TASK_REFRESH_INTERVAL_MS = 4000;
+const COMPANION_TASK_REFRESH_INTERVAL_MS = 2500;
+const DASH_MUX_MEMORY_MULTIPLIER = 3;
+const LIVE_RECORDING_MEMORY_MULTIPLIER = 3;
+const SAFETY_SETTINGS_DEFAULTS = Object.freeze({
+  dashMaxFileMb: 512,
+  dashMaxMemoryMb: 1536,
+  liveMaxDurationMinutes: 120,
+  liveMaxFileMb: 1024,
+  liveMaxMemoryMb: 1536
+});
+const SAFETY_SETTINGS_BOUNDS = Object.freeze({
+  dashMaxFileMb: { min: 16, max: 4096 },
+  dashMaxMemoryMb: { min: 128, max: 8192 },
+  liveMaxDurationMinutes: { min: 1, max: 720 },
+  liveMaxFileMb: { min: 16, max: 4096 },
+  liveMaxMemoryMb: { min: 32, max: 8192 }
+});
+const COMPANION_SETTINGS_DEFAULTS = Object.freeze({
+  preferDash: false,
+  preferLive: false
+});
 
 const state = {
   tabId: null,
@@ -68,8 +95,22 @@ const state = {
   },
   busy: false,
   downloadControl: null,
+  nativeDirectTasks: new Map(),
+  nativeDirectTaskWaiters: new Map(),
+  companionTasks: new Map(),
+  companionTaskWaiters: new Map(),
+  companionStatus: "unknown",
+  companionSettings: normalizeCompanionSettings(COMPANION_SETTINGS_DEFAULTS),
+  batchJobs: new Map(),
+  batchJobWaiters: new Map(),
+  batchRunPromise: null,
+  batchResumeTimer: null,
+  taskCenterLoading: false,
+  taskCenterRefreshTimer: null,
+  refreshGeneration: 0,
   pagePickerOpen: false,
-  selectedPageCids: null
+  selectedPageCids: null,
+  safetySettings: normalizeSafetySettings(SAFETY_SETTINGS_DEFAULTS)
 };
 
 const statusElement = document.querySelector("#status");
@@ -97,6 +138,22 @@ const progressSpeed = document.querySelector("#progress-speed");
 const downloadControls = document.querySelector("#download-controls");
 const pauseButton = document.querySelector("#pause");
 const cancelButton = document.querySelector("#cancel");
+const dashMaxFileInput = document.querySelector("#dash-max-file-mb");
+const dashMaxMemoryInput = document.querySelector("#dash-max-memory-mb");
+const liveMaxDurationInput = document.querySelector("#live-max-duration-minutes");
+const liveMaxFileInput = document.querySelector("#live-max-file-mb");
+const liveMaxMemoryInput = document.querySelector("#live-max-memory-mb");
+const safetySettingsSummary = document.querySelector("#safety-settings-summary");
+const safetySaveButton = document.querySelector("#safety-save");
+const companionStatusElement = document.querySelector("#companion-status");
+const companionCheckButton = document.querySelector("#companion-check");
+const companionPreferDashInput = document.querySelector("#companion-prefer-dash");
+const companionPreferLiveInput = document.querySelector("#companion-prefer-live");
+const companionSaveButton = document.querySelector("#companion-save");
+const taskCenter = document.querySelector("#task-center");
+const taskCenterRefreshButton = document.querySelector("#task-center-refresh");
+const taskCenterNote = document.querySelector("#task-center-note");
+const taskList = document.querySelector("#task-list");
 
 document.addEventListener("DOMContentLoaded", initialize);
 copyButton?.addEventListener("click", copyBvid);
@@ -114,30 +171,326 @@ qualitySelect.addEventListener?.("change", () => {
 });
 pauseButton?.addEventListener("click", togglePauseDownload);
 cancelButton?.addEventListener("click", cancelDownload);
+safetySaveButton?.addEventListener("click", saveSafetySettings);
+companionCheckButton?.addEventListener("click", () => {
+  checkStreamingCompanion({ userInitiated: true }).catch(() => {});
+});
+companionSaveButton?.addEventListener("click", saveCompanionSettings);
+taskCenterRefreshButton?.addEventListener("click", () => {
+  refreshTaskCenter({ resumeBatch: false }).catch(() => {});
+});
+for (const input of [dashMaxFileInput, dashMaxMemoryInput, liveMaxDurationInput, liveMaxFileInput, liveMaxMemoryInput]) {
+  input?.addEventListener("input", renderSafetySettingsSummary);
+}
 const progressPort = chrome.runtime.connect({ name: PROGRESS_PORT_NAME });
 progressPort.onMessage.addListener((message) => {
   if (message?.type !== PROGRESS_MESSAGE_TYPE) {
     return;
   }
 
-  if (message.payload?.tabId && state.tabId && message.payload.tabId !== state.tabId) {
+  const payload = message.payload || {};
+  const payloadTabId = Number(payload.tabId) || 0;
+  if (state.tabId && (payload.nativeDownload || payload.companionDownload) && payloadTabId !== Number(state.tabId)) {
+    return;
+  }
+  if (payloadTabId && state.tabId && payloadTabId !== Number(state.tabId)) {
     return;
   }
 
-  updateProgress(message.payload);
+  const directTask = receiveNativeDirectTaskProgress(payload);
+  const companionTask = receiveCompanionTaskProgress(payload);
+  const belongsToCurrentControl = payload.nativeDownload
+    ? state.downloadControl?.nativeTaskId === directTask?.taskId
+    : payload.companionDownload
+      ? state.downloadControl?.companionTaskId === companionTask?.taskId
+      : true;
+  if (belongsToCurrentControl) {
+    updateProgress(payload);
+  }
 });
 chrome.tabs?.onActivated?.addListener(() => {
-  refreshFromActiveTab();
+  if (!state.downloadControl) {
+    refreshFromActiveTab({ force: true });
+  }
 });
 chrome.tabs?.onUpdated?.addListener((tabId, changeInfo) => {
-  if (tabId !== state.tabId || !changeInfo.url) {
+  if (tabId !== state.tabId || !changeInfo.url || state.downloadControl) {
     return;
   }
-  refreshFromActiveTab();
+  refreshFromActiveTab({ force: true });
 });
 
 async function initialize() {
+  await Promise.all([loadSafetySettings(), loadCompanionSettings()]);
   await refreshFromActiveTab({ force: true });
+}
+
+async function loadSafetySettings() {
+  let stored = null;
+  try {
+    stored = await chrome.storage?.local?.get(SAFETY_SETTINGS_STORAGE_KEY);
+  } catch (_error) {
+    // Keep the conservative defaults when extension storage is unavailable.
+  }
+  state.safetySettings = normalizeSafetySettings(stored?.[SAFETY_SETTINGS_STORAGE_KEY]);
+  renderSafetySettings();
+}
+
+async function saveSafetySettings() {
+  state.safetySettings = normalizeSafetySettings(readSafetySettingsInputs());
+  renderSafetySettings();
+  try {
+    await chrome.storage?.local?.set({
+      [SAFETY_SETTINGS_STORAGE_KEY]: state.safetySettings
+    });
+    setStatus("已保存内存与录制保护设置");
+  } catch (_error) {
+    setStatus("保护设置已生效，但未能保存到浏览器");
+  }
+}
+
+async function loadCompanionSettings() {
+  let stored = null;
+  try {
+    stored = await chrome.storage?.local?.get(COMPANION_SETTINGS_STORAGE_KEY);
+  } catch (_error) {
+    // The browser downloader remains available with the conservative defaults.
+  }
+  state.companionSettings = normalizeCompanionSettings(stored?.[COMPANION_SETTINGS_STORAGE_KEY]);
+  renderCompanionSettings();
+}
+
+async function saveCompanionSettings() {
+  state.companionSettings = normalizeCompanionSettings(readCompanionSettingsInputs());
+  renderCompanionSettings();
+  try {
+    await chrome.storage?.local?.set({
+      [COMPANION_SETTINGS_STORAGE_KEY]: state.companionSettings
+    });
+    setStatus("本地流式助手偏好已保存");
+  } catch (_error) {
+    setStatus("本地流式助手偏好已生效，但未能保存到浏览器");
+  }
+}
+
+function normalizeCompanionSettings(value) {
+  const source = value || {};
+  return {
+    preferDash: Boolean(source.preferDash),
+    preferLive: Boolean(source.preferLive)
+  };
+}
+
+function readCompanionSettingsInputs() {
+  return {
+    preferDash: Boolean(companionPreferDashInput?.checked),
+    preferLive: Boolean(companionPreferLiveInput?.checked)
+  };
+}
+
+function renderCompanionSettings() {
+  if (companionPreferDashInput) {
+    companionPreferDashInput.checked = Boolean(state.companionSettings.preferDash);
+  }
+  if (companionPreferLiveInput) {
+    companionPreferLiveInput.checked = Boolean(state.companionSettings.preferLive);
+  }
+  renderCompanionStatus();
+}
+
+function renderCompanionStatus() {
+  if (!companionStatusElement) {
+    return;
+  }
+  const status = String(state.companionStatus || "unknown");
+  const labels = {
+    unknown: "尚未检测",
+    checking: "正在检测…",
+    available: "已连接，可用于流式落盘",
+    unavailable: "未检测到已注册的本地助手"
+  };
+  companionStatusElement.dataset.state = status;
+  companionStatusElement.textContent = labels[status] || labels.unknown;
+  if (companionCheckButton) {
+    companionCheckButton.disabled = status === "checking";
+  }
+}
+
+async function checkStreamingCompanion(options = {}) {
+  if (state.companionStatus === "checking") {
+    return false;
+  }
+  state.companionStatus = "checking";
+  renderCompanionStatus();
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: "BILI_DOWNLOAD_COMPANION_PING"
+    });
+    if (!response?.ok) {
+      throw new Error(response?.error || "Native companion was not available.");
+    }
+    state.companionStatus = "available";
+    renderCompanionStatus();
+    if (options.userInitiated) {
+      setStatus("本地流式助手已连接");
+    }
+    return true;
+  } catch (_error) {
+    state.companionStatus = "unavailable";
+    renderCompanionStatus();
+    if (options.userInitiated) {
+      setStatus("未检测到本地流式助手；请按 README 构建并注册后重试");
+    }
+    return false;
+  }
+}
+
+async function ensureStreamingCompanionAvailable() {
+  return state.companionStatus === "available"
+    ? true
+    : checkStreamingCompanion();
+}
+
+function normalizeSafetySettings(value) {
+  const source = value || {};
+  return Object.fromEntries(Object.entries(SAFETY_SETTINGS_DEFAULTS).map(([key, fallback]) => {
+    const bounds = SAFETY_SETTINGS_BOUNDS[key];
+    const numeric = Number(source[key]);
+    const normalized = Number.isFinite(numeric)
+      ? Math.min(Math.max(Math.round(numeric), bounds.min), bounds.max)
+      : fallback;
+    return [key, normalized];
+  }));
+}
+
+function readSafetySettingsInputs() {
+  return {
+    dashMaxFileMb: dashMaxFileInput?.value,
+    dashMaxMemoryMb: dashMaxMemoryInput?.value,
+    liveMaxDurationMinutes: liveMaxDurationInput?.value,
+    liveMaxFileMb: liveMaxFileInput?.value,
+    liveMaxMemoryMb: liveMaxMemoryInput?.value
+  };
+}
+
+function renderSafetySettings() {
+  const settings = state.safetySettings;
+  if (dashMaxFileInput) {
+    dashMaxFileInput.value = String(settings.dashMaxFileMb);
+  }
+  if (dashMaxMemoryInput) {
+    dashMaxMemoryInput.value = String(settings.dashMaxMemoryMb);
+  }
+  if (liveMaxDurationInput) {
+    liveMaxDurationInput.value = String(settings.liveMaxDurationMinutes);
+  }
+  if (liveMaxFileInput) {
+    liveMaxFileInput.value = String(settings.liveMaxFileMb);
+  }
+  if (liveMaxMemoryInput) {
+    liveMaxMemoryInput.value = String(settings.liveMaxMemoryMb);
+  }
+  renderSafetySettingsSummary();
+}
+
+function renderSafetySettingsSummary() {
+  if (!safetySettingsSummary) {
+    return;
+  }
+  const settings = normalizeSafetySettings(readSafetySettingsInputs());
+  const dashLimits = getDashSafetyLimits(settings);
+  const liveLimits = getLiveSafetyLimits(settings);
+  safetySettingsSummary.textContent = `DASH 实际缓冲上限约 ${formatBytes(dashLimits.maxInputBytes)}（按合并峰值约 ${DASH_MUX_MEMORY_MULTIPLIER} 倍估算）；直播实际缓冲上限约 ${formatBytes(liveLimits.maxBytes)}（按保存峰值约 ${LIVE_RECORDING_MEMORY_MULTIPLIER} 倍估算），达到时长或大小上限会自动停止。`;
+}
+
+function getDashSafetyLimits(settings = state.safetySettings) {
+  const normalized = normalizeSafetySettings(settings);
+  const maxFileBytes = normalized.dashMaxFileMb * MEBIBYTE;
+  const maxMemoryBytes = normalized.dashMaxMemoryMb * MEBIBYTE;
+  return {
+    maxFileBytes,
+    maxMemoryBytes,
+    maxInputBytes: Math.min(maxFileBytes, Math.floor(maxMemoryBytes / DASH_MUX_MEMORY_MULTIPLIER))
+  };
+}
+
+function getLiveSafetyLimits(settings = state.safetySettings) {
+  const normalized = normalizeSafetySettings(settings);
+  const maxFileBytes = normalized.liveMaxFileMb * MEBIBYTE;
+  const maxMemoryBytes = normalized.liveMaxMemoryMb * MEBIBYTE;
+  return {
+    maxFileBytes,
+    maxMemoryBytes,
+    maxBytes: Math.min(maxFileBytes, Math.floor(maxMemoryBytes / LIVE_RECORDING_MEMORY_MULTIPLIER)),
+    maxDurationMs: normalized.liveMaxDurationMinutes * 60 * 1000
+  };
+}
+
+function knownSegmentSize(segment) {
+  const directSize = normalizeMediaLimitBytes(segment?.size);
+  if (directSize) {
+    return directSize;
+  }
+  return normalizeMediaLimitBytes(readCandidates(segment)[0]?.size);
+}
+
+function assertDashInputWithinSafetyLimits(inputBytes, safety, phase) {
+  const bytes = normalizeMediaLimitBytes(inputBytes);
+  if (!bytes) {
+    return;
+  }
+  if (bytes > safety.maxFileBytes) {
+    throw createMediaSafetyLimitError(
+      `DASH ${phase}媒体为 ${formatBytes(bytes)}，超过设置的 DASH 文件上限 ${formatBytes(safety.maxFileBytes)}；为防止浏览器内存耗尽，未开始合并。请降低清晰度，或在“内存与录制保护”中调高上限。`
+    );
+  }
+  if (bytes > safety.maxInputBytes) {
+    throw dashSafetyLimitError(safety, bytes, phase);
+  }
+}
+
+function dashSafetyLimitError(safety, bytes, phase) {
+  return createMediaSafetyLimitError(dashSafetyLimitMessage(safety, bytes, phase));
+}
+
+function dashSafetyLimitMessage(safety, bytes = 0, phase = "下载") {
+  const memoryBound = safety.maxInputBytes < safety.maxFileBytes;
+  const limitLabel = memoryBound
+    ? `DASH 内存预算 ${formatBytes(safety.maxMemoryBytes)}（合并峰值按约 ${DASH_MUX_MEMORY_MULTIPLIER} 倍估算）`
+    : `DASH 文件上限 ${formatBytes(safety.maxFileBytes)}`;
+  const measured = normalizeMediaLimitBytes(bytes);
+  return `DASH ${phase}${measured ? `媒体为 ${formatBytes(measured)}，` : ""}超过${limitLabel}对应的安全缓冲上限 ${formatBytes(safety.maxInputBytes)}；已停止且未保存该文件。请降低清晰度，或在“内存与录制保护”中调高上限。`;
+}
+
+function normalizeMediaLimitBytes(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && numeric > 0 ? Math.floor(numeric) : 0;
+}
+
+function createMediaSafetyLimitError(message) {
+  const error = new Error(message);
+  error.name = "MediaSafetyLimitError";
+  error.safetyLimit = true;
+  return error;
+}
+
+function isMediaSafetyLimitError(error) {
+  return error?.name === "MediaSafetyLimitError" || error?.safetyLimit === true;
+}
+
+function liveRecordingResultStatus(diagnostic, fallbackFilename = "") {
+  const saved = diagnostic?.saved || {};
+  const savedToDisk = saved.savedToDisk === true && Number(saved.size) > 0;
+  if (!savedToDisk) {
+    return saved.stopReason === "duration" || saved.stopReason === "size"
+      ? "已达到直播录制安全上限，但尚未接收到直播数据，未保存文件"
+      : "已停止直播录制，未保存文件（尚未接收到直播数据）";
+  }
+  const filename = filenameForPageDownload(saved.filename || fallbackFilename);
+  if (saved.stopReason === "duration" || saved.stopReason === "size") {
+    return `已达到直播录制安全上限，已自动停止并保存已录制部分: ${filename}`;
+  }
+  return `${TEXT.liveRecorded}: ${filename}`;
 }
 
 async function refreshFromActiveTab(options = {}) {
@@ -145,15 +498,32 @@ async function refreshFromActiveTab(options = {}) {
     return;
   }
 
+  const generation = state.refreshGeneration + 1;
+  state.refreshGeneration = generation;
   setBusy(true);
   setStatus(TEXT.checking);
 
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    state.tabId = tab?.id || null;
-    state.page = await readPage(tab);
-    state.page.tabId = state.tabId;
+    if (generation !== state.refreshGeneration) {
+      return;
+    }
+    const tabId = tab?.id || null;
+    const page = await readPage(tab);
+    if (generation !== state.refreshGeneration) {
+      return;
+    }
+    page.tabId = tabId;
+    state.tabId = tabId;
+    state.page = page;
     await loadLastDiagnostic();
+    if (generation !== state.refreshGeneration) {
+      return;
+    }
+    await refreshTaskCenter({ resumeBatch: true, silent: true });
+    if (generation !== state.refreshGeneration) {
+      return;
+    }
 
     if (!hasSupportedPageId(state.page)) {
       setStatus(TEXT.noVideo);
@@ -175,6 +545,9 @@ async function refreshFromActiveTab(options = {}) {
     if (!response?.ok) {
       throw new Error(response?.error || "Failed to load video.");
     }
+    if (generation !== state.refreshGeneration) {
+      return;
+    }
 
     state.video = response.payload;
     state.live = null;
@@ -190,10 +563,14 @@ async function refreshFromActiveTab(options = {}) {
       ? (videoHasMultiplePages(state.video) ? TEXT.collectionReady : TEXT.ready)
       : TEXT.noQuality);
   } catch (error) {
-    setStatus(error.message);
-    render();
+    if (generation === state.refreshGeneration) {
+      setStatus(error.message);
+      render();
+    }
   } finally {
-    setBusy(false);
+    if (generation === state.refreshGeneration) {
+      setBusy(false);
+    }
   }
 }
 
@@ -506,8 +883,10 @@ async function downloadSelectedQuality() {
     const prepared = await preparePageDownload({
       ...state.video.page
     }, Number(qualitySelect.value), state.video.title);
-    await downloadPreparedPayload(prepared);
-    if (prepared.mode !== "dash") {
+    const result = await downloadPreparedPayload(prepared);
+    if (prepared.mode === "durl") {
+      setStatus(`${TEXT.downloadCompleted}: ${result?.completedCount || prepared.count}`);
+    } else if (prepared.mode !== "dash") {
       setStatus(`${TEXT.downloadStarted}: ${prepared.count}`);
     }
   } catch (error) {
@@ -613,15 +992,12 @@ async function downloadSelectedPages() {
 
   try {
     const quality = Number(qualitySelect.value);
-    for (const [index, page] of pages.entries()) {
-      await waitForDownloadControl();
-      throwIfDownloadCanceled();
-      const pageIndex = Number(page.index || page.page) || index + 1;
-      setStatus(`${TEXT.downloadingPages} ${index + 1}/${pages.length} P${String(pageIndex).padStart(2, "0")}`);
-      const prepared = await preparePageDownload(page, quality, pageDownloadTitle(state.video.title, page));
-      await downloadPreparedPayload(prepared);
-    }
-    setStatus(`${TEXT.pagesDownloaded}: ${pages.length}`);
+    const job = await createBatchJob(
+      pages.map((page) => pageBatchItem(page, quality, "video")),
+      { title: `${state.video.title}（多分 P 视频）` }
+    );
+    control.batchJobId = job.jobId;
+    await resumeBatchJob(job.jobId, { userInitiated: true });
   } catch (error) {
     if (isDownloadCanceledError(error)) {
       setStatus(TEXT.canceled);
@@ -659,15 +1035,12 @@ async function downloadSelectedPageAudio() {
   setStatus(TEXT.downloadingPageAudio);
 
   try {
-    for (const [index, page] of pages.entries()) {
-      await waitForDownloadControl();
-      throwIfDownloadCanceled();
-      const pageIndex = Number(page.index || page.page) || index + 1;
-      setStatus(`${TEXT.downloadingPageAudio} ${index + 1}/${pages.length} P${String(pageIndex).padStart(2, "0")}`);
-      const prepared = await prepareAudioDownload(page, audioDownloadTitle(state.video.title, page));
-      await downloadPreparedPayload(prepared, TEXT.downloadingAudio);
-    }
-    setStatus(`${TEXT.pageAudioDownloaded}: ${pages.length}`);
+    const job = await createBatchJob(
+      pages.map((page) => pageBatchItem(page, 0, "audio")),
+      { title: `${state.video.title}（多分 P 音频）` }
+    );
+    control.batchJobId = job.jobId;
+    await resumeBatchJob(job.jobId, { userInitiated: true });
   } catch (error) {
     if (isDownloadCanceledError(error)) {
       setStatus(TEXT.canceled);
@@ -711,25 +1084,41 @@ async function startLiveRecording() {
 
   const control = createDownloadControl();
   control.liveRecording = true;
+  control.liveStartedAt = 0;
+  control.liveDeadlineAt = 0;
   state.downloadControl = control;
   resetProgress();
   setStatus(TEXT.liveRecording);
   updateControls();
 
+  let prepared = null;
+  let usedCompanion = false;
   try {
-    const prepared = await prepareLiveRecording();
+    prepared = await prepareLiveRecording();
+    if (state.companionSettings.preferLive && await ensureStreamingCompanionAvailable()) {
+      usedCompanion = true;
+      const task = await downloadPreparedCompanionPayload(prepared);
+      setStatus(task.outputName
+        ? `本地流式助手已完成录制：${task.outputName}`
+        : TEXT.liveRecorded);
+      return;
+    }
     const diagnostic = await recordLiveSegment(prepared.segments[0], control);
     state.lastDiagnostic = diagnostic;
     await saveDiagnostic(diagnostic);
-    setStatus(`${TEXT.liveRecorded}: ${filenameForPageDownload(prepared.segments[0].filename)}`);
+    setStatus(liveRecordingResultStatus(diagnostic, prepared.segments[0].filename));
   } catch (error) {
     if (isDownloadCanceledError(error)) {
+      if (usedCompanion) {
+        setStatus(TEXT.canceled);
+        return;
+      }
       const diagnostic = error.diagnostic || state.lastDiagnostic;
       if (diagnostic) {
         state.lastDiagnostic = diagnostic;
         await saveDiagnostic(diagnostic);
       }
-      setStatus(`${TEXT.liveRecorded}: ${diagnostic?.saved?.filename || ""}`.trim());
+      setStatus(liveRecordingResultStatus(diagnostic, prepared?.segments?.[0]?.filename));
       return;
     }
     if (error.diagnostic) {
@@ -755,6 +1144,19 @@ function stopLiveRecording() {
   setStatus(TEXT.liveStopping);
   control.canceled = true;
   control.paused = false;
+  if (control.companionTaskId) {
+    requestCompanionTaskControl(control.companionTaskId, "cancel")
+      .catch((error) => {
+        if (state.downloadControl === control) {
+          control.canceled = false;
+          setStatus(error.message || "无法结束本地流式助手录制。");
+          updateControls();
+        }
+      });
+    renderDownloadControls();
+    updateControls();
+    return;
+  }
   for (const abortController of control.abortControllers) {
     abortController.abort();
   }
@@ -823,10 +1225,16 @@ async function prepareAudioDownload(page, title) {
   return prepared.payload;
 }
 
-async function downloadPreparedPayload(prepared, statusText = TEXT.downloading) {
+async function downloadPreparedPayload(prepared, statusText = TEXT.downloading, options = {}) {
   if (prepared.mode === "dash") {
-    await downloadDashAsMp4(prepared);
-    return;
+    if (options.allowCompanion !== false && await shouldUseStreamingCompanionForDash(prepared)) {
+      return downloadPreparedCompanionPayload(prepared, options);
+    }
+    return downloadDashAsMp4(prepared);
+  }
+
+  if (prepared.mode === "durl" || prepared.mode === "audio") {
+    return downloadPreparedDirectPayload(prepared);
   }
 
   for (const [index, segment] of prepared.segments.entries()) {
@@ -841,21 +1249,1206 @@ async function downloadPreparedPayload(prepared, statusText = TEXT.downloading) 
   await saveDiagnostic(state.lastDiagnostic);
 }
 
+async function shouldUseStreamingCompanionForDash(prepared) {
+  if (!state.companionSettings.preferDash) {
+    return false;
+  }
+  return ensureStreamingCompanionAvailable();
+}
+
+async function downloadPreparedCompanionPayload(prepared, options = {}) {
+  const started = await chrome.runtime.sendMessage({
+    type: "BILI_DOWNLOAD_START_COMPANION",
+    payload: {
+      prepared,
+      tabId: state.tabId
+    }
+  });
+  if (!started?.ok || !started?.payload?.taskId) {
+    throw new Error(started?.error || "无法启动本地流式助手。");
+  }
+
+  const task = rememberCompanionTask(started.payload);
+  if (typeof options.onStarted === "function") {
+    await options.onStarted(task);
+  }
+  const control = state.downloadControl;
+  if (control) {
+    control.companionTaskId = task.taskId;
+  }
+  if (control?.canceled) {
+    requestCompanionTaskControl(task.taskId, "cancel").catch(() => {});
+    throw downloadCanceledError();
+  }
+  beginCompanionTaskProgress(task);
+  let completedTask = null;
+  try {
+    completedTask = await waitForCompanionTask(task.taskId);
+  } finally {
+    if (control?.companionTaskId === task.taskId && isCompanionTaskTerminal(state.companionTasks.get(task.taskId))) {
+      control.companionTaskId = "";
+    }
+  }
+  if (completedTask.state !== "complete") {
+    if (completedTask.state === "canceled") {
+      throw downloadCanceledError();
+    }
+    throw new Error(completedTask.error || "本地流式助手任务未完成。");
+  }
+  completeProgress(completedTask);
+  return completedTask;
+}
+
+function beginCompanionTaskProgress(task) {
+  state.progress.active = true;
+  state.progress.receivedBytes = Number(task?.receivedBytes) || 0;
+  state.progress.totalBytes = Number(task?.totalBytes) || 0;
+  state.progress.percent = state.progress.totalBytes
+    ? Math.min((state.progress.receivedBytes / state.progress.totalBytes) * 100, 100)
+    : 0;
+  state.progress.speedBytesPerSecond = 0;
+  state.progress.durationMs = Number(task?.durationMs) || 0;
+  state.progress.startedAt = Date.now();
+  state.progress.lastAt = state.progress.startedAt;
+  state.progress.segmentIndex = Number(task?.segmentIndex) || 0;
+  state.progress.segmentCount = Number(task?.segmentCount) || 0;
+  state.progress.candidateIndex = 0;
+  state.progress.candidateCount = 0;
+  renderProgress();
+}
+
+function safeCompanionDisplayText(value, maxLength = 240) {
+  return String(value || "")
+    .replace(/https?:\/\/[^\s]+/gi, "[已隐藏链接]")
+    .replace(/[a-z]:[\\/][^\s]+/gi, "[已隐藏本地路径]")
+    .replace(/[\\/]/g, "")
+    .slice(0, maxLength);
+}
+
+function safeCompanionOutputName(value) {
+  const raw = String(value || "").split(/[\\/]/).at(-1) || "";
+  return safeCompanionDisplayText(raw, 180);
+}
+
+function normalizeCompanionTaskState(value) {
+  const stateValue = String(value || "").toLowerCase();
+  if (stateValue === "completed") {
+    return "complete";
+  }
+  return ["queued", "starting", "in_progress", "refreshing", "canceling", "complete", "failed", "interrupted", "canceled"]
+    .includes(stateValue)
+    ? stateValue
+    : "";
+}
+
+function rememberCompanionTask(task) {
+  const normalized = {
+    taskId: String(task?.taskId || "").replace(/[^a-z0-9_-]/gi, "").slice(0, 160),
+    tabId: Number(task?.tabId) || 0,
+    kind: ["dash", "live"].includes(String(task?.kind || "").toLowerCase())
+      ? String(task.kind).toLowerCase()
+      : "",
+    title: safeCompanionDisplayText(task?.title || "", 240),
+    outputName: safeCompanionOutputName(task?.outputName || ""),
+    state: normalizeCompanionTaskState(task?.state || task?.taskState),
+    receivedBytes: Math.max(Number(task?.receivedBytes) || 0, 0),
+    totalBytes: Math.max(Number(task?.totalBytes) || 0, 0),
+    segmentIndex: Math.max(Number(task?.segmentIndex) || 0, 0),
+    segmentCount: Math.max(Number(task?.segmentCount) || 0, 0),
+    durationMs: Math.max(Number(task?.durationMs) || 0, 0),
+    error: safeCompanionDisplayText(task?.error || "", 240),
+    recoverable: Boolean(task?.recoverable),
+    createdAt: String(task?.createdAt || ""),
+    updatedAt: String(task?.updatedAt || "")
+  };
+  if (normalized.taskId) {
+    const previous = state.companionTasks.get(normalized.taskId) || {};
+    state.companionTasks.set(normalized.taskId, {
+      ...previous,
+      ...normalized
+    });
+  }
+  return state.companionTasks.get(normalized.taskId) || normalized;
+}
+
+function receiveCompanionTaskProgress(payload) {
+  if (!payload?.companionDownload || !payload?.taskId) {
+    return null;
+  }
+  const previous = state.companionTasks.get(String(payload.taskId)) || {};
+  const task = rememberCompanionTask({
+    ...previous,
+    taskId: payload.taskId,
+    tabId: payload.tabId ?? previous.tabId,
+    kind: payload.companionKind || payload.kind || previous.kind,
+    title: payload.title || previous.title,
+    outputName: payload.outputName || previous.outputName,
+    state: payload.taskState || payload.state || previous.state,
+    receivedBytes: payload.receivedBytes ?? previous.receivedBytes,
+    totalBytes: payload.totalBytes ?? previous.totalBytes,
+    segmentIndex: payload.segmentIndex ?? previous.segmentIndex,
+    segmentCount: payload.segmentCount ?? previous.segmentCount,
+    durationMs: payload.durationMs ?? previous.durationMs,
+    error: payload.error || previous.error,
+    recoverable: payload.recoverable ?? previous.recoverable,
+    createdAt: payload.createdAt || previous.createdAt,
+    updatedAt: payload.updatedAt || previous.updatedAt
+  });
+  if (isCompanionTaskTerminal(task)) {
+    settleCompanionTaskWaiter(task);
+  }
+  renderTaskCenter();
+  scheduleTaskCenterRefresh();
+  return task;
+}
+
+function isCompanionTaskTerminal(task) {
+  return ["complete", "failed", "interrupted", "canceled"].includes(String(task?.state || task?.taskState || ""));
+}
+
+function waitForCompanionTask(taskId) {
+  const task = state.companionTasks.get(taskId);
+  if (isCompanionTaskTerminal(task)) {
+    return task.state === "complete"
+      ? Promise.resolve(task)
+      : Promise.reject(companionTaskError(task));
+  }
+  return new Promise((resolve, reject) => {
+    const waiter = { resolve, reject, timer: null };
+    state.companionTaskWaiters.set(taskId, waiter);
+    const latest = state.companionTasks.get(taskId);
+    if (isCompanionTaskTerminal(latest)) {
+      settleCompanionTaskWaiter(latest);
+      return;
+    }
+    scheduleCompanionTaskPoll(taskId, waiter);
+  });
+}
+
+function scheduleCompanionTaskPoll(taskId, waiter) {
+  waiter.timer = setTimeout(async () => {
+    try {
+      const response = await chrome.runtime.sendMessage({
+        type: "BILI_DOWNLOAD_GET_COMPANION_TASK",
+        payload: { taskId }
+      });
+      if (response?.ok && response.payload) {
+        const task = rememberCompanionTask(response.payload);
+        if (isCompanionTaskTerminal(task)) {
+          settleCompanionTaskWaiter(task);
+          return;
+        }
+      }
+    } catch (_error) {
+      // The background progress port normally arrives first; polling covers worker restarts.
+    }
+    if (state.companionTaskWaiters.get(taskId) === waiter) {
+      scheduleCompanionTaskPoll(taskId, waiter);
+    }
+  }, COMPANION_TASK_REFRESH_INTERVAL_MS);
+  waiter.timer?.unref?.();
+}
+
+function settleCompanionTaskWaiter(task) {
+  const taskId = String(task?.taskId || "");
+  const waiter = state.companionTaskWaiters.get(taskId);
+  if (!waiter) {
+    return;
+  }
+  state.companionTaskWaiters.delete(taskId);
+  if (waiter.timer) {
+    clearTimeout(waiter.timer);
+  }
+  if (task?.state === "complete") {
+    waiter.resolve(task);
+  } else {
+    waiter.reject(companionTaskError(task));
+  }
+}
+
+function companionTaskError(task) {
+  if (task?.state === "canceled") {
+    return downloadCanceledError();
+  }
+  return new Error(task?.error || "本地流式助手任务已中断。");
+}
+
+async function requestCompanionTaskControl(taskId, action) {
+  const response = await chrome.runtime.sendMessage({
+    type: "BILI_DOWNLOAD_CONTROL_COMPANION_TASK",
+    payload: { taskId, action }
+  });
+  if (!response?.ok) {
+    throw new Error(response?.error || "无法控制本地流式助手任务。");
+  }
+  return response.payload ? rememberCompanionTask(response.payload) : null;
+}
+
+async function downloadPreparedDirectPayload(prepared, options = {}) {
+  const started = await chrome.runtime.sendMessage({
+    type: "BILI_DOWNLOAD_START_DIRECT",
+    payload: {
+      prepared,
+      tabId: state.tabId
+    }
+  });
+
+  if (!started?.ok || !started?.payload?.taskId) {
+    state.lastDiagnostic = started?.diagnostic || state.lastDiagnostic;
+    throw new Error(started?.error || "Failed to start native download.");
+  }
+
+  const task = rememberNativeDirectTask(started.payload);
+  const control = state.downloadControl;
+  if (control) {
+    control.nativeTaskId = task.taskId;
+  }
+  try {
+    if (typeof options.onStarted === "function") {
+      await options.onStarted(task);
+    }
+  } catch (error) {
+    // A native transfer already exists at this point.  If its batch linkage
+    // cannot be persisted, request cancellation rather than leaving an
+    // untracked download that a reopened side panel would start again.
+    requestNativeDirectTaskControl(task.taskId, "cancel").catch(() => {});
+    if (control?.nativeTaskId === task.taskId) {
+      control.nativeTaskId = "";
+    }
+    throw error;
+  }
+  if (control?.canceled) {
+    requestNativeDirectTaskControl(task.taskId, "cancel").catch(() => {});
+    throw downloadCanceledError();
+  }
+  if (control?.paused) {
+    await requestNativeDirectTaskControl(task.taskId, "pause");
+  }
+  beginNativeDirectTaskProgress(task);
+  let completedTask = null;
+  try {
+    completedTask = await waitForNativeDirectTask(task.taskId);
+  } catch (error) {
+    await loadNativeDirectTaskDiagnostic();
+    throw error;
+  }
+  if (completedTask.state !== "complete") {
+    if (completedTask.state === "canceled") {
+      throw downloadCanceledError();
+    }
+    throw new Error(completedTask.error || "Native download was interrupted.");
+  }
+
+  completeProgress(completedTask);
+  await loadNativeDirectTaskDiagnostic();
+  return completedTask;
+}
+
+function beginNativeDirectTaskProgress(task) {
+  state.progress.active = true;
+  state.progress.receivedBytes = Number(task?.receivedBytes) || 0;
+  state.progress.totalBytes = Number(task?.totalBytes) || 0;
+  state.progress.percent = state.progress.totalBytes
+    ? Math.min((state.progress.receivedBytes / state.progress.totalBytes) * 100, 100)
+    : 0;
+  state.progress.speedBytesPerSecond = 0;
+  state.progress.durationMs = 0;
+  state.progress.startedAt = Date.now();
+  state.progress.lastAt = state.progress.startedAt;
+  const activeSegment = Array.isArray(task?.segments)
+    ? task.segments.find((segment) => segment.state === "in_progress" || segment.state === "starting") || task.segments[0]
+    : null;
+  state.progress.segmentIndex = Number(activeSegment?.index) || 0;
+  state.progress.segmentCount = Number(task?.count) || (Array.isArray(task?.segments) ? task.segments.length : 0);
+  state.progress.candidateIndex = Number(activeSegment?.candidateIndex) || 0;
+  state.progress.candidateCount = Number(activeSegment?.candidateCount) || 0;
+  renderProgress();
+}
+
+function rememberNativeDirectTask(task) {
+  const normalized = {
+    ...task,
+    taskId: String(task?.taskId || ""),
+    state: String(task?.state || task?.taskState || ""),
+    receivedBytes: Number(task?.receivedBytes) || 0,
+    totalBytes: Number(task?.totalBytes) || 0,
+    error: String(task?.error || "")
+  };
+  if (normalized.taskId) {
+    state.nativeDirectTasks.set(normalized.taskId, normalized);
+  }
+  return normalized;
+}
+
+function receiveNativeDirectTaskProgress(payload) {
+  if (!payload?.nativeDownload || !payload?.taskId) {
+    return null;
+  }
+
+  const previous = state.nativeDirectTasks.get(payload.taskId) || {};
+  const task = rememberNativeDirectTask({
+    ...previous,
+    taskId: payload.taskId,
+    state: payload.taskState || previous.state,
+    taskState: payload.taskState || previous.taskState,
+    receivedBytes: payload.receivedBytes,
+    totalBytes: payload.totalBytes,
+    error: payload.error || previous.error,
+    downloadIds: payload.downloadIds || previous.downloadIds
+  });
+  if (isNativeDirectTaskTerminal(task)) {
+    settleNativeDirectTaskWaiter(task);
+  }
+  renderTaskCenter();
+  scheduleTaskCenterRefresh();
+  return task;
+}
+
+function waitForNativeDirectTask(taskId) {
+  const task = state.nativeDirectTasks.get(taskId);
+  if (isNativeDirectTaskTerminal(task)) {
+    return task.state === "complete"
+      ? Promise.resolve(task)
+      : Promise.reject(nativeDirectTaskError(task));
+  }
+
+  return new Promise((resolve, reject) => {
+    const waiter = {
+      resolve,
+      reject,
+      timer: null
+    };
+    state.nativeDirectTaskWaiters.set(taskId, waiter);
+    const latest = state.nativeDirectTasks.get(taskId);
+    if (isNativeDirectTaskTerminal(latest)) {
+      settleNativeDirectTaskWaiter(latest);
+      return;
+    }
+    scheduleNativeDirectTaskPoll(taskId, waiter);
+  });
+}
+
+function scheduleNativeDirectTaskPoll(taskId, waiter) {
+  waiter.timer = setTimeout(async () => {
+    try {
+      const response = await chrome.runtime.sendMessage({
+        type: "BILI_DOWNLOAD_GET_DIRECT_TASK",
+        payload: { taskId }
+      });
+      if (response?.ok && response.payload) {
+        const task = rememberNativeDirectTask(response.payload);
+        if (isNativeDirectTaskTerminal(task)) {
+          settleNativeDirectTaskWaiter(task);
+          return;
+        }
+      }
+    } catch (_error) {
+      // Port updates normally arrive first; polling only covers a worker restart.
+    }
+
+    if (state.nativeDirectTaskWaiters.get(taskId) === waiter) {
+      scheduleNativeDirectTaskPoll(taskId, waiter);
+    }
+  }, 2000);
+}
+
+function settleNativeDirectTaskWaiter(task) {
+  const taskId = String(task?.taskId || "");
+  const waiter = state.nativeDirectTaskWaiters.get(taskId);
+  if (!waiter) {
+    return;
+  }
+  state.nativeDirectTaskWaiters.delete(taskId);
+  if (waiter.timer) {
+    clearTimeout(waiter.timer);
+  }
+  settleNativeDirectTask(task, waiter);
+}
+
+function settleNativeDirectTask(task, waiter = null) {
+  if (task?.state === "complete") {
+    waiter?.resolve(task);
+    return task;
+  }
+  const error = nativeDirectTaskError(task);
+  waiter?.reject(error);
+  return error;
+}
+
+function nativeDirectTaskError(task) {
+  if (task?.state === "canceled") {
+    return downloadCanceledError();
+  }
+  return new Error(task?.error || "Native download was interrupted.");
+}
+
+function isNativeDirectTaskTerminal(task) {
+  return ["complete", "interrupted", "canceled"].includes(task?.state || task?.taskState || "");
+}
+
+async function requestNativeDirectTaskControl(taskId, action) {
+  const response = await chrome.runtime.sendMessage({
+    type: "BILI_DOWNLOAD_CONTROL_DIRECT",
+    payload: { taskId, action }
+  });
+  if (!response?.ok) {
+    throw new Error(response?.error || "Failed to control native download.");
+  }
+  return response.payload ? rememberNativeDirectTask(response.payload) : null;
+}
+
+async function loadNativeDirectTaskDiagnostic() {
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: "BILI_DOWNLOAD_GET_DIAGNOSTIC"
+    });
+    if (response?.ok && response.payload) {
+      state.lastDiagnostic = response.payload;
+    }
+  } catch (_error) {
+    // The background already persisted its own diagnostic; this only refreshes the side panel.
+  }
+}
+
+async function refreshTaskCenter(options = {}) {
+  if (state.taskCenterLoading || !state.tabId) {
+    renderTaskCenter();
+    return;
+  }
+
+  state.taskCenterLoading = true;
+  try {
+    const [directResponse, batchResponse, companionResponse] = await Promise.all([
+      sendTaskCenterMessage({
+        type: "BILI_DOWNLOAD_LIST_DIRECT_TASKS",
+        payload: { tabId: state.tabId, activeOnly: false }
+      }),
+      sendTaskCenterMessage({
+        type: "BILI_DOWNLOAD_LIST_BATCH_JOBS",
+        payload: { tabId: state.tabId, activeOnly: false }
+      }),
+      sendTaskCenterMessage({
+        type: "BILI_DOWNLOAD_LIST_COMPANION_TASKS",
+        payload: { tabId: state.tabId, activeOnly: false }
+      })
+    ]);
+    for (const task of Array.isArray(directResponse?.payload) ? directResponse.payload : []) {
+      rememberNativeDirectTask(task);
+    }
+    for (const job of Array.isArray(batchResponse?.payload) ? batchResponse.payload : []) {
+      rememberBatchJob(job);
+    }
+    const companionTasks = Array.isArray(companionResponse?.payload)
+      ? companionResponse.payload
+      : (Array.isArray(companionResponse?.payload?.tasks) ? companionResponse.payload.tasks : []);
+    for (const task of companionTasks) {
+      rememberCompanionTask(task);
+    }
+  } finally {
+    state.taskCenterLoading = false;
+    renderTaskCenter();
+    scheduleTaskCenterRefresh();
+  }
+
+  if (options.resumeBatch) {
+    resumeVisibleBatchJobs().catch(() => {});
+  }
+}
+
+async function sendTaskCenterMessage(message) {
+  try {
+    const response = await chrome.runtime.sendMessage(message);
+    return response?.ok ? response : null;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function rememberBatchJob(job) {
+  const normalized = {
+    ...job,
+    jobId: String(job?.jobId || job?.batchJobId || job?.id || ""),
+    state: String(job?.state || ""),
+    tabId: Number(job?.tabId) || 0,
+    currentIndex: Math.max(Number(job?.currentIndex) || 0, 0),
+    itemCount: Math.max(Number(job?.itemCount) || Number(job?.count) || (Array.isArray(job?.items) ? job.items.length : 0), 0),
+    completedCount: Math.max(Number(job?.completedCount) || 0, 0),
+    error: String(job?.error || "")
+  };
+  if (normalized.jobId) {
+    state.batchJobs.set(normalized.jobId, normalized);
+  }
+  return normalized;
+}
+
+function isBatchJobTerminal(job) {
+  return ["complete", "canceled"].includes(String(job?.state || ""));
+}
+
+function isTaskCenterItemActive(item) {
+  return !["complete", "failed", "interrupted", "canceled"].includes(String(item?.state || item?.taskState || ""));
+}
+
+function visibleTaskCenterItems() {
+  const tabId = Number(state.tabId) || 0;
+  if (!tabId) {
+    return [];
+  }
+  const belongsToCurrentTab = (item) => Number(item?.tabId) === tabId;
+  const direct = Array.from(state.nativeDirectTasks.values())
+    .filter(belongsToCurrentTab)
+    .map((task) => ({ kind: "direct", item: task }));
+  const batches = Array.from(state.batchJobs.values())
+    .filter(belongsToCurrentTab)
+    .map((job) => ({ kind: "batch", item: job }));
+  const companion = Array.from(state.companionTasks.values())
+    .filter(belongsToCurrentTab)
+    .map((task) => ({ kind: "companion", item: task }));
+  return [...direct, ...companion, ...batches]
+    .sort((left, right) => {
+      const leftActive = isTaskCenterItemActive(left.item) ? 0 : 1;
+      const rightActive = isTaskCenterItemActive(right.item) ? 0 : 1;
+      if (leftActive !== rightActive) {
+        return leftActive - rightActive;
+      }
+      return String(right.item.updatedAt || right.item.createdAt || "")
+        .localeCompare(String(left.item.updatedAt || left.item.createdAt || ""));
+    })
+    .slice(0, 24);
+}
+
+function renderTaskCenter() {
+  if (!taskCenter || !taskCenterNote || !taskList) {
+    return;
+  }
+  const tasks = visibleTaskCenterItems();
+  taskList.replaceChildren();
+  if (!tasks.length) {
+    taskCenterNote.textContent = "当前页面没有由扩展管理的下载任务。";
+    return;
+  }
+
+  const activeCount = tasks.filter((entry) => isTaskCenterItemActive(entry.item)).length;
+  taskCenterNote.textContent = activeCount
+    ? `当前页面有 ${activeCount} 个进行中的任务；关闭侧边栏后可在此继续查看和控制。`
+    : `显示最近 ${tasks.length} 个任务。`;
+  for (const entry of tasks) {
+    taskList.append(renderTaskCenterRow(entry.kind, entry.item));
+  }
+}
+
+function renderTaskCenterRow(kind, item) {
+  const row = document.createElement("article");
+  row.className = "task-row";
+  const heading = document.createElement("div");
+  heading.className = "task-row-head";
+  const title = document.createElement("span");
+  title.className = "task-row-title";
+  title.textContent = taskCenterTitle(kind, item);
+  title.title = title.textContent;
+  const stateLabel = document.createElement("span");
+  stateLabel.className = "task-state";
+  stateLabel.dataset.state = String(item.state || "");
+  stateLabel.textContent = taskStateLabel(item.state);
+  heading.append(title, stateLabel);
+
+  const meta = document.createElement("div");
+  meta.className = "task-row-meta";
+  const progress = document.createElement("span");
+  progress.textContent = taskCenterProgress(kind, item);
+  const detail = document.createElement("span");
+  detail.textContent = taskCenterDetail(kind, item);
+  meta.append(progress, detail);
+  row.append(heading, meta);
+
+  const actions = renderTaskCenterActions(kind, item);
+  if (actions) {
+    row.append(actions);
+  }
+  return row;
+}
+
+function taskCenterTitle(kind, item) {
+  if (kind === "batch") {
+    return String(item.title || item.label || "多分 P 下载队列");
+  }
+  if (kind === "companion") {
+    const label = item.kind === "live" ? "直播录制" : "DASH 下载";
+    return `${label} · ${String(item.title || item.outputName || "本地流式助手")}`;
+  }
+  const segment = Array.isArray(item.segments) ? item.segments[0] : null;
+  return String(item.title || segment?.context?.title || segment?.title || "媒体下载");
+}
+
+function taskStateLabel(value) {
+  return ({
+    queued: "等待中",
+    starting: "正在启动",
+    in_progress: "下载中",
+    paused: "已暂停",
+    refreshing: "正在刷新地址",
+    canceling: "正在取消",
+    complete: "已完成",
+    failed: "失败",
+    interrupted: "已中断",
+    canceled: "已取消"
+  })[String(value || "")] || "未知";
+}
+
+function taskCenterProgress(kind, item) {
+  if (kind === "batch") {
+    const total = Number(item.itemCount) || (Array.isArray(item.items) ? item.items.length : 0);
+    const completed = Number(item.completedCount) || 0;
+    return total ? `${completed}/${total} 个条目` : "队列准备中";
+  }
+  const received = Number(item.receivedBytes) || 0;
+  const total = Number(item.totalBytes) || 0;
+  return `${formatBytes(received)} / ${total ? formatBytes(total) : "--"}`;
+}
+
+function taskCenterDetail(kind, item) {
+  if (item.error) {
+    return String(item.error).slice(0, 80);
+  }
+  if (kind === "batch") {
+    return String(item.kind === "audio" || item.mode === "audio" ? "音频" : "视频");
+  }
+  if (kind === "companion") {
+    return item.kind === "live" ? "本地流式助手 · 分段直播录制" : "本地流式助手 · DASH 流式落盘";
+  }
+  const completeCount = Number(item.completedCount) || 0;
+  const count = Number(item.count) || (Array.isArray(item.segments) ? item.segments.length : 0);
+  return count > 1 ? `分段 ${completeCount}/${count}` : "原生下载";
+}
+
+function renderTaskCenterActions(kind, item) {
+  if (kind === "direct") {
+    if (isNativeDirectTaskTerminal(item)) {
+      return null;
+    }
+    const actions = document.createElement("div");
+    actions.className = "task-row-actions";
+    const pause = document.createElement("button");
+    pause.type = "button";
+    pause.textContent = item.state === "paused" ? "继续" : "暂停";
+    pause.addEventListener("click", () => {
+      controlTaskCenterDirectTask(item.taskId, item.state === "paused" ? "resume" : "pause").catch(() => {});
+    });
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "danger";
+    cancel.textContent = "取消";
+    cancel.addEventListener("click", () => {
+      controlTaskCenterDirectTask(item.taskId, "cancel").catch(() => {});
+    });
+    actions.append(pause, cancel);
+    return actions;
+  }
+
+  if (kind === "companion") {
+    const canResume = item.state === "interrupted" && item.recoverable;
+    if (isCompanionTaskTerminal(item) && !canResume) {
+      return null;
+    }
+    const actions = document.createElement("div");
+    actions.className = "task-row-actions";
+    const action = document.createElement("button");
+    action.type = "button";
+    action.className = canResume ? "" : "danger";
+    action.textContent = canResume ? "重新授权并开始" : "取消";
+    action.addEventListener("click", () => {
+      controlTaskCenterCompanionTask(item.taskId, canResume ? "resume" : "cancel").catch(() => {});
+    });
+    actions.append(action);
+    return actions;
+  }
+
+  if (isBatchJobTerminal(item)) {
+    return null;
+  }
+  const actions = document.createElement("div");
+  actions.className = "task-row-actions";
+  const resume = document.createElement("button");
+  resume.type = "button";
+  resume.textContent = item.state === "paused" ? "继续" : "查看";
+  resume.addEventListener("click", () => {
+    resumeBatchJob(item.jobId, { userInitiated: true }).catch(() => {});
+  });
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.className = "danger";
+  cancel.textContent = "取消";
+  cancel.addEventListener("click", () => {
+    cancelBatchJob(item.jobId).catch(() => {});
+  });
+  actions.append(resume, cancel);
+  return actions;
+}
+
+async function controlTaskCenterDirectTask(taskId, action) {
+  const task = await requestNativeDirectTaskControl(taskId, action);
+  if (task && state.downloadControl?.nativeTaskId === task.taskId) {
+    state.downloadControl.paused = task.state === "paused";
+    if (isNativeDirectTaskTerminal(task)) {
+      state.downloadControl = null;
+      setBusy(false);
+    }
+  }
+  renderTaskCenter();
+}
+
+async function controlTaskCenterCompanionTask(taskId, action = "cancel") {
+  const task = await requestCompanionTaskControl(taskId, action);
+  if (task && state.downloadControl?.companionTaskId === task.taskId && isCompanionTaskTerminal(task)) {
+    state.downloadControl = null;
+    setBusy(false);
+  }
+  renderTaskCenter();
+  scheduleTaskCenterRefresh();
+}
+
+function scheduleTaskCenterRefresh() {
+  if (state.taskCenterRefreshTimer && typeof clearTimeout === "function") {
+    clearTimeout(state.taskCenterRefreshTimer);
+  }
+  state.taskCenterRefreshTimer = null;
+  const tabId = Number(state.tabId) || 0;
+  if (!tabId) {
+    return;
+  }
+  const isActiveOnCurrentTab = (item) => Number(item?.tabId) === tabId && isTaskCenterItemActive(item);
+  const hasActiveDirect = Array.from(state.nativeDirectTasks.values()).some(isActiveOnCurrentTab);
+  const hasActiveCompanion = Array.from(state.companionTasks.values()).some(isActiveOnCurrentTab);
+  const hasActiveBatch = Array.from(state.batchJobs.values()).some(isActiveOnCurrentTab);
+  if (!hasActiveDirect && !hasActiveCompanion && !hasActiveBatch) {
+    return;
+  }
+  const delay = (hasActiveDirect || hasActiveCompanion)
+    ? Math.min(DIRECT_TASK_REFRESH_INTERVAL_MS, COMPANION_TASK_REFRESH_INTERVAL_MS)
+    : BATCH_TASK_REFRESH_INTERVAL_MS;
+  const timer = setTimeout(() => {
+    state.taskCenterRefreshTimer = null;
+    refreshTaskCenter({ resumeBatch: true, silent: true }).catch(() => {});
+  }, delay);
+  // Node-based smoke tests should not stay alive solely for a UI polling timer.
+  // Browser timer ids are numbers and intentionally have no `unref` method.
+  timer?.unref?.();
+  state.taskCenterRefreshTimer = timer;
+}
+
+async function resumeVisibleBatchJobs() {
+  if (state.batchRunPromise || state.downloadControl) {
+    return;
+  }
+  const tabId = Number(state.tabId) || 0;
+  if (!tabId) {
+    return;
+  }
+  const job = Array.from(state.batchJobs.values())
+    .filter((item) => ["queued", "in_progress"].includes(String(item?.state || "")))
+    .filter((item) => Number(item?.tabId) === tabId)
+    .sort((left, right) => String(left.updatedAt || "").localeCompare(String(right.updatedAt || "")))
+    .at(0);
+  if (job?.jobId) {
+    await resumeBatchJob(job.jobId);
+  }
+}
+
+async function createBatchJob(items, options = {}) {
+  const response = await chrome.runtime.sendMessage({
+    type: "BILI_DOWNLOAD_CREATE_BATCH_JOB",
+    payload: {
+      tabId: state.tabId,
+      title: options.title || state.video?.title || "多分 P 下载队列",
+      items
+    }
+  });
+  const job = response?.payload ? rememberBatchJob(response.payload) : null;
+  if (!response?.ok || !job?.jobId) {
+    throw new Error(response?.error || "无法保存多分 P 下载队列。");
+  }
+  renderTaskCenter();
+  return job;
+}
+
+async function getBatchJob(jobId) {
+  const response = await sendTaskCenterMessage({
+    type: "BILI_DOWNLOAD_GET_BATCH_JOB",
+    payload: { batchJobId: jobId }
+  });
+  return response?.payload ? rememberBatchJob(response.payload) : null;
+}
+
+async function updateBatchJob(jobId, patch) {
+  const response = await chrome.runtime.sendMessage({
+    type: "BILI_DOWNLOAD_UPDATE_BATCH_JOB",
+    payload: { batchJobId: jobId, patch }
+  });
+  const job = response?.payload ? rememberBatchJob(response.payload) : null;
+  if (!response?.ok || !job?.jobId) {
+    throw new Error(response?.error || "无法更新下载队列状态。");
+  }
+  renderTaskCenter();
+  scheduleTaskCenterRefresh();
+  return job;
+}
+
+function pageBatchItem(page, quality, kind = "video") {
+  const pageIndex = Number(page?.index || page?.page) || 1;
+  const title = kind === "audio"
+    ? audioDownloadTitle(state.video?.title || "bili_audio", page)
+    : pageDownloadTitle(state.video?.title || "bili_video", page);
+  return {
+    itemId: `${kind}-${pageIndex}-${Number(page?.cid) || 0}`,
+    bvid: state.video?.bvid || "",
+    epId: page?.epId || state.video?.epId || null,
+    cid: Number(page?.cid),
+    quality: kind === "audio" ? 0 : Number(quality),
+    title,
+    source: state.video?.source || state.page.type || "video",
+    pageIndex,
+    pageLabel: `P${String(pageIndex).padStart(2, "0")}`,
+    kind,
+    // The background's persisted schema intentionally has no arbitrary `kind`
+    // field. `audio` is also a valid persisted mode, so use it as the stable
+    // discriminator until the item is prepared again after a panel reload.
+    mode: kind === "audio" ? "audio" : ""
+  };
+}
+
+async function prepareBatchItem(item) {
+  const isAudio = item?.kind === "audio" || item?.mode === "audio";
+  const response = await chrome.runtime.sendMessage({
+    type: isAudio ? "BILI_DOWNLOAD_PREPARE_AUDIO" : "BILI_DOWNLOAD_PREPARE_DIRECT",
+    payload: {
+      bvid: item?.bvid,
+      epId: item?.epId || null,
+      cid: Number(item?.cid),
+      tabId: state.tabId,
+      quality: Number(item?.quality) || undefined,
+      title: item?.title || "bili_download"
+    }
+  });
+  if (!response?.ok) {
+    state.lastDiagnostic = response?.diagnostic || state.lastDiagnostic;
+    throw new Error(response?.error || "无法重新准备下载媒体。");
+  }
+  return response.payload;
+}
+
+async function resumeBatchJob(jobId, options = {}) {
+  if (!jobId) {
+    return null;
+  }
+  if (state.batchRunPromise) {
+    return state.batchRunPromise;
+  }
+  const operation = runBatchJob(jobId, options);
+  state.batchRunPromise = operation;
+  try {
+    return await operation;
+  } finally {
+    if (state.batchRunPromise === operation) {
+      state.batchRunPromise = null;
+    }
+    scheduleTaskCenterRefresh();
+  }
+}
+
+async function runBatchJob(jobId, options = {}) {
+  let job = await getBatchJob(jobId);
+  if (!job) {
+    return null;
+  }
+  if (isBatchJobTerminal(job)) {
+    return job;
+  }
+  if (["paused", "interrupted"].includes(String(job.state || "")) && !options.userInitiated) {
+    return job;
+  }
+  if (!job.tabId || !state.tabId || Number(job.tabId) !== Number(state.tabId)) {
+    if (options.userInitiated) {
+      setStatus("请先切换回创建此下载队列的页面，再继续该任务。");
+    }
+    return job;
+  }
+
+  let control = state.downloadControl;
+  if (!control) {
+    control = createDownloadControl();
+    state.downloadControl = control;
+    setBusy(true);
+  }
+  control.batchJobId = job.jobId;
+  control.batchJob = true;
+  resetProgress();
+  await updateBatchJob(job.jobId, { state: "in_progress", error: "" });
+
+  try {
+    const items = Array.isArray(job.items) ? job.items : [];
+    for (const [offset, storedItem] of items.entries()) {
+      const index = offset + 1;
+      let item = storedItem || {};
+      if (item.state === "complete" || item.state === "canceled") {
+        continue;
+      }
+      await waitForDownloadControl();
+      throwIfDownloadCanceled();
+      setStatus(`${item.kind === "audio" || item.mode === "audio" ? TEXT.downloadingPageAudio : TEXT.downloadingPages} ${index}/${items.length} ${item.pageLabel || ""}`.trim());
+
+      if (item.directTaskId) {
+        const direct = await loadOrWaitForBatchDirectTask(item.directTaskId, control, {
+          resumePaused: Boolean(options.userInitiated)
+        });
+        if (direct?.state === "complete") {
+          job = await updateBatchJob(job.jobId, {
+            currentIndex: index,
+            itemUpdates: [{ index, state: "complete", error: "" }]
+          });
+          continue;
+        }
+        if (direct?.state === "canceled") {
+          // A canceled browser task can be a prior failed batch cancellation.
+          // Drop the stale linkage and prepare a fresh authorized task instead
+          // of repeatedly treating the whole queue as canceled forever.
+          job = await updateBatchJob(job.jobId, {
+            currentIndex: index,
+            itemUpdates: [{ index, state: "queued", directTaskId: "", error: "" }]
+          });
+          item = job.items?.[offset] || { ...item, directTaskId: "", state: "queued" };
+        } else {
+          // A stale or terminal failed native task is retried by obtaining a fresh
+          // play-url below. The direct task itself keeps its historical diagnostic.
+          job = await updateBatchJob(job.jobId, {
+            currentIndex: index,
+            itemUpdates: [{ index, state: "queued", directTaskId: "", error: "" }]
+          });
+          item = job.items?.[offset] || { ...item, directTaskId: "", state: "queued" };
+        }
+      }
+
+      if (item.state === "in_progress" && item.mode === "dash") {
+        // A side-panel/browser mux cannot survive a panel teardown. No partial
+        // output is saved, so returning this item to the queue is safe.
+        job = await updateBatchJob(job.jobId, {
+          currentIndex: index,
+          itemUpdates: [{ index, state: "queued", error: "浏览器端 DASH 在面板关闭后将重新开始。" }]
+        });
+        item = job.items?.[offset] || { ...item, state: "queued" };
+      }
+
+      job = await updateBatchJob(job.jobId, {
+        currentIndex: index,
+        itemUpdates: [{ index, state: "preparing", attempt: (Number(item.attempt) || 0) + 1, error: "" }]
+      });
+      item = job.items?.[offset] || item;
+      const prepared = await prepareBatchItem(item);
+      job = await updateBatchJob(job.jobId, {
+        currentIndex: index,
+        itemUpdates: [{ index, state: "in_progress", mode: prepared.mode || "", format: prepared.format || "", error: "" }]
+      });
+
+      if (prepared.mode === "durl" || prepared.mode === "audio") {
+        await downloadPreparedDirectPayload(prepared, {
+          onStarted: async (task) => {
+            job = await updateBatchJob(job.jobId, {
+              currentIndex: index,
+              itemUpdates: [{ index, state: "in_progress", directTaskId: task.taskId, mode: prepared.mode || "", format: prepared.format || "" }]
+            });
+          }
+        });
+      } else {
+        // Batch recovery currently persists only browser/native direct task ids.
+        // Keep its DASH path browser-only until it can persist the companion task
+        // relationship without creating a duplicate download after panel reopen.
+        await downloadPreparedPayload(prepared, TEXT.downloading, { allowCompanion: false });
+      }
+      job = await updateBatchJob(job.jobId, {
+        currentIndex: index,
+        itemUpdates: [{ index, state: "complete", error: "" }]
+      });
+    }
+    job = await updateBatchJob(job.jobId, { state: "complete", error: "" });
+    setStatus(`${job.title || TEXT.pagesDownloaded}: ${Number(job.completedCount) || items.length}`);
+    return job;
+  } catch (error) {
+    const currentIndex = Math.max(Number(job.currentIndex) || 1, 1);
+    if (isDownloadCanceledError(error)) {
+      if (control?.batchCancelPending) {
+        // cancelBatchJob confirms any surviving chrome.downloads task before it
+        // marks the persisted queue terminal. Do not race it with a local abort.
+        return job;
+      }
+      job = await updateBatchJob(job.jobId, {
+        state: "canceled",
+        error: "",
+        itemUpdates: [{ index: currentIndex, state: "canceled", error: "" }]
+      }).catch(() => job);
+      setStatus(TEXT.canceled);
+      return job;
+    }
+    const message = String(error?.message || "下载队列已暂停。");
+    job = await updateBatchJob(job.jobId, {
+      state: "paused",
+      error: message,
+      itemUpdates: [{ index: currentIndex, state: "queued", error: message }]
+    }).catch(() => job);
+    if (error.diagnostic) {
+      state.lastDiagnostic = error.diagnostic;
+      await saveDiagnostic(error.diagnostic);
+    }
+    setStatus(`${message}；可在任务中心继续。`);
+    return job;
+  } finally {
+    if (state.downloadControl === control) {
+      state.downloadControl = null;
+      setBusy(false);
+    }
+    renderTaskCenter();
+  }
+}
+
+async function loadOrWaitForBatchDirectTask(taskId, control, options = {}) {
+  let task = state.nativeDirectTasks.get(taskId) || null;
+  if (!task) {
+    const response = await sendTaskCenterMessage({
+      type: "BILI_DOWNLOAD_GET_DIRECT_TASK",
+      payload: { taskId }
+    });
+    task = response?.payload ? rememberNativeDirectTask(response.payload) : null;
+  }
+  if (!task) {
+    return null;
+  }
+  control.nativeTaskId = task.taskId;
+  control.paused = task.state === "paused";
+  if (task.state === "paused" && options.resumePaused) {
+    task = await requestNativeDirectTaskControl(task.taskId, "resume") || task;
+    control.paused = task.state === "paused";
+  }
+  beginNativeDirectTaskProgress(task);
+  try {
+    return await waitForNativeDirectTask(task.taskId);
+  } catch (_error) {
+    return state.nativeDirectTasks.get(task.taskId) || task;
+  } finally {
+    if (control.nativeTaskId === task.taskId) {
+      control.nativeTaskId = "";
+    }
+  }
+}
+
+async function cancelBatchJob(jobId) {
+  const job = state.batchJobs.get(jobId) || await getBatchJob(jobId);
+  if (!job || isBatchJobTerminal(job)) {
+    return;
+  }
+  const control = state.downloadControl;
+  if (control?.batchJobId === jobId) {
+    control.batchCancelPending = true;
+    control.canceled = true;
+    control.paused = false;
+    for (const abortController of control.abortControllers) {
+      abortController.abort();
+    }
+    resumeDownloadWaiters(control);
+  }
+
+  const directTaskIds = new Set((Array.isArray(job.items) ? job.items : [])
+    .filter((item) => !["complete", "canceled"].includes(String(item?.state || "")))
+    .map((item) => String(item?.directTaskId || ""))
+    .filter(Boolean));
+  if (control?.batchJobId === jobId && control.nativeTaskId) {
+    directTaskIds.add(String(control.nativeTaskId));
+  }
+
+  let cancellationError = null;
+  const confirmedTasks = new Map();
+  for (const taskId of directTaskIds) {
+    try {
+      const known = state.nativeDirectTasks.get(taskId);
+      if (known && isNativeDirectTaskTerminal(known)) {
+        continue;
+      }
+      const task = await requestNativeDirectTaskControl(taskId, "cancel");
+      if (!task || !isNativeDirectTaskTerminal(task)) {
+        throw new Error("未确认原生下载任务已经取消。");
+      }
+    } catch (error) {
+      cancellationError = error;
+      break;
+    }
+  }
+
+  const currentIndex = Math.max(Number(job.currentIndex) || 1, 1);
+  if (cancellationError) {
+    const message = "未能确认所有浏览器下载已取消；队列已暂停，请重试取消或在浏览器下载列表中处理。";
+    await updateBatchJob(jobId, {
+      state: "paused",
+      error: message,
+      currentIndex,
+      itemUpdates: [{ index: currentIndex, state: "queued", error: message }]
+    });
+    if (control?.batchJobId === jobId) {
+      control.batchCancelPending = false;
+      control.canceled = false;
+      control.paused = true;
+      resumeDownloadWaiters(control);
+    }
+    setStatus(message);
+    renderDownloadControls();
+    return;
+  }
+
+  const itemUpdates = (Array.isArray(job.items) ? job.items : [])
+    .map((item, index) => ({ item, index: index + 1 }))
+    .filter(({ item }) => !["complete", "canceled"].includes(String(item?.state || "")))
+    .map(({ index }) => ({ index, state: "canceled", error: "" }));
+  await updateBatchJob(jobId, {
+    state: "canceled",
+    error: "",
+    currentIndex,
+    itemUpdates
+  });
+  if (control?.batchJobId === jobId) {
+    control.batchCancelPending = false;
+  }
+  setStatus(TEXT.canceled);
+}
+
 async function downloadDashAsMp4(prepared) {
+  const safety = getDashSafetyLimits();
+  const expectedInputBytes = prepared.segments.reduce((total, segment) => (
+    total + knownSegmentSize(segment)
+  ), 0);
+  assertDashInputWithinSafetyLimits(expectedInputBytes, safety, "预计");
+
   const downloads = [];
+  let bufferedInputBytes = 0;
   for (const [index, segment] of prepared.segments.entries()) {
     await waitForDownloadControl();
     throwIfDownloadCanceled();
     const role = segment.context?.roleLabel || segment.context?.role || "";
     const suffix = role ? ` ${index + 1}/${prepared.count} ${role}` : ` ${index + 1}/${prepared.count}`;
     setStatus(`${TEXT.downloading}${suffix}`);
-    const diagnostic = await downloadSegment(segment, { save: false });
+    const remainingBytes = safety.maxInputBytes - bufferedInputBytes;
+    if (remainingBytes <= 0) {
+      throw dashSafetyLimitError(safety, bufferedInputBytes, "已下载");
+    }
+    const diagnostic = await downloadSegment(segment, {
+      save: false,
+      maxBytes: remainingBytes,
+      limitMessage: dashSafetyLimitMessage(safety, 0, "下载")
+    });
+    const blob = diagnostic.blob;
     downloads.push({
       segment,
       diagnostic,
-      blob: diagnostic.blob
+      blob
     });
     delete diagnostic.blob;
+    bufferedInputBytes += blob?.size || 0;
+    assertDashInputWithinSafetyLimits(bufferedInputBytes, safety, "已下载");
     state.lastDiagnostic = diagnostic;
   }
 
@@ -876,6 +2469,9 @@ async function downloadDashAsMp4(prepared) {
       audioBlob: audio.blob,
       outputName: dashOutputFilename(prepared)
     });
+    if (merged?.blob?.size > safety.maxFileBytes) {
+      throw new Error(`合并后的 MP4 为 ${formatBytes(merged.blob.size)}，超过设置的 DASH 文件上限 ${formatBytes(safety.maxFileBytes)}；未保存文件。请降低清晰度，或在“内存与录制保护”中调高上限。`);
+    }
     await waitForDownloadControl();
     throwIfDownloadCanceled();
     const downloadFilename = filenameForPageDownload(merged.filename);
@@ -903,13 +2499,15 @@ async function downloadDashAsMp4(prepared) {
 async function downloadSegment(segment, options = {}) {
   const diagnostic = createPageDiagnostic(segment);
   const downloadOptions = {
-    save: options.save !== false
+    save: options.save !== false,
+    maxBytes: normalizeMediaLimitBytes(options.maxBytes),
+    limitMessage: String(options.limitMessage || "")
   };
   if (isExtensionFetchPreferred(segment.url)) {
     try {
       return await downloadViaExtensionBlob(segment, diagnostic, null, downloadOptions);
     } catch (error) {
-      if (isDownloadCanceledError(error)) {
+      if (isDownloadCanceledError(error) || isMediaSafetyLimitError(error)) {
         throw error;
       }
       return downloadViaPageBlob(segment, diagnostic, error, downloadOptions);
@@ -919,7 +2517,7 @@ async function downloadSegment(segment, options = {}) {
   try {
     return await downloadViaPageBlob(segment, diagnostic, null, downloadOptions);
   } catch (error) {
-    if (isDownloadCanceledError(error)) {
+    if (isDownloadCanceledError(error) || isMediaSafetyLimitError(error)) {
       throw error;
     }
     return downloadViaExtensionBlob(segment, diagnostic, error, downloadOptions);
@@ -963,29 +2561,47 @@ async function recordLiveSegment(segment, control) {
         fetch: pickFetchResult(result)
       });
       diagnostic.fetch = pickFetchResult(result);
-      diagnostic.phase = "complete";
+      diagnostic.phase = result.stoppedBySafetyLimit
+        ? "stopped-by-safety-limit"
+        : result.savedToDisk === false
+          ? "stopped"
+          : "complete";
       diagnostic.error = null;
       diagnostic.saved = {
         filename: result.filename,
         mime: result.mime,
         size: result.size,
         method: "live-recording",
-        mode: "live-flv"
+        mode: "live-flv",
+        savedToDisk: result.savedToDisk === true,
+        stopReason: result.stopReason || ""
       };
+      if (result.stoppedBySafetyLimit) {
+        diagnostic.safety = {
+          stopReason: result.stopReason,
+          maxBytes: result.maxBytes,
+          maxFileBytes: result.maxFileBytes,
+          maxMemoryBytes: result.maxMemoryBytes,
+          maxDurationMs: result.maxDurationMs
+        };
+      }
       completeProgress(result);
       await saveDiagnostic(diagnostic);
       return diagnostic;
     } catch (error) {
       if (isDownloadCanceledError(error)) {
-        diagnostic.phase = "complete";
-        diagnostic.error = null;
         const result = error.result || {};
+        const savedToDisk = result.savedToDisk === true && Number(result.size) > 0;
+        diagnostic.phase = savedToDisk ? "complete" : "stopped";
+        diagnostic.error = null;
         diagnostic.saved = {
           filename: result.filename || filenameForPageDownload(segment.filename),
           mime: result.mime || "video/x-flv",
           size: result.size || 0,
           method: "live-recording",
-          mode: "live-flv"
+          mode: "live-flv",
+          savedToDisk,
+          stopReason: result.stopReason || "user"
         };
         completeProgress(result);
         await saveDiagnostic(diagnostic);
@@ -1016,12 +2632,75 @@ async function recordLiveSegment(segment, control) {
 async function fetchLiveRecording(url, filename, control, progressContext) {
   const abortController = new AbortController();
   control.abortControllers.add(abortController);
+  const safety = getLiveSafetyLimits();
+  const maxBytes = safety.maxBytes;
+  const maxDurationMs = safety.maxDurationMs;
+  const recordingStartedAt = Number(control.liveStartedAt) || Date.now();
+  const deadlineAt = Number(control.liveDeadlineAt) || recordingStartedAt + maxDurationMs;
+  control.liveStartedAt = recordingStartedAt;
+  control.liveDeadlineAt = deadlineAt;
   const chunks = [];
   let receivedBytes = 0;
   let response = null;
   let stoppedByUser = false;
+  let stoppedBySafetyLimit = false;
+  let stopReason = "";
+  let limitTimer = null;
+
+  const durationMs = () => (
+    Math.max(Date.now() - recordingStartedAt, 0)
+  );
+  const stoppedResult = (savedToDisk = false, blob = null) => ({
+    ok: true,
+    responseOk: Boolean(response?.ok),
+    status: response?.status || 0,
+    statusText: response?.statusText || "",
+    mime: blob?.type || response?.headers?.get("content-type") || "video/x-flv",
+    size: blob?.size || receivedBytes,
+    totalBytes: blob?.size || receivedBytes,
+    receivedBytes,
+    durationMs: durationMs(),
+    filename,
+    mode: "live-flv",
+    savedToDisk,
+    stoppedByUser: stoppedByUser || control.canceled,
+    stoppedBySafetyLimit,
+    stopReason,
+    maxBytes,
+    maxFileBytes: safety.maxFileBytes,
+    maxMemoryBytes: safety.maxMemoryBytes,
+    maxDurationMs
+  });
+  const stopForSafetyLimit = (reason) => {
+    if (control.canceled || stoppedBySafetyLimit) {
+      return;
+    }
+    stoppedBySafetyLimit = true;
+    stopReason = reason;
+    abortController.abort();
+  };
 
   try {
+    if (control.canceled) {
+      const error = downloadCanceledError();
+      error.result = stoppedResult(false);
+      throw error;
+    }
+    beginCandidateProgress({
+      ...progressContext,
+      totalBytes: 0
+    });
+    state.progress.durationMs = durationMs();
+    renderProgress();
+    const remainingDurationMs = Math.max(deadlineAt - Date.now(), 0);
+    if (remainingDurationMs <= 0) {
+      stoppedBySafetyLimit = true;
+      stopReason = "duration";
+      return stoppedResult(false);
+    }
+    if (typeof setTimeout === "function") {
+      limitTimer = setTimeout(() => stopForSafetyLimit("duration"), remainingDurationMs);
+    }
     response = await fetch(url, {
       credentials: "include",
       cache: "no-store",
@@ -1042,12 +2721,16 @@ async function fetchLiveRecording(url, filename, control, progressContext) {
 
     while (true) {
       await waitForSpecificControl(control);
+      if (control.canceled) {
+        stoppedByUser = true;
+        break;
+      }
       let packet = null;
       try {
         packet = await reader.read();
       } catch (error) {
         if (control.canceled || error?.name === "AbortError") {
-          stoppedByUser = true;
+          stoppedByUser = control.canceled;
           break;
         }
         throw error;
@@ -1057,49 +2740,62 @@ async function fetchLiveRecording(url, filename, control, progressContext) {
         break;
       }
 
+      if (stoppedBySafetyLimit) {
+        break;
+      }
+      const nextReceivedBytes = receivedBytes + packet.value.byteLength;
+      if (maxBytes > 0 && nextReceivedBytes > maxBytes) {
+        stopForSafetyLimit("size");
+        break;
+      }
+
       chunks.push(packet.value);
-      receivedBytes += packet.value.byteLength;
+      receivedBytes = nextReceivedBytes;
       updateProgress({
         ...progressContext,
         receivedBytes,
         totalBytes: 0,
         done: false
       });
+      if (maxBytes > 0 && receivedBytes >= maxBytes) {
+        stopForSafetyLimit("size");
+        break;
+      }
     }
 
+    state.progress.durationMs = durationMs();
+    if (receivedBytes <= 0) {
+      const result = stoppedResult(false);
+      if (result.stoppedByUser) {
+        const error = downloadCanceledError();
+        error.result = result;
+        throw error;
+      }
+      return result;
+    }
     const blob = new Blob(chunks, {
       type: response.headers.get("content-type") || "video/x-flv"
     });
     if (blob.size <= 0) {
-      throw new Error("直播录制为空，未保存文件。");
+      return stoppedResult(false);
     }
 
     saveBlob(blob, filename);
-    const durationMs = state.progress.startedAt ? Date.now() - state.progress.startedAt : state.progress.durationMs;
-    state.progress.durationMs = durationMs;
-    const result = {
-      ok: true,
-      responseOk: true,
-      status: response.status,
-      statusText: response.statusText,
-      mime: blob.type,
-      size: blob.size,
-      totalBytes: blob.size,
-      receivedBytes: blob.size,
-      durationMs,
-      filename,
-      mode: "live-flv",
-      savedToDisk: true
-    };
-
-    if (stoppedByUser || control.canceled) {
-      const error = downloadCanceledError();
-      error.result = result;
-      throw error;
+    return stoppedResult(true, blob);
+  } catch (error) {
+    if (stoppedBySafetyLimit) {
+      return stoppedResult(false);
     }
-
-    return result;
+    if (control.canceled && error?.name === "AbortError") {
+      const canceled = downloadCanceledError();
+      canceled.result = stoppedResult(false);
+      throw canceled;
+    }
+    throw error;
   } finally {
+    if (limitTimer !== null && typeof clearTimeout === "function") {
+      clearTimeout(limitTimer);
+    }
     control.abortControllers.delete(abortController);
   }
 }
@@ -1149,7 +2845,11 @@ async function downloadViaPageBlob(segment, diagnostic = createPageDiagnostic(se
             totalBytes: candidate.size || segment.size || 0
           },
           PAGE_DOWNLOAD_CONTROL_EVENT,
-          currentDownloadControlState()
+          currentDownloadControlState(),
+          {
+            maxBytes: options.maxBytes,
+            limitMessage: options.limitMessage
+          }
         ]
       });
 
@@ -1167,6 +2867,18 @@ async function downloadViaPageBlob(segment, diagnostic = createPageDiagnostic(se
       };
       diagnostic.candidateAttempts.push(attempt);
       diagnostic.fetch = attempt.fetch;
+
+      if (result?.limitReached) {
+        diagnostic.phase = "page-fetch-safety-limit";
+        diagnostic.error = result.error || "媒体大小超过安全上限。";
+        diagnostic.safety = {
+          maxBytes: options.maxBytes || 0
+        };
+        await saveDiagnostic(diagnostic);
+        const error = diagnosticError(diagnostic.error, diagnostic);
+        error.safetyLimit = true;
+        throw error;
+      }
 
       if (!result?.ok) {
         if (state.downloadControl?.canceled) {
@@ -1205,6 +2917,9 @@ async function downloadViaPageBlob(segment, diagnostic = createPageDiagnostic(se
       return diagnostic;
     } catch (error) {
       if (isDownloadCanceledError(error)) {
+        throw error;
+      }
+      if (isMediaSafetyLimitError(error)) {
         throw error;
       }
       if (error.diagnostic) {
@@ -1270,6 +2985,10 @@ async function downloadViaExtensionBlob(segment, diagnostic, previousError, opti
           candidateIndex: index + 1,
           candidateCount: candidates.length,
           totalBytes: candidate.size || segment.size || 0
+        },
+        {
+          maxBytes: options.maxBytes,
+          limitMessage: options.limitMessage
         }
       );
       const attempt = {
@@ -1284,6 +3003,18 @@ async function downloadViaExtensionBlob(segment, diagnostic, previousError, opti
       };
       diagnostic.extensionCandidateAttempts.push(attempt);
       diagnostic.fetch = attempt.fetch;
+
+      if (result?.limitReached) {
+        diagnostic.phase = "extension-fetch-safety-limit";
+        diagnostic.error = result.error || "媒体大小超过安全上限。";
+        diagnostic.safety = {
+          maxBytes: options.maxBytes || 0
+        };
+        await saveDiagnostic(diagnostic);
+        const error = diagnosticError(diagnostic.error, diagnostic);
+        error.safetyLimit = true;
+        throw error;
+      }
 
       if (!result?.ok) {
         diagnostic.phase = "extension-fetch-message-error";
@@ -1321,6 +3052,9 @@ async function downloadViaExtensionBlob(segment, diagnostic, previousError, opti
       if (isDownloadCanceledError(error)) {
         throw error;
       }
+      if (isMediaSafetyLimitError(error)) {
+        throw error;
+      }
       diagnostic.phase = "extension-blob-error";
       diagnostic.error = error.message;
       diagnostic.extensionCandidateAttempts.push({
@@ -1347,12 +3081,13 @@ async function copyDiagnostic() {
     return;
   }
 
+  const exportedDiagnostic = sanitizeDiagnosticForExport(state.lastDiagnostic);
   await navigator.clipboard.writeText(
     JSON.stringify(
       {
-        page: state.page,
+        page: sanitizeDiagnosticForExport(state.page),
         selectedQuality: qualitySelect.value,
-        diagnostic: state.lastDiagnostic
+        diagnostic: exportedDiagnostic
       },
       null,
       2
@@ -1367,7 +3102,7 @@ async function loadLastDiagnostic() {
       type: "BILI_DOWNLOAD_GET_DIAGNOSTIC"
     });
     if (response?.ok && response.payload) {
-      state.lastDiagnostic = response.payload;
+      state.lastDiagnostic = sanitizeDiagnosticForExport(response.payload);
     }
   } catch (_error) {
     state.lastDiagnostic = null;
@@ -1379,11 +3114,12 @@ async function saveDiagnostic(diagnostic) {
     return;
   }
 
-  state.lastDiagnostic = diagnostic;
+  const safeDiagnostic = sanitizeDiagnosticForExport(diagnostic);
+  state.lastDiagnostic = safeDiagnostic;
   try {
     await chrome.runtime.sendMessage({
       type: "BILI_DOWNLOAD_SAVE_DIAGNOSTIC",
-      payload: diagnostic
+      payload: safeDiagnostic
     });
   } catch (_error) {
     // The copied diagnostic in this popup is enough if the service worker is asleep.
@@ -1462,9 +3198,7 @@ function sanitizeDiagnosticForNested(diagnostic) {
   if (!diagnostic) {
     return null;
   }
-  const copy = { ...diagnostic };
-  delete copy.blob;
-  return copy;
+  return sanitizeDiagnosticForExport(diagnostic);
 }
 
 function pickFetchResult(response) {
@@ -1506,6 +3240,10 @@ function createDownloadControl() {
   return {
     paused: false,
     canceled: false,
+    cancelPending: false,
+    nativeTaskId: "",
+    companionTaskId: "",
+    batchJobId: "",
     abortControllers: new Set(),
     waiters: []
   };
@@ -1517,6 +3255,12 @@ function togglePauseDownload() {
     return;
   }
 
+  if (control.companionTaskId) {
+    setStatus("本地流式助手任务暂不支持暂停；可在任务中心取消。");
+    renderDownloadControls();
+    return;
+  }
+
   control.paused = !control.paused;
   if (control.paused) {
     setStatus(TEXT.paused);
@@ -1524,14 +3268,76 @@ function togglePauseDownload() {
     setStatus(TEXT.resumed);
     resumeDownloadWaiters(control);
   }
-  notifyPageDownloadControl();
+  if (control.batchJobId) {
+    updateBatchJob(control.batchJobId, {
+      state: control.paused ? "paused" : "in_progress",
+      error: ""
+    }).catch(() => {});
+  }
+  if (control.nativeTaskId) {
+    const requestedPause = control.paused;
+    requestNativeDirectTaskControl(control.nativeTaskId, requestedPause ? "pause" : "resume")
+      .catch((error) => {
+        if (state.downloadControl === control && !control.canceled && control.paused === requestedPause) {
+          control.paused = !requestedPause;
+          setStatus(error.message);
+          renderDownloadControls();
+        }
+      });
+  } else {
+    notifyPageDownloadControl();
+  }
   renderDownloadControls();
 }
 
-function cancelDownload() {
+async function cancelDownload() {
   const control = state.downloadControl;
   if (!control || control.canceled) {
     return;
+  }
+
+  if (control.batchJobId) {
+    cancelBatchJob(control.batchJobId).catch((error) => {
+      setStatus(error.message || "无法取消下载队列。");
+    });
+    return;
+  }
+
+  if (control.nativeTaskId) {
+    const taskId = control.nativeTaskId;
+    control.cancelPending = true;
+    setStatus("正在确认取消原生下载…");
+    renderDownloadControls();
+    try {
+      const task = await requestNativeDirectTaskControl(taskId, "cancel");
+      if (!task || !["canceling", "canceled"].includes(String(task.state || ""))) {
+        throw new Error("浏览器未确认原生下载已经进入取消流程。");
+      }
+      if (task.state !== "canceled") {
+        setStatus("正在等待浏览器确认取消…");
+        renderDownloadControls();
+        return;
+      }
+      control.cancelPending = false;
+      control.canceled = true;
+      control.paused = false;
+      for (const abortController of control.abortControllers) {
+        abortController.abort();
+      }
+      resumeDownloadWaiters(control);
+      settleNativeDirectTaskWaiter(task);
+      clearProgress();
+      setStatus(TEXT.canceled);
+      renderDownloadControls();
+      return;
+    } catch (error) {
+      if (state.downloadControl === control) {
+        control.cancelPending = false;
+        setStatus(error.message || "无法取消原生下载。");
+        renderDownloadControls();
+      }
+      return;
+    }
   }
 
   control.canceled = true;
@@ -1540,7 +3346,17 @@ function cancelDownload() {
     abortController.abort();
   }
   resumeDownloadWaiters(control);
-  notifyPageDownloadControl();
+  if (control.companionTaskId) {
+    requestCompanionTaskControl(control.companionTaskId, "cancel").catch((error) => {
+      if (state.downloadControl === control) {
+        control.canceled = false;
+        setStatus(error.message || "无法取消本地流式助手任务。");
+        renderDownloadControls();
+      }
+    });
+  } else {
+    notifyPageDownloadControl();
+  }
   clearProgress();
   setStatus(TEXT.canceled);
   renderDownloadControls();
@@ -1644,17 +3460,218 @@ function summarizeUrl(value) {
     return "";
   }
 
-  try {
-    const url = new URL(value);
+  if (isLocalDiagnosticPath(value)) {
+    return {
+      host: "",
+      path: "[local path redacted]",
+      searchLength: 0,
+      sample: summarizeLocalDiagnosticPath(value)
+    };
+  }
+
+  const url = parseDiagnosticUrl(value);
+  if (url) {
     return {
       host: url.host,
       path: url.pathname.slice(0, 180),
       searchLength: url.search.length,
       sample: `${url.origin}${url.pathname}${url.search ? "?..." : ""}`
     };
-  } catch (_error) {
-    return String(value).slice(0, 240);
   }
+
+  return {
+    host: "",
+    path: "",
+    searchLength: 0,
+    sample: "[unparseable URL]"
+  };
+}
+
+function sanitizeDiagnosticForExport(value) {
+  return sanitizeDiagnosticValue(value);
+}
+
+function sanitizeDiagnosticValue(value, seen = new WeakSet(), key = "") {
+  if (value === null || value === undefined) {
+    return value;
+  }
+
+  if (key && isSensitiveDiagnosticField(key)) {
+    return "[Sensitive value redacted]";
+  }
+
+  if (typeof value === "string") {
+    if (key === "filename") {
+      return summarizeDiagnosticFilename(value);
+    }
+    if (isLocalDiagnosticPath(value)) {
+      return isDiagnosticUrlField(key)
+        ? summarizeUrl(value)
+        : summarizeLocalDiagnosticPath(value);
+    }
+    if (isDiagnosticUrlField(key) && looksLikeDiagnosticUrl(value)) {
+      return summarizeUrl(value);
+    }
+    return redactDiagnosticText(value);
+  }
+
+  if (typeof value === "number" || typeof value === "boolean") {
+    return value;
+  }
+
+  if (typeof value === "bigint") {
+    return String(value);
+  }
+
+  if (typeof value !== "object") {
+    return undefined;
+  }
+
+  if (key === "blob" || (typeof Blob !== "undefined" && value instanceof Blob)) {
+    return undefined;
+  }
+
+  if (seen.has(value)) {
+    return "[Circular diagnostic value]";
+  }
+  seen.add(value);
+
+  if (Array.isArray(value)) {
+    return value.map((item) => sanitizeDiagnosticValue(item, seen));
+  }
+
+  const sanitized = {};
+  for (const [childKey, childValue] of Object.entries(value)) {
+    if (childKey === "blob") {
+      continue;
+    }
+
+    const child = sanitizeDiagnosticValue(childValue, seen, childKey);
+    if (child !== undefined) {
+      sanitized[childKey] = child;
+    }
+  }
+  return sanitized;
+}
+
+function isDiagnosticUrlField(key) {
+  return /url|uri|href|origin|referrer|referer|endpoint|redirect|location/i.test(String(key || "")) ||
+    key === "media";
+}
+
+function isSensitiveDiagnosticField(key) {
+  const normalized = String(key || "")
+    .replace(/([a-z])([A-Z])/g, "$1_$2")
+    .toLowerCase();
+  return /token|secret|cookie|authorization|credential|session|password|passwd/.test(normalized) ||
+    /(?:^|[_-])(?:sign(?:ature)?|csrf|(?:api|access)[_-]?key)(?:$|[_-])/.test(normalized);
+}
+
+function looksLikeDiagnosticUrl(value) {
+  return /^(?:(?:https?|wss?):)?\/\//i.test(String(value || "").trim());
+}
+
+function isLocalDiagnosticPath(value) {
+  const text = String(value || "").trim();
+  return /^file:\/\//i.test(text) ||
+    /^[a-z]:[\\/]/i.test(text) ||
+    /^\\\\/.test(text) ||
+    /^\/(?!\/)/.test(text);
+}
+
+function redactDiagnosticText(value) {
+  return redactLocalPathsInText(
+    redactSensitiveValuesInText(
+      redactSignedUrlsInText(value)
+    )
+  );
+}
+
+function redactSensitiveValuesInText(value) {
+  const sensitiveField = "(?:[\\w-]*(?:token|secret|cookie|authorization|credential|session|password|passwd)[\\w-]*|sign(?:ature)?|csrf|(?:api|access)[_-]?key)";
+  const assignmentPattern = new RegExp(
+    `((?:^|[\\s,;{(\\[?&])["']?${sensitiveField}["']?\\s*(?:=|:)\\s*(?:Bearer\\s+)?)` +
+      `(?!\\[Sensitive value redacted\\])(?:"(?:\\\\.|[^"])*"|'(?:\\\\.|[^'])*'|[^\\s,;}&\\])]+)`,
+    "gi"
+  );
+  let redacted = String(value).replace(assignmentPattern, "$1[Sensitive value redacted]");
+  redacted = redacted.replace(
+    /(\b(?:set-)?cookie\s*:\s*)[^\r\n|]*/gi,
+    "$1[Sensitive value redacted]"
+  );
+  return redacted.replace(
+    /(\bBearer\s+)(?!\[Sensitive value redacted\])[A-Za-z0-9._~+\/-]+=*/gi,
+    "$1[Sensitive value redacted]"
+  );
+}
+
+function redactLocalPathsInText(value) {
+  let redacted = String(value);
+  redacted = redacted.replace(/file:\/\/[^\s"'<>`)\]}]+/gi, (match) => summarizeLocalDiagnosticPath(match));
+  redacted = redacted.replace(
+    /(^|[\s"'`([{=,:;])(?:[a-z]:[\\/]|\\\\)[^\s"'<>`)\]}]+/gi,
+    (match, prefix) => `${prefix}${summarizeLocalDiagnosticPath(match.slice(prefix.length))}`
+  );
+  return redacted.replace(
+    /(^|[\s"'`([{=,:;])\/(?!\/)[^\s"'<>`)\]}]+/g,
+    (match, prefix) => `${prefix}${summarizeLocalDiagnosticPath(match.slice(prefix.length))}`
+  );
+}
+
+function summarizeLocalDiagnosticPath(value) {
+  const filename = summarizeDiagnosticFilename(value);
+  return filename ? `[local path ${filename}]` : "[local path redacted]";
+}
+
+function redactSignedUrlsInText(value) {
+  return String(value).replace(/(?:(?:https?|wss?):\/\/|\/\/)[^\s"'<>`]+/gi, (match) => {
+    if (/[?#]\.\.\.$/.test(match)) {
+      return match;
+    }
+    const summary = summarizeUrl(match);
+    const parsed = parseDiagnosticUrl(match);
+    if (!parsed) {
+      return /[?#]/.test(match) ? "[URL redacted]" : match;
+    }
+    if (!parsed?.search && !parsed?.hash) {
+      return match;
+    }
+
+    const suffix = parsed.search ? "?…" : "#…";
+    return summary?.host
+      ? `[URL ${summary.host}${summary.path}${suffix}]`
+      : "[URL redacted]";
+  });
+}
+
+function parseDiagnosticUrl(value) {
+  const text = String(value || "").trim();
+  if (!looksLikeDiagnosticUrl(text)) {
+    return null;
+  }
+
+  try {
+    return new URL(text.startsWith("//") ? `https:${text}` : text);
+  } catch (_error) {
+    return null;
+  }
+}
+
+function summarizeDiagnosticFilename(value) {
+  const source = String(value || "").trim();
+  let normalized = source.replace(/\\/g, "/");
+  if (/^file:\/\//i.test(source)) {
+    try {
+      const url = new URL(source);
+      normalized = url.protocol === "file:" ? url.pathname.replace(/\\/g, "/") : normalized;
+    } catch (_error) {
+      normalized = source.replace(/^file:\/\/(?:localhost)?/i, "").replace(/\\/g, "/");
+    }
+  }
+  if (!/^(?:[a-z]:\/|\/)/i.test(normalized)) {
+    return normalized.slice(0, 240);
+  }
+  return normalized.split("/").filter(Boolean).pop()?.slice(0, 180) || "";
 }
 
 function filenameForPageDownload(filename) {
@@ -1700,12 +3717,19 @@ function isExtensionFetchPreferred(value) {
   }
 }
 
-async function downloadMediaInPage(url, filename, saveToDisk, progressContext, controlEventName, initialControlState = null) {
+async function downloadMediaInPage(url, filename, saveToDisk, progressContext, controlEventName, initialControlState = null, safety = null) {
   const control = {
     paused: Boolean(initialControlState?.paused),
     canceled: Boolean(initialControlState?.canceled),
     waiters: [],
     abortController: new AbortController()
+  };
+  const maxBytes = Number(safety?.maxBytes) > 0 ? Math.floor(Number(safety.maxBytes)) : 0;
+  const limitMessage = String(safety?.limitMessage || "媒体大小超过安全上限，已停止且未保存文件。");
+  const mediaSafetyLimitError = () => {
+    const error = new Error(limitMessage);
+    error.name = "MediaSafetyLimitError";
+    return error;
   };
   if (control.canceled) {
     control.abortController.abort();
@@ -1754,7 +3778,25 @@ async function downloadMediaInPage(url, filename, saveToDisk, progressContext, c
     });
     const contentLength = Number(response.headers.get("content-length")) || 0;
 
+    if (maxBytes > 0 && contentLength > maxBytes) {
+      control.abortController.abort();
+      throw mediaSafetyLimitError();
+    }
+
     if (!response.ok) {
+      if (maxBytes > 0) {
+        return {
+          ok: true,
+          responseOk: false,
+          status: response.status,
+          statusText: response.statusText,
+          mime: response.headers.get("content-type") || "",
+          size: 0,
+          totalBytes: contentLength,
+          receivedBytes: 0,
+          filename
+        };
+      }
       const errorBody = await response.blob();
       return {
         ok: true,
@@ -1775,6 +3817,12 @@ async function downloadMediaInPage(url, filename, saveToDisk, progressContext, c
     let lastProgressAt = 0;
 
     if (!reader) {
+      // A response without a readable stream cannot be capped while it is
+      // materialized. DASH always supplies maxBytes, so fail safely instead
+      // of allowing a malformed response to bypass the memory guard.
+      if (maxBytes > 0) {
+        throw mediaSafetyLimitError();
+      }
       const body = await response.blob();
       receivedBytes = body.size;
       await waitForControl();
@@ -1794,6 +3842,10 @@ async function downloadMediaInPage(url, filename, saveToDisk, progressContext, c
         }
         await waitForControl();
 
+        if (maxBytes > 0 && receivedBytes + value.byteLength > maxBytes) {
+          control.abortController.abort();
+          throw mediaSafetyLimitError();
+        }
         chunks.push(value);
         receivedBytes += value.byteLength;
         const now = Date.now();
@@ -1855,6 +3907,7 @@ async function downloadMediaInPage(url, filename, saveToDisk, progressContext, c
     return {
       ok: false,
       error: error.message,
+      limitReached: error?.name === "MediaSafetyLimitError",
       filename,
       mode: "page-blob"
     };
@@ -1869,15 +3922,28 @@ function dispatchPageDownloadControl(controlEventName, detail) {
   }));
 }
 
-async function fetchMediaInExtension(url, filename, saveToDisk, progressContext) {
+async function fetchMediaInExtension(url, filename, saveToDisk, progressContext, safety = null) {
   const expectedSize = Number(progressContext?.totalBytes) || 0;
+  const maxBytes = normalizeMediaLimitBytes(safety?.maxBytes);
+  if (maxBytes > 0 && expectedSize > maxBytes) {
+    return {
+      ok: false,
+      error: String(safety?.limitMessage || "媒体大小超过安全上限，已停止且未保存文件。"),
+      limitReached: true,
+      filename,
+      mode: "extension-preflight"
+    };
+  }
   if (expectedSize >= PARALLEL_RANGE_MIN_BYTES) {
-    const parallelResult = await fetchMediaInExtensionRanges(url, filename, saveToDisk, progressContext, expectedSize);
+    const parallelResult = await fetchMediaInExtensionRanges(url, filename, saveToDisk, progressContext, expectedSize, safety);
     if (parallelResult?.ok && parallelResult.responseOk) {
       return parallelResult;
     }
+    if (parallelResult?.limitReached) {
+      return parallelResult;
+    }
 
-    const singleResult = await fetchMediaInExtensionSingle(url, filename, saveToDisk, progressContext);
+    const singleResult = await fetchMediaInExtensionSingle(url, filename, saveToDisk, progressContext, safety);
     if (singleResult) {
       singleResult.fallback = {
         from: "extension-range",
@@ -1887,10 +3953,12 @@ async function fetchMediaInExtension(url, filename, saveToDisk, progressContext)
     return singleResult;
   }
 
-  return fetchMediaInExtensionSingle(url, filename, saveToDisk, progressContext);
+  return fetchMediaInExtensionSingle(url, filename, saveToDisk, progressContext, safety);
 }
 
-async function fetchMediaInExtensionSingle(url, filename, saveToDisk, progressContext) {
+async function fetchMediaInExtensionSingle(url, filename, saveToDisk, progressContext, safety = null) {
+  const maxBytes = normalizeMediaLimitBytes(safety?.maxBytes);
+  const limitMessage = String(safety?.limitMessage || "媒体大小超过安全上限，已停止且未保存文件。");
   try {
     await waitForDownloadControl();
     const response = await fetch(url, {
@@ -1905,7 +3973,24 @@ async function fetchMediaInExtensionSingle(url, filename, saveToDisk, progressCo
       Number(progressContext?.totalBytes) ||
       0;
 
+    if (maxBytes > 0 && contentLength > maxBytes) {
+      throw createMediaSafetyLimitError(limitMessage);
+    }
+
     if (!response.ok) {
+      if (maxBytes > 0) {
+        return {
+          ok: true,
+          responseOk: false,
+          status: response.status,
+          statusText: response.statusText,
+          mime: response.headers.get("content-type") || "",
+          size: 0,
+          totalBytes: contentLength,
+          receivedBytes: 0,
+          filename
+        };
+      }
       const errorBody = await response.blob();
       return {
         ok: true,
@@ -1926,6 +4011,12 @@ async function fetchMediaInExtensionSingle(url, filename, saveToDisk, progressCo
     let lastProgressAt = 0;
 
     if (!reader) {
+      // A response without a readable stream cannot be capped while it is
+      // materialized. DASH always supplies maxBytes, so fail safely instead
+      // of allowing a malformed response to bypass the memory guard.
+      if (maxBytes > 0) {
+        throw createMediaSafetyLimitError(limitMessage);
+      }
       const body = await response.blob();
       receivedBytes = body.size;
       await waitForDownloadControl();
@@ -1945,6 +4036,10 @@ async function fetchMediaInExtensionSingle(url, filename, saveToDisk, progressCo
         }
         await waitForDownloadControl();
 
+        if (maxBytes > 0 && receivedBytes + value.byteLength > maxBytes) {
+          reader.cancel?.();
+          throw createMediaSafetyLimitError(limitMessage);
+        }
         chunks.push(value);
         receivedBytes += value.byteLength;
         const now = Date.now();
@@ -1992,6 +4087,15 @@ async function fetchMediaInExtensionSingle(url, filename, saveToDisk, progressCo
       blob: saveToDisk === false ? body : null
     };
   } catch (error) {
+    if (isMediaSafetyLimitError(error)) {
+      return {
+        ok: false,
+        error: error.message,
+        limitReached: true,
+        filename,
+        mode: "extension-single"
+      };
+    }
     if (state.downloadControl?.canceled || error.name === "AbortError" || error.name === "DownloadCanceledError") {
       throw downloadCanceledError();
     }
@@ -2004,7 +4108,17 @@ async function fetchMediaInExtensionSingle(url, filename, saveToDisk, progressCo
   }
 }
 
-async function fetchMediaInExtensionRanges(url, filename, saveToDisk, progressContext, totalBytes) {
+async function fetchMediaInExtensionRanges(url, filename, saveToDisk, progressContext, totalBytes, safety = null) {
+  const maxBytes = normalizeMediaLimitBytes(safety?.maxBytes);
+  if (maxBytes > 0 && totalBytes > maxBytes) {
+    return {
+      ok: false,
+      error: String(safety?.limitMessage || "媒体大小超过安全上限，已停止且未保存文件。"),
+      limitReached: true,
+      filename,
+      mode: "extension-range"
+    };
+  }
   const ranges = buildRanges(totalBytes, PARALLEL_RANGE_CHUNK_BYTES);
   const chunks = new Array(ranges.length);
   const rangeProgress = new Array(ranges.length).fill(0);
@@ -2074,6 +4188,15 @@ async function fetchMediaInExtensionRanges(url, filename, saveToDisk, progressCo
       blob: saveToDisk === false ? body : null
     };
   } catch (error) {
+    if (isMediaSafetyLimitError(error)) {
+      return {
+        ok: false,
+        error: error.message,
+        limitReached: true,
+        filename,
+        mode: "extension-range"
+      };
+    }
     if (state.downloadControl?.canceled || error.name === "AbortError" || error.name === "DownloadCanceledError") {
       throw downloadCanceledError();
     }
@@ -2087,6 +4210,7 @@ async function fetchMediaInExtensionRanges(url, filename, saveToDisk, progressCo
 }
 
 async function fetchRangeChunk(url, range, onProgress) {
+  const expectedBytes = range.end - range.start + 1;
   await waitForDownloadControl();
   const response = await fetch(url, {
     credentials: "include",
@@ -2102,12 +4226,15 @@ async function fetchRangeChunk(url, range, onProgress) {
     throw new Error(`Range request returned HTTP ${response.status || "unknown"}.`);
   }
 
+  const contentLength = Number(response.headers.get("content-length")) || 0;
+  if (contentLength > expectedBytes) {
+    throw createMediaSafetyLimitError(
+      `Range 响应大小 ${formatBytes(contentLength)} 超过请求块上限 ${formatBytes(expectedBytes)}；已停止以保护内存。`
+    );
+  }
   const reader = response.body?.getReader();
   if (!reader) {
-    const body = await response.blob();
-    await waitForDownloadControl();
-    onProgress(body.size);
-    return body;
+    throw new Error("Range 响应不支持安全的流式读取，已停止此分块请求。");
   }
 
   const chunks = [];
@@ -2120,12 +4247,23 @@ async function fetchRangeChunk(url, range, onProgress) {
     }
     await waitForDownloadControl();
 
+    const nextReceivedBytes = receivedBytes + value.byteLength;
+    if (nextReceivedBytes > expectedBytes) {
+      try {
+        const canceled = reader.cancel?.();
+        canceled?.catch?.(() => {});
+      } catch (_error) {
+        // The size guard still prevents this response from being retained.
+      }
+      throw createMediaSafetyLimitError(
+        `Range 响应超过请求块上限 ${formatBytes(expectedBytes)}；已停止以保护内存。`
+      );
+    }
     chunks.push(value);
-    receivedBytes += value.byteLength;
+    receivedBytes = nextReceivedBytes;
     onProgress(receivedBytes);
   }
 
-  const expectedBytes = range.end - range.start + 1;
   if (receivedBytes !== expectedBytes) {
     throw new Error(`Range chunk size mismatch: ${receivedBytes}/${expectedBytes}.`);
   }
@@ -2245,7 +4383,8 @@ function updateProgress(payload) {
   state.progress.percent = totalBytes ? Math.min((receivedBytes / totalBytes) * 100, 100) : 0;
   state.progress.speedBytesPerSecond = receivedBytes / elapsedSeconds;
   if (state.downloadControl?.liveRecording) {
-    state.progress.durationMs = now - state.progress.startedAt;
+    const liveStartedAt = Number(state.downloadControl.liveStartedAt) || state.progress.startedAt;
+    state.progress.durationMs = Math.max(now - liveStartedAt, 0);
   }
   state.progress.lastAt = now;
   state.progress.segmentIndex = payload.segmentIndex || state.progress.segmentIndex;
@@ -2308,11 +4447,13 @@ function renderDownloadControls() {
     downloadControls.hidden = !visible;
   }
   if (pauseButton) {
-    pauseButton.disabled = !visible || control?.canceled;
-    pauseButton.textContent = visible && control?.paused ? "\u7ee7\u7eed" : "\u6682\u505c";
+    pauseButton.disabled = !visible || control?.canceled || Boolean(control?.companionTaskId);
+    pauseButton.textContent = visible && control?.companionTaskId
+      ? "不支持暂停"
+      : (visible && control?.paused ? "\u7ee7\u7eed" : "\u6682\u505c");
   }
   if (cancelButton) {
-    cancelButton.disabled = !visible || control?.canceled;
+    cancelButton.disabled = !visible || control?.canceled || control?.cancelPending;
   }
 }
 
@@ -2399,6 +4540,17 @@ function updateControls() {
       !hasVideoId ||
       !hasMultiplePages ||
       !hasSelectedPages;
+  }
+  const safetyLocked = Boolean(state.downloadControl);
+  for (const input of [dashMaxFileInput, dashMaxMemoryInput, liveMaxDurationInput, liveMaxFileInput, liveMaxMemoryInput]) {
+    if (input) {
+      input.disabled = safetyLocked;
+      input.title = safetyLocked ? "下载或录制进行中；保护设置仅可在下一项任务开始前调整。" : "";
+    }
+  }
+  if (safetySaveButton) {
+    safetySaveButton.disabled = safetyLocked;
+    safetySaveButton.title = safetyLocked ? "下载或录制进行中；保护设置仅可在下一项任务开始前调整。" : "";
   }
   updatePageSelectionAction();
   diagnosticButton.disabled = state.busy || !state.lastDiagnostic;

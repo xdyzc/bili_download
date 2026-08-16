@@ -1,12 +1,56 @@
 const API_BASE = "https://api.bilibili.com";
 const DIAGNOSTIC_STORAGE_KEY = "lastDiagnostic";
+const DIRECT_DOWNLOAD_TASK_STORAGE_KEY = "directDownloadTasks";
+const COMPANION_DOWNLOAD_TASK_STORAGE_KEY = "companionDownloadTasks";
+const BATCH_DOWNLOAD_JOB_STORAGE_KEY = "batchDownloadJobs";
 const DNR_TEST_TYPES = ["main_frame", "other", "media", "xmlhttprequest"];
 const PROGRESS_MESSAGE_TYPE = "BILI_DOWNLOAD_PAGE_PROGRESS";
 const PROGRESS_PORT_NAME = "BILI_DOWNLOAD_PROGRESS_PORT";
 const SIZE_PROBE_TIMEOUT_MS = 2500;
+const DIRECT_DOWNLOAD_TASK_HISTORY_LIMIT = 20;
+const BATCH_DOWNLOAD_JOB_HISTORY_LIMIT = 20;
+const DIRECT_DOWNLOAD_SNAPSHOT_MIN_INTERVAL_MS = 1500;
+const DIRECT_DOWNLOAD_SNAPSHOT_MIN_BYTES_DELTA = 1024 * 1024;
+const DIRECT_DOWNLOAD_CANDIDATE_REFRESH_LIMIT = 2;
+const BATCH_DOWNLOAD_JOB_ITEM_LIMIT = 500;
+const COMPANION_NATIVE_HOST_NAME = "com.bili_download.stream_companion";
+const COMPANION_PROTOCOL_VERSION = 1;
+const COMPANION_TASK_HISTORY_LIMIT = 20;
+const COMPANION_DEFAULT_MAX_BYTES = 128 * 1024 * 1024 * 1024;
+const COMPANION_MAX_BYTES = 128 * 1024 * 1024 * 1024;
+const COMPANION_DEFAULT_LIVE_DURATION_SECONDS = 2 * 60 * 60;
+const COMPANION_MAX_LIVE_DURATION_SECONDS = 24 * 60 * 60;
+const COMPANION_DEFAULT_LIVE_SEGMENT_SECONDS = 5 * 60;
+const COMPANION_MAX_LIVE_SEGMENT_SECONDS = 60 * 60;
+const COMPANION_SNAPSHOT_MIN_INTERVAL_MS = 1500;
+const COMPANION_SNAPSHOT_MIN_BYTES_DELTA = 1024 * 1024;
+const COMPANION_START_TIMEOUT_MS = 8000;
 
 let lastDiagnostic = null;
 const progressPorts = new Set();
+const directDownloadTasks = new Map();
+const directDownloadIds = new Map();
+let directDownloadTaskSequence = 0;
+let directDownloadTasksRestored = false;
+let directDownloadTasksRestorePromise = null;
+let directDownloadTasksPersistOperation = Promise.resolve();
+let directDownloadTasksPersistTimer = null;
+let directDownloadTasksLastPersistAt = 0;
+const directDownloadTaskPersistMetadata = new Map();
+const companionDownloadTasks = new Map();
+const companionDownloadPorts = new Map();
+let companionDownloadTaskSequence = 0;
+let companionDownloadTasksRestored = false;
+let companionDownloadTasksRestorePromise = null;
+let companionDownloadTasksPersistOperation = Promise.resolve();
+let companionDownloadTasksPersistTimer = null;
+let companionDownloadTasksLastPersistAt = 0;
+const companionDownloadTaskPersistMetadata = new Map();
+const batchDownloadJobs = new Map();
+let batchDownloadJobSequence = 0;
+let batchDownloadJobsRestored = false;
+let batchDownloadJobsRestorePromise = null;
+let batchDownloadJobsPersistOperation = Promise.resolve();
 
 configureSidePanelBehavior();
 chrome.runtime.onInstalled?.addListener(configureSidePanelBehavior);
@@ -50,6 +94,90 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
 
+  if (message?.type === "BILI_DOWNLOAD_COMPANION_PING") {
+    pingCompanionNativeHost()
+      .then((payload) => sendResponse({ ok: true, payload }))
+      .catch((error) => sendResponse(errorResponse(error)));
+    return true;
+  }
+
+  if (message?.type === "BILI_DOWNLOAD_START_COMPANION") {
+    startCompanionDownload(message.payload)
+      .then((payload) => sendResponse({ ok: true, payload }))
+      .catch((error) => sendResponse(errorResponse(error)));
+    return true;
+  }
+
+  if (message?.type === "BILI_DOWNLOAD_GET_COMPANION_TASK") {
+    getCompanionDownloadTask(message.payload?.taskId)
+      .then((payload) => sendResponse({ ok: true, payload }))
+      .catch((error) => sendResponse(errorResponse(error)));
+    return true;
+  }
+
+  if (message?.type === "BILI_DOWNLOAD_LIST_COMPANION_TASKS") {
+    listCompanionDownloadTasks(message.payload)
+      .then((payload) => sendResponse({ ok: true, payload }))
+      .catch((error) => sendResponse(errorResponse(error)));
+    return true;
+  }
+
+  if (message?.type === "BILI_DOWNLOAD_CONTROL_COMPANION_TASK") {
+    controlCompanionDownloadTask(message.payload)
+      .then((payload) => sendResponse({ ok: true, payload }))
+      .catch((error) => sendResponse(errorResponse(error)));
+    return true;
+  }
+
+  if (message?.type === "BILI_DOWNLOAD_GET_DIRECT_TASK") {
+    getDirectDownloadTask(message.payload?.taskId)
+      .then((payload) => sendResponse({ ok: true, payload }))
+      .catch((error) => sendResponse(errorResponse(error)));
+    return true;
+  }
+
+  if (message?.type === "BILI_DOWNLOAD_LIST_DIRECT_TASKS") {
+    listDirectDownloadTasks(message.payload)
+      .then((payload) => sendResponse({ ok: true, payload }))
+      .catch((error) => sendResponse(errorResponse(error)));
+    return true;
+  }
+
+  if (message?.type === "BILI_DOWNLOAD_CONTROL_DIRECT") {
+    controlDirectDownloadTask(message.payload)
+      .then((payload) => sendResponse({ ok: true, payload }))
+      .catch((error) => sendResponse(errorResponse(error)));
+    return true;
+  }
+
+  if (message?.type === "BILI_DOWNLOAD_CREATE_BATCH_JOB") {
+    createBatchDownloadJob(message.payload)
+      .then((payload) => sendResponse({ ok: true, payload }))
+      .catch((error) => sendResponse(errorResponse(error)));
+    return true;
+  }
+
+  if (message?.type === "BILI_DOWNLOAD_GET_BATCH_JOB") {
+    getBatchDownloadJob(message.payload?.batchJobId)
+      .then((payload) => sendResponse({ ok: true, payload }))
+      .catch((error) => sendResponse(errorResponse(error)));
+    return true;
+  }
+
+  if (message?.type === "BILI_DOWNLOAD_LIST_BATCH_JOBS") {
+    listBatchDownloadJobs(message.payload)
+      .then((payload) => sendResponse({ ok: true, payload }))
+      .catch((error) => sendResponse(errorResponse(error)));
+    return true;
+  }
+
+  if (message?.type === "BILI_DOWNLOAD_UPDATE_BATCH_JOB") {
+    updateBatchDownloadJob(message.payload)
+      .then((payload) => sendResponse({ ok: true, payload }))
+      .catch((error) => sendResponse(errorResponse(error)));
+    return true;
+  }
+
   if (message?.type === "BILI_DOWNLOAD_PREPARE_DIRECT") {
     prepareDirectDownload(message.payload)
       .then((payload) => sendResponse({ ok: true, payload }))
@@ -81,7 +209,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === "BILI_DOWNLOAD_SAVE_DIAGNOSTIC") {
     setLastDiagnostic(message.payload)
       .then(() => sendResponse({ ok: true }))
-      .catch((error) => sendResponse({ ok: false, error: error.message }));
+      .catch((error) => sendResponse(errorResponse(error)));
     return true;
   }
 
@@ -94,7 +222,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === "BILI_DOWNLOAD_GET_DIAGNOSTIC") {
     getLastDiagnostic()
       .then((payload) => sendResponse({ ok: true, payload }))
-      .catch((error) => sendResponse({ ok: false, error: error.message }));
+      .catch((error) => sendResponse(errorResponse(error)));
     return true;
   }
 
@@ -132,16 +260,42 @@ function relayProgress(payload, tabId) {
 }
 
 function normalizeProgressPayload(value) {
-  return {
+  const normalized = {
     receivedBytes: Number(value?.receivedBytes) || 0,
     totalBytes: Number(value?.totalBytes) || 0,
     segmentIndex: Number(value?.segmentIndex) || 0,
     segmentCount: Number(value?.segmentCount) || 0,
     candidateIndex: Number(value?.candidateIndex) || 0,
     candidateCount: Number(value?.candidateCount) || 0,
-    done: Boolean(value?.done)
+    done: Boolean(value?.done),
+    taskId: typeof value?.taskId === "string" ? value.taskId : "",
+    taskState: typeof value?.taskState === "string" ? value.taskState : "",
+    nativeDownload: Boolean(value?.nativeDownload),
+    downloadIds: Array.isArray(value?.downloadIds)
+      ? value.downloadIds.map((id) => Number(id)).filter((id) => Number.isInteger(id) && id > 0)
+      : [],
+    error: typeof value?.error === "string" ? redactDiagnosticText(value.error) : ""
   };
+
+  // Keep the legacy progress shape stable for page and browser-download
+  // clients. Companion-only fields are opt-in so existing consumers do not
+  // mistake a local task for a Chrome downloads task.
+  if (value?.companionDownload) {
+    normalized.companionDownload = true;
+    normalized.companionKind = normalizeCompanionKind(value?.companionKind);
+    normalized.phase = normalizeCompanionPhase(value?.phase);
+    normalized.recoverable = Boolean(value?.recoverable);
+    normalized.segmentCount = Number(value?.segmentCount) || normalized.segmentCount;
+    normalized.reconnectAttempt = Number(value?.reconnectAttempt) || 0;
+  }
+  return normalized;
 }
+
+chrome.downloads?.onChanged?.addListener((delta) => {
+  handleDirectDownloadChange(delta).catch(() => {
+    // Native download events are best-effort. The browser still owns the file transfer.
+  });
+});
 
 if (chrome.declarativeNetRequest?.onRuleMatchedDebug) {
   chrome.declarativeNetRequest.onRuleMatchedDebug.addListener((info) => {
@@ -415,69 +569,2570 @@ async function fetchAccountStatus() {
 }
 
 async function startDirectDownload(payload) {
-  const prepared = await prepareDirectDownload(payload);
-  const ids = [];
-  const diagnostics = [];
+  await restoreDirectDownloadTasks();
+  const prepared = payload?.prepared || await prepareDirectDownload(payload);
+  if (prepared?.mode !== "durl" && prepared?.mode !== "audio") {
+    throw new Error("Native downloads only support standalone media streams.");
+  }
 
-  for (const segment of prepared.segments) {
-    const candidates = readCandidates(segment);
-    const candidateDiagnostics = [];
-    let lastError = null;
-    let downloaded = false;
+  const task = createDirectDownloadTask(prepared, normalizeTabId(payload?.tabId));
+  directDownloadTasks.set(task.id, task);
+  pruneDirectDownloadTasks(task.id);
+  await persistDirectDownloadTasks({ force: true });
+  await queueDirectDownloadTask(task, () => advanceDirectDownloadTask(task));
+  return snapshotDirectDownloadTask(task);
+}
 
-    for (const [candidateIndex, candidate] of candidates.entries()) {
-      try {
-        const result = await downloadFileWithDiagnostics({
-          options: {
-            url: candidate.url,
-            filename: segment.filename,
-            conflictAction: "uniquify",
-            saveAs: false
-          },
-          context: {
-            ...segment.context,
-            downloadMethod: "background-download",
-            candidateIndex: candidateIndex + 1,
-            candidateCount: candidates.length,
-            candidateKind: candidate.kind
-          }
-        });
-        ids.push(result.id);
-        diagnostics.push(result.diagnostic);
-        candidateDiagnostics.push(result.diagnostic);
-        downloaded = true;
-        break;
-      } catch (error) {
-        lastError = error;
-        const diagnostic = error.diagnostic || {
-          phase: "download-error",
-          error: error.message,
-          request: {
-            media: summarizeUrl(candidate.url),
-            filename: segment.filename
-          }
-        };
-        diagnostics.push(diagnostic);
-        candidateDiagnostics.push(diagnostic);
-      }
+function createDirectDownloadTask(prepared, tabId = null) {
+  const sourceSegments = Array.isArray(prepared?.segments) ? prepared.segments : [];
+  if (!sourceSegments.length) {
+    throw new Error("Direct stream response did not include a downloadable segment.");
+  }
+
+  const segments = sourceSegments.map((source, index) => {
+    const candidates = readCandidates(source);
+    if (!candidates.length) {
+      throw new Error(`Direct stream segment ${index + 1} did not include a media URL.`);
     }
 
-    if (!downloaded) {
-      if (lastError?.diagnostic) {
-        lastError.diagnostic.allCandidateDiagnostics = candidateDiagnostics
-          .filter((diagnostic) => diagnostic !== lastError.diagnostic)
-          .map((diagnostic) => sanitizeForMessage(diagnostic));
-      }
-      throw lastError || new Error("All media candidates failed.");
+    return {
+      index: index + 1,
+      filename: String(source.filename || `BiliDownload/direct_${index + 1}.mp4`),
+      size: Number(source.size) || 0,
+      context: directTaskContext(source.context),
+      candidates,
+      candidateCount: candidates.length,
+      candidateIndex: 0,
+      candidateRefreshCount: 0,
+      downloadId: null,
+      state: "queued",
+      receivedBytes: 0,
+      totalBytes: Number(source.size) || 0,
+      error: "",
+      diagnostic: null,
+      candidateDiagnostics: []
+    };
+  });
+
+  const now = new Date().toISOString();
+  return {
+    id: createDirectDownloadTaskId(),
+    tabId: normalizeTabId(tabId),
+    mode: String(prepared?.mode || "durl"),
+    format: String(prepared?.format || ""),
+    createdAt: now,
+    updatedAt: now,
+    state: "queued",
+    error: "",
+    requestedAction: "",
+    segments,
+    operation: Promise.resolve()
+  };
+}
+
+function createDirectDownloadTaskId() {
+  directDownloadTaskSequence += 1;
+  return `direct-${Date.now().toString(36)}-${directDownloadTaskSequence.toString(36)}`;
+}
+
+function directTaskContext(context) {
+  return {
+    bvid: String(context?.bvid || ""),
+    epId: normalizeId(context?.epId),
+    cid: Number(context?.cid) || 0,
+    quality: Number(context?.quality) || 0,
+    title: String(context?.title || ""),
+    source: String(context?.source || "video"),
+    segmentIndex: Number(context?.segmentIndex) || 0,
+    segmentCount: Number(context?.segmentCount) || 0,
+    format: String(context?.format || ""),
+    role: String(context?.role || ""),
+    roleLabel: String(context?.roleLabel || ""),
+    downloadMethod: "native-download"
+  };
+}
+
+function queueDirectDownloadTask(task, operation) {
+  const previous = task.operation || Promise.resolve();
+  const next = previous.then(operation, operation);
+  task.operation = next.catch(() => {});
+  return next;
+}
+
+async function advanceDirectDownloadTask(task) {
+  if (isDirectDownloadTaskTerminal(task) || task.state === "paused") {
+    return;
+  }
+
+  const activeSegment = task.segments.find(isDirectDownloadSegmentActive);
+  if (activeSegment) {
+    await publishDirectDownloadTask(task);
+    return;
+  }
+
+  const nextSegment = task.segments.find((segment) => segment.state === "queued");
+  if (!nextSegment) {
+    if (task.segments.every((segment) => segment.state === "complete")) {
+      await finishDirectDownloadTask(task, "complete");
+    }
+    return;
+  }
+
+  await startDirectDownloadSegment(task, nextSegment);
+}
+
+async function startDirectDownloadSegment(task, segment) {
+  if (await honorPendingDirectTaskControl(task, segment)) {
+    return;
+  }
+
+  let candidate = segment.candidates[segment.candidateIndex];
+  if (!candidate) {
+    const refreshed = await refreshDirectDownloadTaskCandidates(task, segment);
+    candidate = refreshed ? segment.candidates[segment.candidateIndex] : null;
+    if (!candidate) {
+      await failDirectDownloadSegment(task, segment, segment.error || "All media candidates failed.");
+      return;
     }
   }
 
-  return {
-    ids,
-    count: ids.length,
-    diagnostics,
-    method: "background-download"
+  const context = {
+    ...segment.context,
+    candidateIndex: segment.candidateIndex + 1,
+    candidateCount: segment.candidates.length,
+    candidateKind: candidate.kind
   };
+  const diagnostic = createBaseDiagnostic({
+    mediaUrl: candidate.url,
+    filename: segment.filename,
+    context
+  });
+  diagnostic.phase = "probing-dnr";
+  diagnostic.dnr = await testDnrRules(candidate.url);
+  segment.diagnostic = diagnostic;
+  segment.candidateDiagnostics.push(diagnostic);
+  task.state = "starting";
+  task.error = "";
+  await setLastDiagnostic(diagnostic);
+  await publishDirectDownloadTask(task);
+
+  try {
+    diagnostic.phase = "starting-download";
+    await setLastDiagnostic(diagnostic);
+    if (await honorPendingDirectTaskControl(task, segment)) {
+      return;
+    }
+    const downloadId = await downloadFile({
+      url: candidate.url,
+      filename: segment.filename,
+      conflictAction: "uniquify",
+      saveAs: false
+    });
+
+    segment.downloadId = downloadId;
+    segment.state = "in_progress";
+    directDownloadIds.set(downloadId, {
+      taskId: task.id,
+      segmentIndex: segment.index
+    });
+    if (await honorPendingDirectTaskControl(task, segment, downloadId)) {
+      return;
+    }
+    diagnostic.downloadId = downloadId;
+    diagnostic.phase = "download-started";
+    let initialItem = null;
+    try {
+      initialItem = await getDownloadItem(downloadId);
+    } catch (_error) {
+      // The native transfer is already owned by Chrome even when its initial item cannot be queried.
+    }
+    diagnostic.initialItem = pickDownloadItem(initialItem);
+    task.state = "in_progress";
+    task.updatedAt = new Date().toISOString();
+    await setLastDiagnostic(diagnostic);
+    await publishDirectDownloadTask(task);
+    if (initialItem?.state === "complete" || initialItem?.state === "interrupted") {
+      await applyDirectDownloadChange(task, segment, {
+        id: downloadId,
+        state: { current: initialItem.state },
+        error: initialItem.error ? { current: initialItem.error } : null
+      });
+    }
+  } catch (error) {
+    diagnostic.phase = "download-error";
+    diagnostic.error = error.message;
+    segment.error = error.message;
+    await setLastDiagnostic(diagnostic);
+    segment.candidateIndex += 1;
+    segment.downloadId = null;
+    segment.state = "queued";
+    if (segment.candidateIndex < segment.candidates.length) {
+      await startDirectDownloadSegment(task, segment);
+      return;
+    }
+    if (await refreshDirectDownloadTaskCandidates(task, segment)) {
+      await startDirectDownloadSegment(task, segment);
+      return;
+    }
+    await failDirectDownloadSegment(task, segment, error.message);
+  }
+}
+
+async function refreshDirectDownloadTaskCandidates(task, targetSegment) {
+  if (!task || !targetSegment || isDirectDownloadTaskTerminal(task)) {
+    return false;
+  }
+  if (Number(targetSegment.candidateRefreshCount) >= DIRECT_DOWNLOAD_CANDIDATE_REFRESH_LIMIT) {
+    targetSegment.error = "Media URL refresh limit was reached.";
+    return false;
+  }
+
+  targetSegment.candidateRefreshCount = (Number(targetSegment.candidateRefreshCount) || 0) + 1;
+  try {
+    const prepared = await rebuildDirectDownloadTaskPayload(task, targetSegment);
+    const preparedSegments = Array.isArray(prepared?.segments) ? prepared.segments : [];
+    const preparedTarget = preparedSegments[targetSegment.index - 1];
+    if (!preparedTarget || !readCandidates(preparedTarget).length) {
+      throw new Error("Refreshed media response did not include the expected direct stream segment.");
+    }
+
+    for (const segment of task.segments) {
+      if (segment.state !== "queued") {
+        continue;
+      }
+      const refreshedSegment = preparedSegments[segment.index - 1];
+      const candidates = readCandidates(refreshedSegment);
+      if (!candidates.length) {
+        continue;
+      }
+      segment.candidates = candidates;
+      segment.candidateCount = candidates.length;
+      segment.candidateIndex = 0;
+      segment.size = Number(refreshedSegment.size) || segment.size;
+      segment.totalBytes = Number(refreshedSegment.size) || segment.totalBytes || segment.size;
+      segment.context = directTaskContext({
+        ...segment.context,
+        ...refreshedSegment.context
+      });
+      segment.error = "";
+    }
+
+    task.format = String(prepared.format || task.format || "");
+    task.error = "";
+    await publishDirectDownloadTask(task, { force: true });
+    return Boolean(targetSegment.candidates[targetSegment.candidateIndex]);
+  } catch (error) {
+    const message = redactDiagnosticText(`Could not refresh media URLs: ${error?.message || "unknown error"}`);
+    targetSegment.error = message;
+    task.error = message;
+    await publishDirectDownloadTask(task, { force: true });
+    return false;
+  }
+}
+
+async function rebuildDirectDownloadTaskPayload(task, segment) {
+  const context = directTaskContext(segment?.context);
+  const bvid = normalizeBvid(context.bvid);
+  const epId = normalizeId(context.epId);
+  const cid = Number(context.cid);
+  const title = context.title || bvid || (epId ? `ep${epId}` : "");
+  if ((!bvid && !epId) || !cid) {
+    throw new Error("The saved direct download metadata is incomplete.");
+  }
+
+  if (task.mode === "audio") {
+    return prepareAudioDownload({
+      bvid,
+      epId,
+      cid,
+      title,
+      tabId: task.tabId
+    });
+  }
+
+  const quality = Number(context.quality);
+  if (!quality) {
+    throw new Error("The saved direct download quality is incomplete.");
+  }
+  const source = epId ? "bangumi" : "video";
+  const playUrl = await fetchMediaPlayUrl({
+    bvid,
+    epId,
+    cid,
+    quality,
+    fnval: 0,
+    tabId: task.tabId
+  });
+  if (epId) {
+    assertPlayablePgc(playUrl);
+  }
+  if (!hasExactDirectQuality(playUrl, quality)) {
+    throw unavailableQualityError(quality);
+  }
+  const directSegments = buildDirectSegmentPlans(playUrl);
+  if (!directSegments.length) {
+    throw new Error("Refreshed direct stream response did not include downloadable segments.");
+  }
+  return prepareDurlSegments({
+    bvid,
+    epId,
+    cid,
+    quality: responseQuality(playUrl) || quality,
+    title,
+    playUrl,
+    segments: directSegments,
+    source
+  });
+}
+
+async function honorPendingDirectTaskControl(task, segment, downloadId = null) {
+  const action = task.requestedAction || (task.state === "canceled" ? "cancel" : "");
+  if (action === "cancel") {
+    if (Number.isInteger(downloadId) && downloadId > 0) {
+      await controlNativeDownload(downloadId, "cancel").catch(() => {});
+    }
+    await finishDirectDownloadTask(task, "canceled");
+    return true;
+  }
+  if (action === "pause") {
+    if (Number.isInteger(downloadId) && downloadId > 0) {
+      await controlNativeDownload(downloadId, "pause").catch(() => {});
+      task.state = "paused";
+      await publishDirectDownloadTask(task);
+      return true;
+    }
+    task.state = "paused";
+    await publishDirectDownloadTask(task);
+    return true;
+  }
+  return false;
+}
+
+async function handleDirectDownloadChange(delta) {
+  const downloadId = Number(delta?.id);
+  let mappedDownload = directDownloadIds.get(downloadId);
+  if (!mappedDownload) {
+    await restoreDirectDownloadTasks();
+    mappedDownload = directDownloadIds.get(downloadId);
+  }
+  if (!mappedDownload) {
+    return;
+  }
+
+  const task = directDownloadTasks.get(mappedDownload.taskId);
+  const segment = task?.segments.find((item) => item.index === mappedDownload.segmentIndex);
+  if (!task || !segment) {
+    directDownloadIds.delete(downloadId);
+    return;
+  }
+
+  await queueDirectDownloadTask(task, () => applyDirectDownloadChange(task, segment, delta));
+}
+
+async function applyDirectDownloadChange(task, segment, delta) {
+  if (!isDirectDownloadSegmentActive(segment)) {
+    return;
+  }
+
+  let item = null;
+  try {
+    item = await getDownloadItem(segment.downloadId);
+  } catch (_error) {
+    // A missing item is handled below from the event delta.
+  }
+
+  const observedState = item?.state || delta?.state?.current || "";
+  const diagnostic = segment.diagnostic;
+  if (diagnostic) {
+    diagnostic.events.push({
+      at: new Date().toISOString(),
+      delta: pickDownloadDelta(delta),
+      item: pickDownloadItem(item)
+    });
+    diagnostic.latestItem = pickDownloadItem(item);
+  }
+
+  segment.receivedBytes = Number(item?.bytesReceived) || segment.receivedBytes;
+  segment.totalBytes = Number(item?.totalBytes) || segment.totalBytes || segment.size;
+  task.updatedAt = new Date().toISOString();
+
+  if (task.state === "canceled") {
+    segment.state = "canceled";
+    directDownloadIds.delete(Number(delta?.id));
+    await finishDirectDownloadTask(task, "canceled");
+    return;
+  }
+
+  if (observedState === "complete") {
+    segment.state = "complete";
+    segment.receivedBytes = Number(item?.bytesReceived || item?.fileSize) || segment.totalBytes || segment.size;
+    segment.totalBytes = Number(item?.totalBytes || item?.fileSize) || segment.totalBytes || segment.receivedBytes;
+    if (diagnostic) {
+      diagnostic.phase = "complete";
+      diagnostic.error = null;
+      diagnostic.saved = {
+        filename: item?.filename || segment.filename,
+        mime: item?.mime || "",
+        size: segment.receivedBytes,
+        method: "native-download",
+        mode: task.mode,
+        savedToDisk: true
+      };
+      await setLastDiagnostic(diagnostic);
+    }
+    directDownloadIds.delete(Number(delta?.id));
+    await advanceDirectDownloadTask(task);
+    return;
+  }
+
+  const interrupted = observedState === "interrupted" || Boolean(delta?.error);
+  if (interrupted) {
+    const reason = item?.error || delta?.error?.current || "download interrupted";
+    if (diagnostic) {
+      diagnostic.phase = "interrupted";
+      diagnostic.error = reason;
+      await setLastDiagnostic(diagnostic);
+    }
+    directDownloadIds.delete(Number(delta?.id));
+    segment.error = reason;
+    segment.downloadId = null;
+    if (isUserCanceledNativeDownload(reason, task)) {
+      segment.state = "canceled";
+      await finishDirectDownloadTask(task, "canceled");
+      return;
+    }
+    if (isNativeDownloadShutdown(reason)) {
+      await failDirectDownloadSegment(task, segment, reason);
+      return;
+    }
+    segment.candidateIndex += 1;
+    segment.state = "queued";
+    if (segment.candidateIndex < segment.candidates.length) {
+      await startDirectDownloadSegment(task, segment);
+      return;
+    }
+    if (await refreshDirectDownloadTaskCandidates(task, segment)) {
+      await startDirectDownloadSegment(task, segment);
+      return;
+    }
+    await failDirectDownloadSegment(task, segment, reason);
+    return;
+  }
+
+  if (diagnostic) {
+    diagnostic.phase = observedState || "download-changed";
+    await setLastDiagnostic(diagnostic);
+  }
+  syncDirectDownloadPausedState(task, segment, item, delta);
+  await publishDirectDownloadTask(task);
+}
+
+function isUserCanceledNativeDownload(reason, task = null) {
+  const normalized = String(reason || "").toUpperCase();
+  return normalized.includes("USER_CANCELED") || task?.requestedAction === "cancel";
+}
+
+function isNativeDownloadShutdown(reason) {
+  return String(reason || "").toUpperCase().includes("USER_SHUTDOWN");
+}
+
+function isDirectDownloadSegmentActive(segment) {
+  return ["in_progress", "starting", "paused"].includes(String(segment?.state || ""));
+}
+
+function syncDirectDownloadPausedState(task, segment, item, delta) {
+  const paused = item?.paused === true || delta?.paused?.current === true;
+  const resumed = item?.paused === false || delta?.paused?.current === false;
+  if (paused) {
+    segment.state = "paused";
+    task.state = "paused";
+    return;
+  }
+  if (resumed) {
+    segment.state = "in_progress";
+    if (task.state === "paused" && task.requestedAction !== "pause") {
+      task.state = "in_progress";
+    }
+  }
+}
+
+async function failDirectDownloadSegment(task, segment, reason) {
+  segment.state = "interrupted";
+  segment.error = reason;
+  task.error = reason;
+  const diagnostic = segment.diagnostic;
+  if (diagnostic) {
+    diagnostic.phase = "interrupted";
+    diagnostic.error = reason;
+    diagnostic.allCandidateDiagnostics = segment.candidateDiagnostics
+      .filter((item) => item !== diagnostic)
+      .map((item) => sanitizeForMessage(item));
+    await setLastDiagnostic(diagnostic);
+  }
+  await finishDirectDownloadTask(task, "interrupted", reason);
+}
+
+async function finishDirectDownloadTask(task, state, error = "") {
+  task.state = state;
+  task.error = error || task.error || "";
+  task.updatedAt = new Date().toISOString();
+  for (const segment of task.segments) {
+    if (state === "canceled" && (segment.state === "queued" || segment.state === "starting" ||
+      segment.state === "in_progress" || segment.state === "paused")) {
+      segment.state = "canceled";
+    }
+    if (isDirectDownloadTaskTerminal(task)) {
+      segment.candidates = [];
+    }
+    if (segment.downloadId) {
+      directDownloadIds.delete(segment.downloadId);
+    }
+  }
+  pruneDirectDownloadTasks(task.id);
+  await publishDirectDownloadTask(task, { force: true });
+}
+
+async function controlDirectDownloadTask(payload) {
+  const taskId = String(payload?.taskId || "");
+  const action = String(payload?.action || "");
+  await restoreDirectDownloadTasks();
+  const task = directDownloadTasks.get(taskId);
+  if (!task) {
+    const stored = await getDirectDownloadTask(taskId);
+    if (stored) {
+      throw new Error("This direct download task can no longer be controlled. Please use the browser download shelf.");
+    }
+    throw new Error("Direct download task was not found.");
+  }
+  if (!["pause", "resume", "cancel"].includes(action)) {
+    throw new Error("Unknown direct download action.");
+  }
+  task.requestedAction = action;
+
+  return queueDirectDownloadTask(task, async () => {
+    if (isDirectDownloadTaskTerminal(task)) {
+      return snapshotDirectDownloadTask(task);
+    }
+
+    const activeIds = task.segments
+      .filter((segment) => isDirectDownloadSegmentActive(segment) && Number.isInteger(segment.downloadId))
+      .map((segment) => segment.downloadId);
+
+    if (action === "pause") {
+      await Promise.all(activeIds.map((id) => controlNativeDownload(id, "pause")));
+      task.state = "paused";
+    } else if (action === "resume") {
+      await Promise.all(activeIds.map((id) => controlNativeDownload(id, "resume")));
+      for (const segment of task.segments) {
+        if (segment.state === "paused") {
+          segment.state = "in_progress";
+        }
+      }
+      task.state = "in_progress";
+      await advanceDirectDownloadTask(task);
+    } else {
+      try {
+        await Promise.all(activeIds.map((id) => controlNativeDownload(id, "cancel")));
+      } catch (error) {
+        if (task.requestedAction === "cancel") {
+          task.requestedAction = "";
+        }
+        await publishDirectDownloadTask(task, { force: true });
+        throw error;
+      }
+      if (!activeIds.length) {
+        await finishDirectDownloadTask(task, "canceled");
+        return snapshotDirectDownloadTask(task);
+      }
+      // Chrome owns the final transition.  Do not report a terminal cancel
+      // until its download record actually changes, otherwise a failed or
+      // completed native transfer could be mislabeled as canceled.
+      task.state = "canceling";
+      task.updatedAt = new Date().toISOString();
+      await publishDirectDownloadTask(task, { force: true });
+      return snapshotDirectDownloadTask(task);
+    }
+
+    if (task.requestedAction === action) {
+      task.requestedAction = "";
+    }
+
+    task.updatedAt = new Date().toISOString();
+    await publishDirectDownloadTask(task);
+    return snapshotDirectDownloadTask(task);
+  });
+}
+
+function controlNativeDownload(id, action) {
+  return new Promise((resolve, reject) => {
+    const method = chrome.downloads?.[action];
+    if (typeof method !== "function") {
+      reject(new Error(`chrome.downloads.${action} is unavailable.`));
+      return;
+    }
+
+    let settled = false;
+    const finish = (error = null) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      if (error) {
+        reject(error);
+      } else {
+        resolve();
+      }
+    };
+
+    try {
+      const result = method.call(chrome.downloads, id, () => {
+        const error = chrome.runtime?.lastError;
+        finish(error ? new Error(error.message) : null);
+      });
+      result?.then?.(() => finish()).catch((error) => finish(error));
+    } catch (error) {
+      finish(error);
+    }
+  });
+}
+
+function isDirectDownloadTaskTerminal(task) {
+  return ["complete", "interrupted", "canceled"].includes(task?.state || task?.taskState || "");
+}
+
+async function getDirectDownloadTask(taskId) {
+  const normalizedTaskId = String(taskId || "");
+  await restoreDirectDownloadTasks();
+  const task = directDownloadTasks.get(normalizedTaskId);
+  if (task) {
+    return snapshotDirectDownloadTask(task);
+  }
+
+  try {
+    const stored = await chrome.storage?.local?.get(DIRECT_DOWNLOAD_TASK_STORAGE_KEY);
+    const tasks = Array.isArray(stored?.[DIRECT_DOWNLOAD_TASK_STORAGE_KEY])
+      ? stored[DIRECT_DOWNLOAD_TASK_STORAGE_KEY]
+      : [];
+    const snapshot = tasks.find((item) => item?.taskId === normalizedTaskId) || null;
+    return snapshot ? sanitizeForMessage(snapshot) : null;
+  } catch (_error) {
+    return null;
+  }
+}
+
+async function listDirectDownloadTasks(payload = {}) {
+  await restoreDirectDownloadTasks();
+  const tabId = normalizeTabId(payload?.tabId);
+  const activeOnly = Boolean(payload?.activeOnly);
+  return Array.from(directDownloadTasks.values())
+    .filter((task) => !tabId || task.tabId === tabId)
+    .filter((task) => !activeOnly || !isDirectDownloadTaskTerminal(task))
+    .sort((left, right) => String(right.updatedAt).localeCompare(String(left.updatedAt)))
+    .map((task) => snapshotDirectDownloadTask(task));
+}
+
+async function restoreDirectDownloadTasks() {
+  if (directDownloadTasksRestored) {
+    return;
+  }
+  if (directDownloadTasksRestorePromise) {
+    return directDownloadTasksRestorePromise;
+  }
+
+  directDownloadTasksRestorePromise = (async () => {
+    try {
+      const stored = await chrome.storage?.local?.get(DIRECT_DOWNLOAD_TASK_STORAGE_KEY);
+      const snapshots = Array.isArray(stored?.[DIRECT_DOWNLOAD_TASK_STORAGE_KEY])
+        ? stored[DIRECT_DOWNLOAD_TASK_STORAGE_KEY]
+        : [];
+      let restoredChanged = false;
+      const restoredTasks = [];
+      for (const snapshot of snapshots) {
+        const taskId = String(snapshot?.taskId || "");
+        if (!taskId || directDownloadTasks.has(taskId)) {
+          continue;
+        }
+        const task = restoreDirectDownloadTask(snapshot);
+        // Older snapshots may contain raw error text. Re-persist any snapshot
+        // changed by the same privacy boundary used for new task snapshots.
+        const safeSnapshot = sanitizeForMessage(snapshot);
+        restoredChanged = restoredChanged || task.restoreChanged || JSON.stringify(snapshot) !== JSON.stringify(safeSnapshot);
+        directDownloadTasks.set(task.id, task);
+        restoredTasks.push(task);
+        for (const segment of task.segments) {
+          if (Number.isInteger(segment.downloadId) && segment.downloadId > 0 &&
+            isDirectDownloadSegmentActive(segment)) {
+            directDownloadIds.set(segment.downloadId, {
+              taskId: task.id,
+              segmentIndex: segment.index
+            });
+          }
+        }
+      }
+      pruneDirectDownloadTasks();
+      await reconcileRestoredDirectDownloadTasks(restoredTasks);
+      await resumeRestoredDirectDownloadTasks(restoredTasks);
+      if (restoredChanged) {
+        await persistDirectDownloadTasks({ force: true });
+      }
+    } catch (_error) {
+      // The browser still owns native downloads if a service-worker snapshot cannot be restored.
+    } finally {
+      directDownloadTasksRestored = true;
+      directDownloadTasksRestorePromise = null;
+    }
+  })();
+
+  return directDownloadTasksRestorePromise;
+}
+
+async function reconcileRestoredDirectDownloadTasks(tasks) {
+  const operations = [];
+  for (const task of tasks) {
+    if (isDirectDownloadTaskTerminal(task)) {
+      continue;
+    }
+    for (const segment of task.segments) {
+      if (!isDirectDownloadSegmentActive(segment) || !Number.isInteger(segment.downloadId) || segment.downloadId <= 0) {
+        continue;
+      }
+      operations.push(queueDirectDownloadTask(task, () => reconcileRestoredDirectDownloadSegment(task, segment)));
+    }
+  }
+  await Promise.all(operations);
+}
+
+async function reconcileRestoredDirectDownloadSegment(task, segment) {
+  const downloadId = segment.downloadId;
+  let item = null;
+  try {
+    item = await getDownloadItem(downloadId);
+  } catch (_error) {
+    // Keep the stored state when Chrome's downloads database is temporarily unavailable.
+    return;
+  }
+
+  if (!item) {
+    const message = "Native download record was unavailable during service worker recovery.";
+    segment.state = "interrupted";
+    segment.error = message;
+    segment.downloadId = null;
+    directDownloadIds.delete(downloadId);
+    await finishDirectDownloadTask(task, "interrupted", message);
+    return;
+  }
+
+  await applyDirectDownloadChange(task, segment, {
+    id: downloadId,
+    state: { current: item.state || "" },
+    error: item.error ? { current: item.error } : null,
+    paused: typeof item.paused === "boolean" ? { current: item.paused } : null
+  });
+}
+
+async function resumeRestoredDirectDownloadTasks(tasks) {
+  const operations = [];
+  for (const task of tasks) {
+    if (isDirectDownloadTaskTerminal(task) || task.state === "paused") {
+      continue;
+    }
+    if (task.segments.some(isDirectDownloadSegmentActive)) {
+      continue;
+    }
+    operations.push(queueDirectDownloadTask(task, () => advanceDirectDownloadTask(task)));
+  }
+  await Promise.all(operations);
+}
+
+function restoreDirectDownloadTask(snapshot) {
+  const now = new Date().toISOString();
+  let restoreChanged = false;
+  const segments = Array.isArray(snapshot?.segments) ? snapshot.segments.map((source, index) => {
+    const downloadId = Number(source?.downloadId) || null;
+    let state = String(source?.state || "queued");
+    // A service worker can be suspended after we persisted `starting` but
+    // before Chrome returns a download id.  There is no browser-owned task to
+    // reconcile in that case, so put the segment back in the safe reprepare
+    // queue instead of leaving a permanently active-looking task.
+    if (isDirectDownloadSegmentActive({ state }) && !(Number.isInteger(downloadId) && downloadId > 0)) {
+      state = "queued";
+      restoreChanged = true;
+    }
+    return {
+    index: Number(source?.index) || index + 1,
+    filename: String(source?.filename || ""),
+    size: Number(source?.size) || 0,
+    context: directTaskContext(source?.context),
+    candidates: [],
+    candidateCount: Number(source?.candidateCount) || 0,
+    candidateIndex: Math.max((Number(source?.candidateIndex) || 1) - 1, 0),
+    candidateRefreshCount: Math.max(Number(source?.candidateRefreshCount) || 0, 0),
+    downloadId: Number.isInteger(downloadId) && downloadId > 0 ? downloadId : null,
+    state,
+    receivedBytes: Number(source?.receivedBytes) || 0,
+    totalBytes: Number(source?.totalBytes) || Number(source?.size) || 0,
+    error: redactDiagnosticText(String(source?.error || "")),
+    diagnostic: null,
+    candidateDiagnostics: []
+    };
+  }) : [];
+
+  let taskState = String(snapshot?.state || "queued");
+  const hasReconciledNativeSegment = segments.some((segment) => (
+    isDirectDownloadSegmentActive(segment) && Number.isInteger(segment.downloadId) && segment.downloadId > 0
+  ));
+  if (restoreChanged && !hasReconciledNativeSegment && ["starting", "in_progress"].includes(taskState)) {
+    taskState = "queued";
+  }
+
+  const task = {
+    id: String(snapshot?.taskId || ""),
+    tabId: normalizeTabId(snapshot?.tabId),
+    mode: String(snapshot?.mode || "durl"),
+    format: String(snapshot?.format || ""),
+    createdAt: String(snapshot?.createdAt || now),
+    updatedAt: String(snapshot?.updatedAt || now),
+    state: taskState,
+    error: redactDiagnosticText(String(snapshot?.error || "")),
+    requestedAction: "",
+    segments,
+    operation: Promise.resolve(),
+    restoreChanged
+  };
+  return task;
+}
+
+function pruneDirectDownloadTasks(preserveTaskId = "") {
+  let terminalCount = Array.from(directDownloadTasks.values())
+    .filter(isDirectDownloadTaskTerminal)
+    .length;
+  const removable = Array.from(directDownloadTasks.values())
+    .filter((task) => task.id !== preserveTaskId && isDirectDownloadTaskTerminal(task))
+    .sort((left, right) => String(left.updatedAt).localeCompare(String(right.updatedAt)));
+  while (terminalCount > DIRECT_DOWNLOAD_TASK_HISTORY_LIMIT && removable.length) {
+    const task = removable.shift();
+    directDownloadTasks.delete(task.id);
+    directDownloadTaskPersistMetadata.delete(task.id);
+    terminalCount -= 1;
+  }
+}
+
+async function publishDirectDownloadTask(task, options = {}) {
+  task.updatedAt = new Date().toISOString();
+  await persistDirectDownloadTasks({
+    force: Boolean(options.force) || isDirectDownloadTaskTerminal(task)
+  });
+  relayProgress(directDownloadTaskProgress(task), task.tabId);
+}
+
+function directDownloadTaskSnapshotsForStorage() {
+  const tasks = Array.from(directDownloadTasks.values());
+  const active = tasks
+    .filter((task) => !isDirectDownloadTaskTerminal(task))
+    .sort((left, right) => String(right.updatedAt).localeCompare(String(left.updatedAt)));
+  const terminal = tasks
+    .filter(isDirectDownloadTaskTerminal)
+    .sort((left, right) => String(right.updatedAt).localeCompare(String(left.updatedAt)))
+    .slice(0, DIRECT_DOWNLOAD_TASK_HISTORY_LIMIT);
+  return [...active, ...terminal]
+    .map((task) => snapshotDirectDownloadTask(task))
+    .sort((left, right) => String(right.updatedAt).localeCompare(String(left.updatedAt)));
+}
+
+function directDownloadTaskPersistenceFingerprint(snapshot) {
+  return JSON.stringify({
+    state: snapshot.state,
+    error: snapshot.error,
+    completedCount: snapshot.completedCount,
+    downloadIds: snapshot.downloadIds,
+    segments: (snapshot.segments || []).map((segment) => ({
+      index: segment.index,
+      state: segment.state,
+      downloadId: segment.downloadId,
+      candidateIndex: segment.candidateIndex,
+      candidateCount: segment.candidateCount,
+      candidateRefreshCount: segment.candidateRefreshCount,
+      error: segment.error
+    }))
+  });
+}
+
+function shouldPersistDirectDownloadTasks(snapshots, force) {
+  if (force || !directDownloadTasksLastPersistAt) {
+    return true;
+  }
+  const now = Date.now();
+  for (const snapshot of snapshots) {
+    const previous = directDownloadTaskPersistMetadata.get(snapshot.taskId);
+    const fingerprint = directDownloadTaskPersistenceFingerprint(snapshot);
+    if (!previous || previous.fingerprint !== fingerprint) {
+      return true;
+    }
+    const receivedDelta = Math.abs((Number(snapshot.receivedBytes) || 0) - previous.receivedBytes);
+    const totalDelta = Math.abs((Number(snapshot.totalBytes) || 0) - previous.totalBytes);
+    if (receivedDelta >= DIRECT_DOWNLOAD_SNAPSHOT_MIN_BYTES_DELTA ||
+      totalDelta >= DIRECT_DOWNLOAD_SNAPSHOT_MIN_BYTES_DELTA ||
+      now - previous.persistedAt >= DIRECT_DOWNLOAD_SNAPSHOT_MIN_INTERVAL_MS) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function scheduleDirectDownloadTasksPersistence() {
+  if (directDownloadTasksPersistTimer !== null || typeof setTimeout !== "function") {
+    return;
+  }
+  const elapsed = Math.max(Date.now() - directDownloadTasksLastPersistAt, 0);
+  const delay = Math.max(DIRECT_DOWNLOAD_SNAPSHOT_MIN_INTERVAL_MS - elapsed, 0);
+  directDownloadTasksPersistTimer = setTimeout(() => {
+    directDownloadTasksPersistTimer = null;
+    persistDirectDownloadTasks().catch(() => {});
+  }, delay);
+}
+
+async function persistDirectDownloadTasks(options = {}) {
+  const force = Boolean(options.force);
+  const snapshots = directDownloadTaskSnapshotsForStorage();
+  if (!shouldPersistDirectDownloadTasks(snapshots, force)) {
+    scheduleDirectDownloadTasksPersistence();
+    return false;
+  }
+  if (directDownloadTasksPersistTimer !== null && typeof clearTimeout === "function") {
+    clearTimeout(directDownloadTasksPersistTimer);
+    directDownloadTasksPersistTimer = null;
+  }
+
+  const write = async () => {
+    const currentSnapshots = directDownloadTaskSnapshotsForStorage();
+    try {
+      await chrome.storage?.local?.set({ [DIRECT_DOWNLOAD_TASK_STORAGE_KEY]: currentSnapshots });
+      const persistedAt = Date.now();
+      directDownloadTasksLastPersistAt = persistedAt;
+      directDownloadTaskPersistMetadata.clear();
+      for (const snapshot of currentSnapshots) {
+        directDownloadTaskPersistMetadata.set(snapshot.taskId, {
+          fingerprint: directDownloadTaskPersistenceFingerprint(snapshot),
+          receivedBytes: Number(snapshot.receivedBytes) || 0,
+          totalBytes: Number(snapshot.totalBytes) || 0,
+          persistedAt
+        });
+      }
+      return true;
+    } catch (_error) {
+      // Native transfers continue even if the task snapshot cannot be persisted.
+      return false;
+    }
+  };
+  const operation = directDownloadTasksPersistOperation.then(write, write);
+  directDownloadTasksPersistOperation = operation.catch(() => {});
+  return operation;
+}
+
+function snapshotDirectDownloadTask(task) {
+  const progress = directDownloadTaskProgress(task);
+  return sanitizeForMessage({
+    taskId: task.id || task.taskId,
+    state: task.state || task.taskState || "",
+    mode: String(task.mode || "durl"),
+    format: String(task.format || ""),
+    createdAt: task.createdAt || "",
+    updatedAt: task.updatedAt || "",
+    tabId: Number(task.tabId) || 0,
+    count: task.segments?.length || Number(task.count) || 0,
+    completedCount: (task.segments || []).filter((segment) => segment.state === "complete").length,
+    error: redactDiagnosticText(String(task.error || "")),
+    downloadIds: progress.downloadIds,
+    receivedBytes: progress.receivedBytes,
+    totalBytes: progress.totalBytes,
+    segments: (task.segments || []).map((segment) => ({
+      index: Number(segment.index) || 0,
+      downloadId: Number(segment.downloadId) || 0,
+      state: String(segment.state || ""),
+      filename: summarizeDiagnosticFilename(segment.filename || ""),
+      size: Number(segment.size) || 0,
+      receivedBytes: Number(segment.receivedBytes) || 0,
+      totalBytes: Number(segment.totalBytes) || 0,
+      candidateIndex: Number(segment.candidateIndex) + 1 || 0,
+      candidateCount: Number(segment.candidateCount) ||
+        (Array.isArray(segment.candidates) ? segment.candidates.length : 0),
+      candidateRefreshCount: Number(segment.candidateRefreshCount) || 0,
+      error: redactDiagnosticText(String(segment.error || "")),
+      context: directTaskContext(segment.context)
+    }))
+  });
+}
+
+function directDownloadTaskProgress(task) {
+  const segments = Array.isArray(task?.segments) ? task.segments : [];
+  const activeSegment = segments.find(isDirectDownloadSegmentActive) ||
+    segments.find((segment) => segment.state === "queued") ||
+    segments.at(-1) || null;
+  const totalBytes = segments.reduce((sum, segment) => sum + (Number(segment.totalBytes) || Number(segment.size) || 0), 0);
+  const receivedBytes = segments.reduce((sum, segment) => {
+    const received = Number(segment.receivedBytes) || 0;
+    const total = Number(segment.totalBytes) || Number(segment.size) || 0;
+    return sum + (segment.state === "complete" ? Math.max(received, total) : received);
+  }, 0);
+
+  return {
+    receivedBytes,
+    totalBytes,
+    segmentIndex: Number(activeSegment?.index) || 0,
+    segmentCount: segments.length,
+    candidateIndex: Number(activeSegment?.candidateIndex) + 1 || 0,
+    candidateCount: Number(activeSegment?.candidateCount) ||
+      (Array.isArray(activeSegment?.candidates) ? activeSegment.candidates.length : 0),
+    done: isDirectDownloadTaskTerminal(task),
+    taskId: task?.id || task?.taskId || "",
+    taskState: task?.state || task?.taskState || "",
+    nativeDownload: true,
+    downloadIds: segments.map((segment) => Number(segment.downloadId)).filter((id) => Number.isInteger(id) && id > 0),
+    error: redactDiagnosticText(String(task?.error || ""))
+  };
+}
+
+// The companion deliberately gets its own task store and port map. Browser
+// download tasks can be reconciled from Chrome's downloads database after a
+// service-worker restart; a Native Messaging port cannot. Keeping these paths
+// separate makes that difference explicit and, critically, prevents signed CDN
+// sources from becoming accidental recovery data in extension storage.
+async function pingCompanionNativeHost() {
+  if (!chrome.runtime?.connectNative) {
+    throw companionUnavailableError();
+  }
+
+  let port;
+  try {
+    port = chrome.runtime.connectNative(COMPANION_NATIVE_HOST_NAME);
+  } catch (_error) {
+    throw companionUnavailableError();
+  }
+  if (!port?.onMessage?.addListener || !port?.onDisconnect?.addListener || !port?.postMessage) {
+    try {
+      port?.disconnect?.();
+    } catch (_error) {
+      // Nothing else can be recovered from an invalid Native Messaging port.
+    }
+    throw companionUnavailableError();
+  }
+
+  const requestId = createCompanionRequestId("ping");
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timeout = typeof setTimeout === "function"
+      ? setTimeout(() => finish(companionUnavailableError()), 5000)
+      : null;
+
+    const cleanup = () => {
+      if (timeout !== null && typeof clearTimeout === "function") {
+        clearTimeout(timeout);
+      }
+      try {
+        port.onMessage?.removeListener?.(onMessage);
+        port.onDisconnect?.removeListener?.(onDisconnect);
+      } catch (_error) {
+        // Listener cleanup is best-effort across Chromium versions.
+      }
+      try {
+        port.disconnect?.();
+      } catch (_error) {
+        // Disconnecting an already-closed temporary ping port is harmless.
+      }
+    };
+    const finish = (error = null, payload = null) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      if (error) {
+        reject(error);
+      } else {
+        resolve(payload);
+      }
+    };
+    const onMessage = (event) => {
+      if (event?.type !== "pong" || String(event?.requestId || "") !== requestId) {
+        return;
+      }
+      if (Number(event?.protocolVersion) !== COMPANION_PROTOCOL_VERSION ||
+        String(event?.nativeHost || "") !== COMPANION_NATIVE_HOST_NAME) {
+        finish(new Error("The local streaming companion uses an incompatible protocol."));
+        return;
+      }
+      finish(null, {
+        nativeHost: COMPANION_NATIVE_HOST_NAME,
+        protocolVersion: COMPANION_PROTOCOL_VERSION
+      });
+    };
+    const onDisconnect = () => finish(companionUnavailableError());
+
+    port.onMessage.addListener(onMessage);
+    port.onDisconnect.addListener(onDisconnect);
+    try {
+      port.postMessage({
+        version: COMPANION_PROTOCOL_VERSION,
+        type: "ping",
+        requestId
+      });
+    } catch (_error) {
+      finish(companionUnavailableError());
+    }
+  });
+}
+
+async function startCompanionDownload(payload = {}) {
+  await restoreCompanionDownloadTasks();
+  const prepared = payload?.prepared;
+  if (!prepared || typeof prepared !== "object") {
+    throw new Error("A current DASH or live stream preparation is required for the local companion.");
+  }
+
+  const descriptor = describeCompanionPreparedDownload(prepared, payload);
+  const task = createCompanionDownloadTask(descriptor, payload);
+  companionDownloadTasks.set(task.id, task);
+  pruneCompanionDownloadTasks(task.id);
+  await persistCompanionDownloadTasks({ force: true });
+
+  try {
+    await startCompanionDownloadTask(task, descriptor);
+  } catch (error) {
+    // A missing host or an immediately rejected start is recoverable: the task
+    // keeps only its safe API metadata and can obtain fresh signed URLs later.
+    if (!isCompanionDownloadTaskTerminal(task)) {
+      await interruptCompanionDownloadTask(task, companionUnavailableMessage(), { force: true });
+    }
+    throw error;
+  }
+  return snapshotCompanionDownloadTask(task);
+}
+
+function createCompanionDownloadTask(descriptor, payload = {}) {
+  const now = new Date().toISOString();
+  return {
+    id: createCompanionDownloadTaskId(),
+    tabId: normalizeTabId(payload?.tabId),
+    kind: descriptor.kind,
+    title: descriptor.metadata.title,
+    outputName: descriptor.outputName,
+    format: descriptor.metadata.format,
+    metadata: descriptor.metadata,
+    maxBytes: normalizeCompanionMaxBytes(payload?.maxBytes),
+    maxDurationSeconds: descriptor.kind === "live"
+      ? normalizeCompanionDurationSeconds(payload?.maxDurationSeconds)
+      : 0,
+    segmentDurationSeconds: descriptor.kind === "live"
+      ? normalizeCompanionSegmentSeconds(payload?.segmentDurationSeconds)
+      : 0,
+    state: "starting",
+    recoverable: false,
+    error: "",
+    phase: "",
+    receivedBytes: 0,
+    totalBytes: Number(descriptor.totalBytes) || 0,
+    videoReceivedBytes: 0,
+    videoTotalBytes: Number(descriptor.videoExpectedBytes) || 0,
+    audioReceivedBytes: 0,
+    audioTotalBytes: Number(descriptor.audioExpectedBytes) || 0,
+    segmentIndex: 0,
+    segmentCount: 0,
+    reconnectAttempt: 0,
+    createdAt: now,
+    updatedAt: now,
+    operation: Promise.resolve(),
+    refreshInFlight: false
+  };
+}
+
+function createCompanionDownloadTaskId() {
+  companionDownloadTaskSequence += 1;
+  return `companion-${Date.now().toString(36)}-${companionDownloadTaskSequence.toString(36)}`;
+}
+
+function createCompanionRequestId(prefix = "request") {
+  companionDownloadTaskSequence += 1;
+  return `${prefix}-${Date.now().toString(36)}-${companionDownloadTaskSequence.toString(36)}`;
+}
+
+function describeCompanionPreparedDownload(prepared, payload = {}) {
+  if (prepared?.mode === "dash") {
+    return describeCompanionDashPreparation(prepared, payload);
+  }
+  if (prepared?.mode === "live") {
+    return describeCompanionLivePreparation(prepared, payload);
+  }
+  throw new Error("The local companion currently supports DASH video/audio and live FLV recording only.");
+}
+
+function describeCompanionDashPreparation(prepared) {
+  const segments = Array.isArray(prepared?.segments) ? prepared.segments : [];
+  const video = segments.find((segment) => String(segment?.context?.role || "") === "video");
+  const audio = segments.find((segment) => String(segment?.context?.role || "") === "audio");
+  if (!video || !audio) {
+    throw new Error("The DASH preparation did not include both video and audio streams.");
+  }
+
+  const context = video.context || {};
+  const bvid = normalizeBvid(context.bvid);
+  const epId = normalizeId(context.epId);
+  const cid = Number(context.cid) || 0;
+  const quality = Number(context.quality) || 0;
+  if ((!bvid && !epId) || !cid || !quality) {
+    throw new Error("The DASH preparation is missing the video metadata required to refresh sources.");
+  }
+
+  const title = normalizeCompanionTitle(context.title, bvid || `ep${epId}`);
+  const videoSources = readCompanionSourceUrls(video);
+  const audioSources = readCompanionSourceUrls(audio);
+  const videoExpectedBytes = companionNonnegativeInteger(video.size);
+  const audioExpectedBytes = companionNonnegativeInteger(audio.size);
+  return {
+    kind: "dash",
+    metadata: {
+      bvid,
+      epId,
+      cid,
+      quality,
+      title,
+      source: epId ? "bangumi" : "video",
+      format: "dash"
+    },
+    outputName: companionOutputName(title, "dash", quality),
+    videoSources,
+    audioSources,
+    videoExpectedBytes,
+    audioExpectedBytes,
+    totalBytes: videoExpectedBytes + audioExpectedBytes
+  };
+}
+
+function describeCompanionLivePreparation(prepared) {
+  const segment = Array.isArray(prepared?.segments) ? prepared.segments[0] : null;
+  const live = prepared?.live || {};
+  const context = segment?.context || {};
+  const roomId = normalizeId(live.roomId || context.roomId);
+  const quality = Number(live.quality || context.quality) || 0;
+  if (!roomId || !quality) {
+    throw new Error("The live preparation is missing the room or quality required to refresh sources.");
+  }
+
+  const title = normalizeCompanionTitle(live.title || context.title, `live_${roomId}`);
+  return {
+    kind: "live",
+    metadata: {
+      roomId,
+      shortId: normalizeId(live.shortId || context.shortId),
+      quality,
+      title,
+      source: "live",
+      format: "flv"
+    },
+    outputName: companionOutputName(title, "live", quality),
+    liveSources: readCompanionSourceUrls(segment),
+    totalBytes: 0,
+    videoExpectedBytes: 0,
+    audioExpectedBytes: 0
+  };
+}
+
+function readCompanionSourceUrls(segment) {
+  const urls = [];
+  const seen = new Set();
+  for (const candidate of readCandidates(segment)) {
+    const url = String(candidate?.url || "");
+    if (!isAllowedCompanionMediaUrl(url) || seen.has(url)) {
+      continue;
+    }
+    seen.add(url);
+    urls.push(url);
+  }
+  if (!urls.length) {
+    throw new Error("The prepared media source is not an allowed Bilibili HTTPS CDN URL.");
+  }
+  return urls;
+}
+
+function isAllowedCompanionMediaUrl(value) {
+  try {
+    const url = new URL(String(value || ""));
+    if (url.protocol !== "https:" || url.username || url.password) {
+      return false;
+    }
+    const host = url.hostname.toLowerCase();
+    return ["bilivideo.com", "bilivideo.cn", "hdslb.com", "edge.mountaintoys.cn"].some((suffix) => (
+      host === suffix || host.endsWith(`.${suffix}`)
+    ));
+  } catch (_error) {
+    return false;
+  }
+}
+
+function normalizeCompanionTitle(value, fallback = "bili_download") {
+  const source = String(value || "").replace(/[\r\n\t]+/g, " ").trim();
+  if (!source || looksLikeDiagnosticUrl(source) || isLocalDiagnosticPath(source)) {
+    return String(fallback || "bili_download").slice(0, 180);
+  }
+  return redactCompanionText(source).slice(0, 180) || String(fallback || "bili_download").slice(0, 180);
+}
+
+function companionOutputName(title, kind, quality = 0) {
+  const labeled = kind === "dash" && quality ? `${title}_${quality}` : title;
+  const stem = safeFilename(labeled).replace(/\.(?:mp4|flv|m4s)$/i, "") || "bili_download";
+  return `${stem.slice(0, 110)}.${kind === "dash" ? "mp4" : "flv"}`;
+}
+
+function buildCompanionStartMessage(task, descriptor) {
+  const requestId = createCompanionRequestId("start");
+  const base = {
+    outputName: normalizeCompanionOutputName(task.outputName, task.kind, task.title, task.metadata?.quality),
+    referer: task.kind === "live" ? "https://live.bilibili.com/" : "https://www.bilibili.com/",
+    maxBytes: normalizeCompanionMaxBytes(task.maxBytes)
+  };
+  let payload;
+  if (task.kind === "dash") {
+    payload = {
+      ...base,
+      video: companionStreamInput(descriptor.videoSources, descriptor.videoExpectedBytes),
+      audio: companionStreamInput(descriptor.audioSources, descriptor.audioExpectedBytes)
+    };
+  } else {
+    payload = {
+      ...base,
+      sources: descriptor.liveSources,
+      maxDurationSeconds: normalizeCompanionDurationSeconds(task.maxDurationSeconds),
+      segmentDurationSeconds: normalizeCompanionSegmentSeconds(task.segmentDurationSeconds)
+    };
+  }
+  return {
+    requestId,
+    message: {
+      version: COMPANION_PROTOCOL_VERSION,
+      type: task.kind === "dash" ? "start_dash" : "start_live",
+      requestId,
+      taskId: task.id,
+      payload
+    }
+  };
+}
+
+function buildCompanionRefreshMessage(task, descriptor) {
+  const requestId = createCompanionRequestId("refresh");
+  let payload;
+  if (task.kind === "dash") {
+    payload = {
+      referer: "https://www.bilibili.com/",
+      video: companionStreamInput(descriptor.videoSources, descriptor.videoExpectedBytes),
+      audio: companionStreamInput(descriptor.audioSources, descriptor.audioExpectedBytes)
+    };
+  } else {
+    payload = {
+      referer: "https://live.bilibili.com/",
+      sources: descriptor.liveSources
+    };
+  }
+  return {
+    requestId,
+    message: {
+      version: COMPANION_PROTOCOL_VERSION,
+      type: task.kind === "dash" ? "refresh_dash_sources" : "refresh_live_sources",
+      requestId,
+      taskId: task.id,
+      payload
+    }
+  };
+}
+
+function companionStreamInput(sources, expectedBytes) {
+  const payload = { sources: Array.isArray(sources) ? sources.slice() : [] };
+  const size = companionNonnegativeInteger(expectedBytes);
+  if (size > 0) {
+    payload.expectedBytes = size;
+  }
+  return payload;
+}
+
+async function startCompanionDownloadTask(task, descriptor) {
+  const { requestId, message } = buildCompanionStartMessage(task, descriptor);
+  await connectCompanionDownloadPort(task, message, requestId);
+}
+
+async function connectCompanionDownloadPort(task, message, startRequestId) {
+  if (!chrome.runtime?.connectNative) {
+    throw companionUnavailableError();
+  }
+  const existing = companionDownloadPorts.get(task.id);
+  if (existing?.port) {
+    throw new Error("The local companion task already has an active connection.");
+  }
+
+  let port;
+  try {
+    port = chrome.runtime.connectNative(COMPANION_NATIVE_HOST_NAME);
+  } catch (_error) {
+    throw companionUnavailableError();
+  }
+  if (!port?.onMessage?.addListener || !port?.onDisconnect?.addListener || !port?.postMessage) {
+    try {
+      port?.disconnect?.();
+    } catch (_error) {
+      // There is no valid port to clean up further.
+    }
+    throw companionUnavailableError();
+  }
+
+  return new Promise((resolve, reject) => {
+    const runtime = {
+      port,
+      pendingRequestIds: new Set([String(startRequestId)]),
+      startRequestId: String(startRequestId),
+      startSettled: false,
+      startTimeout: null,
+      resolveStart: resolve,
+      rejectStart: reject
+    };
+    companionDownloadPorts.set(task.id, runtime);
+
+    const settleStart = (error = null) => {
+      if (runtime.startSettled) {
+        return;
+      }
+      runtime.startSettled = true;
+      if (runtime.startTimeout !== null && typeof clearTimeout === "function") {
+        clearTimeout(runtime.startTimeout);
+        runtime.startTimeout = null;
+      }
+      if (error) {
+        reject(error);
+      } else {
+        resolve(snapshotCompanionDownloadTask(task));
+      }
+    };
+    runtime.settleStart = settleStart;
+
+    const onMessage = (event) => {
+      if (!isCompanionNativeEventForTask(event, task, runtime)) {
+        return;
+      }
+      const eventType = String(event?.type || "");
+      const operation = queueCompanionDownloadTask(task, () => (
+        applyCompanionNativeEvent(task, runtime, event)
+      ));
+      operation.then(() => {
+        if (eventType === "accepted" && String(event?.requestId || "") === runtime.startRequestId) {
+          settleStart();
+        } else if (eventType === "error" && String(event?.requestId || "") === runtime.startRequestId) {
+          settleStart(new Error(task.error || "The local streaming companion rejected the request."));
+        } else if (["completed", "canceled", "failed"].includes(eventType) && !runtime.startSettled) {
+          settleStart(new Error(task.error || "The local streaming companion ended before accepting the task."));
+        }
+      }).catch(() => {
+        if (eventType === "accepted" || eventType === "error") {
+          settleStart(companionUnavailableError());
+        }
+      });
+    };
+    const onDisconnect = () => {
+      if (companionDownloadPorts.get(task.id) !== runtime) {
+        return;
+      }
+      companionDownloadPorts.delete(task.id);
+      const operation = queueCompanionDownloadTask(task, () => (
+        interruptCompanionDownloadTask(task, companionUnavailableMessage(), { force: true })
+      ));
+      operation.finally(() => settleStart(companionUnavailableError()));
+    };
+    runtime.onMessage = onMessage;
+    runtime.onDisconnect = onDisconnect;
+    port.onMessage.addListener(onMessage);
+    port.onDisconnect.addListener(onDisconnect);
+    if (typeof setTimeout === "function") {
+      runtime.startTimeout = setTimeout(() => {
+        if (companionDownloadPorts.get(task.id) !== runtime) {
+          return;
+        }
+        queueCompanionDownloadTask(task, async () => {
+          if (!runtime.startSettled) {
+            await interruptCompanionDownloadTask(task, companionUnavailableMessage(), { force: true });
+          }
+        }).finally(() => {
+          if (!runtime.startSettled) {
+            settleStart(companionUnavailableError());
+          }
+        });
+      }, COMPANION_START_TIMEOUT_MS);
+    }
+
+    try {
+      port.postMessage(message);
+    } catch (_error) {
+      companionDownloadPorts.delete(task.id);
+      queueCompanionDownloadTask(task, () => (
+        interruptCompanionDownloadTask(task, companionUnavailableMessage(), { force: true })
+      )).finally(() => settleStart(companionUnavailableError()));
+      try {
+        port.disconnect?.();
+      } catch (_disconnectError) {
+        // The failed post already leaves no usable transport.
+      }
+    }
+  });
+}
+
+function isCompanionNativeEventForTask(event, task, runtime) {
+  if (!event || typeof event !== "object") {
+    return false;
+  }
+  if (event.version !== undefined && Number(event.version) !== COMPANION_PROTOCOL_VERSION) {
+    return false;
+  }
+  const type = String(event.type || "");
+  if (!["accepted", "progress", "refresh_required", "sources_refreshed", "cancel_requested", "completed", "canceled", "failed", "error"].includes(type)) {
+    return false;
+  }
+  const eventTaskId = String(event.taskId || "");
+  if (eventTaskId && eventTaskId !== task.id) {
+    return false;
+  }
+  if (type === "error") {
+    const requestId = String(event.requestId || "");
+    return Boolean(requestId && runtime.pendingRequestIds.has(requestId));
+  }
+  if (type === "accepted") {
+    return eventTaskId === task.id && String(event.requestId || "") === runtime.startRequestId;
+  }
+  return Boolean(eventTaskId);
+}
+
+function queueCompanionDownloadTask(task, operation) {
+  const previous = task.operation || Promise.resolve();
+  const next = previous.then(operation, operation);
+  task.operation = next.catch(() => {});
+  return next;
+}
+
+async function applyCompanionNativeEvent(task, runtime, event) {
+  const type = String(event?.type || "");
+  const requestId = String(event?.requestId || "");
+  if (requestId) {
+    runtime.pendingRequestIds.delete(requestId);
+  }
+
+  if (type === "accepted") {
+    task.state = "in_progress";
+    task.recoverable = false;
+    task.error = "";
+    task.outputName = normalizeCompanionOutputName(
+      event?.outputName,
+      task.kind,
+      task.title,
+      task.metadata?.quality
+    );
+    await publishCompanionDownloadTask(task, { force: true });
+    return;
+  }
+
+  if (type === "progress") {
+    applyCompanionProgress(task, event);
+    if (!isCompanionDownloadTaskTerminal(task) && task.state !== "canceling") {
+      task.state = "in_progress";
+      task.recoverable = false;
+    }
+    await publishCompanionDownloadTask(task);
+    return;
+  }
+
+  if (type === "refresh_required") {
+    if (isCompanionDownloadTaskTerminal(task) || task.state === "canceling") {
+      return;
+    }
+    task.state = "refreshing";
+    task.recoverable = false;
+    task.error = "";
+    await publishCompanionDownloadTask(task, { force: true });
+    await refreshCompanionDownloadSources(task, runtime);
+    return;
+  }
+
+  if (type === "sources_refreshed") {
+    if (!isCompanionDownloadTaskTerminal(task) && task.state !== "canceling") {
+      task.state = "in_progress";
+      task.recoverable = false;
+      task.error = "";
+      await publishCompanionDownloadTask(task, { force: true });
+    }
+    return;
+  }
+
+  if (type === "cancel_requested") {
+    if (!isCompanionDownloadTaskTerminal(task)) {
+      task.state = "canceling";
+      task.recoverable = false;
+      await publishCompanionDownloadTask(task, { force: true });
+    }
+    return;
+  }
+
+  if (type === "completed" || type === "canceled" || type === "failed") {
+    const terminalState = type === "completed" ? "complete" : type;
+    const bytesWritten = companionNonnegativeInteger(event?.bytesWritten);
+    if (bytesWritten > 0) {
+      task.receivedBytes = Math.max(task.receivedBytes, bytesWritten);
+      task.totalBytes = Math.max(task.totalBytes, bytesWritten);
+    }
+    const message = type === "failed" ? normalizeCompanionErrorMessage(event?.message) : "";
+    await finishCompanionDownloadTask(task, terminalState, message);
+    return;
+  }
+
+  if (type === "error") {
+    await finishCompanionDownloadTask(task, "failed", normalizeCompanionErrorMessage(event?.message));
+  }
+}
+
+function applyCompanionProgress(task, event) {
+  const phase = normalizeCompanionPhase(event?.phase);
+  const received = companionNonnegativeInteger(event?.receivedBytes);
+  const total = companionNonnegativeInteger(event?.totalBytes);
+  task.phase = phase;
+  task.segmentIndex = companionNonnegativeInteger(event?.segmentIndex);
+  task.segmentCount = companionNonnegativeInteger(event?.segmentCount) || task.segmentCount;
+  task.reconnectAttempt = companionNonnegativeInteger(event?.reconnectAttempt);
+
+  if (task.kind === "dash") {
+    if (phase === "download_video") {
+      task.videoReceivedBytes = Math.max(task.videoReceivedBytes, received);
+      task.videoTotalBytes = Math.max(task.videoTotalBytes, total);
+    } else if (phase === "download_audio") {
+      task.audioReceivedBytes = Math.max(task.audioReceivedBytes, received);
+      task.audioTotalBytes = Math.max(task.audioTotalBytes, total);
+    } else if (phase === "muxing") {
+      task.videoReceivedBytes = Math.max(task.videoReceivedBytes, task.videoTotalBytes);
+      task.audioReceivedBytes = Math.max(task.audioReceivedBytes, task.audioTotalBytes);
+    }
+    task.receivedBytes = task.videoReceivedBytes + task.audioReceivedBytes;
+    task.totalBytes = Math.max(task.totalBytes, task.videoTotalBytes + task.audioTotalBytes);
+    return;
+  }
+
+  task.receivedBytes = Math.max(task.receivedBytes, received);
+  task.totalBytes = Math.max(task.totalBytes, total);
+}
+
+async function refreshCompanionDownloadSources(task, runtime) {
+  if (task.refreshInFlight || isCompanionDownloadTaskTerminal(task)) {
+    return;
+  }
+  task.refreshInFlight = true;
+  try {
+    const prepared = await rebuildCompanionDownloadTaskPayload(task);
+    const descriptor = describeCompanionPreparedDownload(prepared, {
+      maxBytes: task.maxBytes,
+      maxDurationSeconds: task.maxDurationSeconds,
+      segmentDurationSeconds: task.segmentDurationSeconds
+    });
+    if (descriptor.kind !== task.kind) {
+      throw new Error("The refreshed media no longer matches the local companion task type.");
+    }
+    const { requestId, message } = buildCompanionRefreshMessage(task, descriptor);
+    const activeRuntime = companionDownloadPorts.get(task.id);
+    if (activeRuntime !== runtime || activeRuntime?.port !== runtime.port) {
+      throw companionUnavailableError();
+    }
+    runtime.pendingRequestIds.add(String(requestId));
+    runtime.port.postMessage(message);
+  } catch (error) {
+    await finishCompanionDownloadTask(task, "failed", normalizeCompanionErrorMessage(error?.message));
+  } finally {
+    task.refreshInFlight = false;
+  }
+}
+
+async function rebuildCompanionDownloadTaskPayload(task) {
+  const metadata = normalizeCompanionTaskMetadata(task?.metadata, task?.kind);
+  if (!metadata) {
+    throw new Error("The saved local companion metadata is incomplete.");
+  }
+  if (task.kind === "dash") {
+    return prepareDirectDownload({
+      bvid: metadata.bvid,
+      epId: metadata.epId,
+      cid: metadata.cid,
+      quality: metadata.quality,
+      title: metadata.title,
+      tabId: task.tabId
+    });
+  }
+  return prepareLiveRecording({
+    roomId: metadata.roomId,
+    title: metadata.title,
+    quality: metadata.quality,
+    tabId: task.tabId
+  });
+}
+
+async function getCompanionDownloadTask(taskId) {
+  await restoreCompanionDownloadTasks();
+  const task = companionDownloadTasks.get(String(taskId || ""));
+  return task ? snapshotCompanionDownloadTask(task) : null;
+}
+
+async function listCompanionDownloadTasks(payload = {}) {
+  await restoreCompanionDownloadTasks();
+  const tabId = normalizeTabId(payload?.tabId);
+  const activeOnly = Boolean(payload?.activeOnly);
+  return Array.from(companionDownloadTasks.values())
+    .filter((task) => !tabId || task.tabId === tabId)
+    .filter((task) => !activeOnly || !isCompanionDownloadTaskTerminal(task))
+    .sort((left, right) => String(right.updatedAt).localeCompare(String(left.updatedAt)))
+    .map((task) => snapshotCompanionDownloadTask(task));
+}
+
+async function controlCompanionDownloadTask(payload = {}) {
+  await restoreCompanionDownloadTasks();
+  const task = companionDownloadTasks.get(String(payload?.taskId || ""));
+  if (!task) {
+    throw new Error("The local companion task was not found.");
+  }
+  const action = String(payload?.action || "").toLowerCase();
+  if (action === "cancel") {
+    if (isCompanionDownloadTaskTerminal(task)) {
+      return snapshotCompanionDownloadTask(task);
+    }
+    task.state = "canceling";
+    task.recoverable = false;
+    task.error = "";
+    await publishCompanionDownloadTask(task, { force: true });
+    const runtime = companionDownloadPorts.get(task.id);
+    if (!runtime?.port) {
+      await finishCompanionDownloadTask(task, "canceled");
+      return snapshotCompanionDownloadTask(task);
+    }
+    const requestId = createCompanionRequestId("cancel");
+    runtime.pendingRequestIds.add(requestId);
+    try {
+      runtime.port.postMessage({
+        version: COMPANION_PROTOCOL_VERSION,
+        type: "cancel",
+        requestId,
+        taskId: task.id
+      });
+    } catch (_error) {
+      await interruptCompanionDownloadTask(task, companionUnavailableMessage(), { force: true });
+    }
+    return snapshotCompanionDownloadTask(task);
+  }
+
+  if (action === "resume") {
+    if (!task.recoverable || task.state !== "interrupted") {
+      throw new Error("Only an interrupted local companion task can be resumed.");
+    }
+    task.state = "starting";
+    task.recoverable = false;
+    task.error = "";
+    task.phase = "";
+    await publishCompanionDownloadTask(task, { force: true });
+    try {
+      const prepared = await rebuildCompanionDownloadTaskPayload(task);
+      const descriptor = describeCompanionPreparedDownload(prepared, {
+        maxBytes: task.maxBytes,
+        maxDurationSeconds: task.maxDurationSeconds,
+        segmentDurationSeconds: task.segmentDurationSeconds
+      });
+      if (descriptor.kind !== task.kind) {
+        throw new Error("The refreshed media no longer matches the saved local companion task.");
+      }
+      await startCompanionDownloadTask(task, descriptor);
+      return snapshotCompanionDownloadTask(task);
+    } catch (error) {
+      await interruptCompanionDownloadTask(task, normalizeCompanionErrorMessage(error?.message), { force: true });
+      throw error;
+    }
+  }
+
+  throw new Error("Unsupported local companion task action.");
+}
+
+function isCompanionDownloadTaskTerminal(task) {
+  return ["complete", "canceled", "failed", "interrupted"].includes(String(task?.state || ""));
+}
+
+async function finishCompanionDownloadTask(task, state, error = "") {
+  if (!task) {
+    return;
+  }
+  task.state = normalizeCompanionTaskState(state, "failed");
+  task.recoverable = false;
+  task.error = error ? normalizeCompanionErrorMessage(error) : "";
+  task.phase = task.state === "complete" ? "complete" : task.phase;
+  await publishCompanionDownloadTask(task, { force: true });
+  releaseCompanionDownloadPort(task.id);
+}
+
+async function interruptCompanionDownloadTask(task, message = companionUnavailableMessage(), options = {}) {
+  if (!task || isCompanionDownloadTaskTerminal(task)) {
+    return;
+  }
+  task.state = "interrupted";
+  task.recoverable = true;
+  task.error = normalizeCompanionErrorMessage(message);
+  task.phase = "";
+  await publishCompanionDownloadTask(task, { force: Boolean(options.force) });
+  releaseCompanionDownloadPort(task.id);
+}
+
+function releaseCompanionDownloadPort(taskId) {
+  const runtime = companionDownloadPorts.get(taskId);
+  if (!runtime) {
+    return;
+  }
+  companionDownloadPorts.delete(taskId);
+  try {
+    runtime.port?.onMessage?.removeListener?.(runtime.onMessage);
+    runtime.port?.onDisconnect?.removeListener?.(runtime.onDisconnect);
+  } catch (_error) {
+    // A port can disappear while listeners are being removed.
+  }
+  try {
+    runtime.port?.disconnect?.();
+  } catch (_error) {
+    // The task snapshot has already been safely persisted.
+  }
+}
+
+async function restoreCompanionDownloadTasks() {
+  if (companionDownloadTasksRestored) {
+    return;
+  }
+  if (companionDownloadTasksRestorePromise) {
+    return companionDownloadTasksRestorePromise;
+  }
+  companionDownloadTasksRestorePromise = (async () => {
+    try {
+      const stored = await chrome.storage?.local?.get(COMPANION_DOWNLOAD_TASK_STORAGE_KEY);
+      const snapshots = Array.isArray(stored?.[COMPANION_DOWNLOAD_TASK_STORAGE_KEY])
+        ? stored[COMPANION_DOWNLOAD_TASK_STORAGE_KEY]
+        : [];
+      let changed = false;
+      for (const snapshot of snapshots) {
+        const task = restoreCompanionDownloadTask(snapshot);
+        if (!task || companionDownloadTasks.has(task.id)) {
+          changed = true;
+          continue;
+        }
+        if (!isCompanionDownloadTaskTerminal(task)) {
+          task.state = "interrupted";
+          task.recoverable = true;
+          task.error = "The extension restarted before the local companion connection could be restored.";
+          task.phase = "";
+          task.updatedAt = new Date().toISOString();
+          changed = true;
+        }
+        const safeSnapshot = snapshotCompanionDownloadTask(task);
+        changed = changed || JSON.stringify(snapshot) !== JSON.stringify(safeSnapshot);
+        companionDownloadTasks.set(task.id, task);
+      }
+      pruneCompanionDownloadTasks();
+      if (changed) {
+        await persistCompanionDownloadTasks({ force: true });
+      }
+    } catch (_error) {
+      // Listing local task history must stay useful even if storage is briefly unavailable.
+    } finally {
+      companionDownloadTasksRestored = true;
+      companionDownloadTasksRestorePromise = null;
+    }
+  })();
+  return companionDownloadTasksRestorePromise;
+}
+
+function restoreCompanionDownloadTask(snapshot) {
+  const id = String(snapshot?.taskId || "");
+  const kind = normalizeCompanionKind(snapshot?.kind);
+  const metadata = normalizeCompanionTaskMetadata(snapshot?.metadata || snapshot?.resume, kind);
+  if (!id || !kind || !metadata) {
+    return null;
+  }
+  const now = new Date().toISOString();
+  const state = normalizeCompanionTaskState(snapshot?.state, "interrupted");
+  return {
+    id,
+    tabId: normalizeTabId(snapshot?.tabId),
+    kind,
+    title: normalizeCompanionTitle(snapshot?.title || metadata.title, metadata.title),
+    outputName: normalizeCompanionOutputName(snapshot?.outputName, kind, metadata.title, metadata.quality),
+    format: String(snapshot?.format || metadata.format || ""),
+    metadata,
+    maxBytes: normalizeCompanionMaxBytes(snapshot?.maxBytes),
+    maxDurationSeconds: kind === "live" ? normalizeCompanionDurationSeconds(snapshot?.maxDurationSeconds) : 0,
+    segmentDurationSeconds: kind === "live" ? normalizeCompanionSegmentSeconds(snapshot?.segmentDurationSeconds) : 0,
+    state,
+    recoverable: Boolean(snapshot?.recoverable) || state === "interrupted",
+    error: normalizeCompanionErrorMessage(snapshot?.error),
+    phase: normalizeCompanionPhase(snapshot?.phase),
+    receivedBytes: companionNonnegativeInteger(snapshot?.receivedBytes),
+    totalBytes: companionNonnegativeInteger(snapshot?.totalBytes),
+    videoReceivedBytes: companionNonnegativeInteger(snapshot?.videoReceivedBytes),
+    videoTotalBytes: companionNonnegativeInteger(snapshot?.videoTotalBytes),
+    audioReceivedBytes: companionNonnegativeInteger(snapshot?.audioReceivedBytes),
+    audioTotalBytes: companionNonnegativeInteger(snapshot?.audioTotalBytes),
+    segmentIndex: companionNonnegativeInteger(snapshot?.segmentIndex),
+    segmentCount: companionNonnegativeInteger(snapshot?.segmentCount),
+    reconnectAttempt: companionNonnegativeInteger(snapshot?.reconnectAttempt),
+    createdAt: String(snapshot?.createdAt || now),
+    updatedAt: String(snapshot?.updatedAt || now),
+    operation: Promise.resolve(),
+    refreshInFlight: false
+  };
+}
+
+function normalizeCompanionTaskMetadata(value, kind) {
+  if (kind === "dash") {
+    const bvid = normalizeBvid(value?.bvid);
+    const epId = normalizeId(value?.epId);
+    const cid = Number(value?.cid) || 0;
+    const quality = Number(value?.quality) || 0;
+    if ((!bvid && !epId) || !cid || !quality) {
+      return null;
+    }
+    return {
+      bvid,
+      epId,
+      cid,
+      quality,
+      title: normalizeCompanionTitle(value?.title, bvid || `ep${epId}`),
+      source: epId ? "bangumi" : "video",
+      format: "dash"
+    };
+  }
+  if (kind === "live") {
+    const roomId = normalizeId(value?.roomId);
+    const quality = Number(value?.quality) || 0;
+    if (!roomId || !quality) {
+      return null;
+    }
+    return {
+      roomId,
+      shortId: normalizeId(value?.shortId),
+      quality,
+      title: normalizeCompanionTitle(value?.title, `live_${roomId}`),
+      source: "live",
+      format: "flv"
+    };
+  }
+  return null;
+}
+
+function pruneCompanionDownloadTasks(preserveTaskId = "") {
+  let terminalCount = Array.from(companionDownloadTasks.values())
+    .filter(isCompanionDownloadTaskTerminal)
+    .length;
+  const removable = Array.from(companionDownloadTasks.values())
+    .filter((task) => task.id !== preserveTaskId && isCompanionDownloadTaskTerminal(task))
+    .sort((left, right) => String(left.updatedAt).localeCompare(String(right.updatedAt)));
+  while (terminalCount > COMPANION_TASK_HISTORY_LIMIT && removable.length) {
+    const task = removable.shift();
+    companionDownloadTasks.delete(task.id);
+    companionDownloadTaskPersistMetadata.delete(task.id);
+    terminalCount -= 1;
+  }
+}
+
+async function publishCompanionDownloadTask(task, options = {}) {
+  task.updatedAt = new Date().toISOString();
+  await persistCompanionDownloadTasks({
+    force: Boolean(options.force) || isCompanionDownloadTaskTerminal(task)
+  });
+  relayProgress(companionDownloadTaskProgress(task), task.tabId);
+}
+
+function companionDownloadTaskProgress(task) {
+  return {
+    receivedBytes: companionNonnegativeInteger(task?.receivedBytes),
+    totalBytes: companionNonnegativeInteger(task?.totalBytes),
+    segmentIndex: companionNonnegativeInteger(task?.segmentIndex),
+    segmentCount: companionNonnegativeInteger(task?.segmentCount),
+    candidateIndex: 0,
+    candidateCount: 0,
+    done: isCompanionDownloadTaskTerminal(task),
+    taskId: String(task?.id || ""),
+    taskState: normalizeCompanionTaskState(task?.state, "interrupted"),
+    nativeDownload: false,
+    companionDownload: true,
+    companionKind: normalizeCompanionKind(task?.kind),
+    phase: normalizeCompanionPhase(task?.phase),
+    recoverable: Boolean(task?.recoverable),
+    reconnectAttempt: companionNonnegativeInteger(task?.reconnectAttempt),
+    downloadIds: [],
+    error: normalizeCompanionErrorMessage(task?.error)
+  };
+}
+
+function companionDownloadTaskSnapshotsForStorage() {
+  const tasks = Array.from(companionDownloadTasks.values());
+  const active = tasks
+    .filter((task) => !isCompanionDownloadTaskTerminal(task))
+    .sort((left, right) => String(right.updatedAt).localeCompare(String(left.updatedAt)));
+  const terminal = tasks
+    .filter(isCompanionDownloadTaskTerminal)
+    .sort((left, right) => String(right.updatedAt).localeCompare(String(left.updatedAt)))
+    .slice(0, COMPANION_TASK_HISTORY_LIMIT);
+  return [...active, ...terminal]
+    .map((task) => snapshotCompanionDownloadTask(task))
+    .sort((left, right) => String(right.updatedAt).localeCompare(String(left.updatedAt)));
+}
+
+function companionDownloadTaskPersistenceFingerprint(snapshot) {
+  return JSON.stringify({
+    state: snapshot.state,
+    recoverable: snapshot.recoverable,
+    error: snapshot.error,
+    phase: snapshot.phase,
+    segmentIndex: snapshot.segmentIndex,
+    segmentCount: snapshot.segmentCount,
+    reconnectAttempt: snapshot.reconnectAttempt
+  });
+}
+
+function shouldPersistCompanionDownloadTasks(snapshots, force) {
+  if (force || !companionDownloadTasksLastPersistAt) {
+    return true;
+  }
+  const now = Date.now();
+  for (const snapshot of snapshots) {
+    const previous = companionDownloadTaskPersistMetadata.get(snapshot.taskId);
+    const fingerprint = companionDownloadTaskPersistenceFingerprint(snapshot);
+    if (!previous || previous.fingerprint !== fingerprint) {
+      return true;
+    }
+    const receivedDelta = Math.abs((Number(snapshot.receivedBytes) || 0) - previous.receivedBytes);
+    const totalDelta = Math.abs((Number(snapshot.totalBytes) || 0) - previous.totalBytes);
+    if (receivedDelta >= COMPANION_SNAPSHOT_MIN_BYTES_DELTA ||
+      totalDelta >= COMPANION_SNAPSHOT_MIN_BYTES_DELTA ||
+      now - previous.persistedAt >= COMPANION_SNAPSHOT_MIN_INTERVAL_MS) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function scheduleCompanionDownloadTasksPersistence() {
+  if (companionDownloadTasksPersistTimer !== null || typeof setTimeout !== "function") {
+    return;
+  }
+  const elapsed = Math.max(Date.now() - companionDownloadTasksLastPersistAt, 0);
+  const delay = Math.max(COMPANION_SNAPSHOT_MIN_INTERVAL_MS - elapsed, 0);
+  companionDownloadTasksPersistTimer = setTimeout(() => {
+    companionDownloadTasksPersistTimer = null;
+    persistCompanionDownloadTasks().catch(() => {});
+  }, delay);
+}
+
+async function persistCompanionDownloadTasks(options = {}) {
+  const force = Boolean(options.force);
+  const snapshots = companionDownloadTaskSnapshotsForStorage();
+  if (!shouldPersistCompanionDownloadTasks(snapshots, force)) {
+    scheduleCompanionDownloadTasksPersistence();
+    return false;
+  }
+  if (companionDownloadTasksPersistTimer !== null && typeof clearTimeout === "function") {
+    clearTimeout(companionDownloadTasksPersistTimer);
+    companionDownloadTasksPersistTimer = null;
+  }
+  const write = async () => {
+    const currentSnapshots = companionDownloadTaskSnapshotsForStorage();
+    try {
+      await chrome.storage?.local?.set({ [COMPANION_DOWNLOAD_TASK_STORAGE_KEY]: currentSnapshots });
+      const persistedAt = Date.now();
+      companionDownloadTasksLastPersistAt = persistedAt;
+      companionDownloadTaskPersistMetadata.clear();
+      for (const snapshot of currentSnapshots) {
+        companionDownloadTaskPersistMetadata.set(snapshot.taskId, {
+          fingerprint: companionDownloadTaskPersistenceFingerprint(snapshot),
+          receivedBytes: companionNonnegativeInteger(snapshot.receivedBytes),
+          totalBytes: companionNonnegativeInteger(snapshot.totalBytes),
+          persistedAt
+        });
+      }
+      return true;
+    } catch (_error) {
+      return false;
+    }
+  };
+  const operation = companionDownloadTasksPersistOperation.then(write, write);
+  companionDownloadTasksPersistOperation = operation.catch(() => {});
+  return operation;
+}
+
+function snapshotCompanionDownloadTask(task) {
+  return sanitizeForMessage({
+    taskId: String(task?.id || task?.taskId || ""),
+    tabId: normalizeTabId(task?.tabId) || 0,
+    kind: normalizeCompanionKind(task?.kind),
+    title: normalizeCompanionTitle(task?.title || task?.metadata?.title, "bili_download"),
+    outputName: normalizeCompanionOutputName(task?.outputName, task?.kind, task?.title || task?.metadata?.title, task?.metadata?.quality),
+    format: String(task?.format || task?.metadata?.format || ""),
+    state: normalizeCompanionTaskState(task?.state, "interrupted"),
+    recoverable: Boolean(task?.recoverable),
+    error: normalizeCompanionErrorMessage(task?.error),
+    phase: normalizeCompanionPhase(task?.phase),
+    receivedBytes: companionNonnegativeInteger(task?.receivedBytes),
+    totalBytes: companionNonnegativeInteger(task?.totalBytes),
+    segmentIndex: companionNonnegativeInteger(task?.segmentIndex),
+    segmentCount: companionNonnegativeInteger(task?.segmentCount),
+    reconnectAttempt: companionNonnegativeInteger(task?.reconnectAttempt),
+    maxBytes: normalizeCompanionMaxBytes(task?.maxBytes),
+    maxDurationSeconds: normalizeCompanionKind(task?.kind) === "live"
+      ? normalizeCompanionDurationSeconds(task?.maxDurationSeconds)
+      : 0,
+    segmentDurationSeconds: normalizeCompanionKind(task?.kind) === "live"
+      ? normalizeCompanionSegmentSeconds(task?.segmentDurationSeconds)
+      : 0,
+    createdAt: String(task?.createdAt || ""),
+    updatedAt: String(task?.updatedAt || ""),
+    // This is intentionally a whitelist of re-preparation identifiers. Do not
+    // add prepared segments, sources, URLs, headers, cookies, or a referer.
+    metadata: normalizeCompanionTaskMetadata(task?.metadata, task?.kind)
+  });
+}
+
+function normalizeCompanionTaskState(value, fallback = "") {
+  const state = String(value || "") === "completed" ? "complete" : String(value || "");
+  return ["starting", "in_progress", "refreshing", "canceling", "complete", "canceled", "failed", "interrupted"].includes(state)
+    ? state
+    : fallback;
+}
+
+function normalizeCompanionKind(value) {
+  const kind = String(value || "");
+  return kind === "dash" || kind === "live" ? kind : "";
+}
+
+function normalizeCompanionPhase(value) {
+  const phase = String(value || "") === "completed" ? "complete" : String(value || "");
+  return ["download_video", "download_audio", "muxing", "recording", "reconnecting", "complete"].includes(phase)
+    ? phase
+    : "";
+}
+
+function normalizeCompanionOutputName(value, kind, title, quality) {
+  const source = String(value || "").trim();
+  if (!source || /[\\/]/.test(source) || isLocalDiagnosticPath(source) || looksLikeDiagnosticUrl(source)) {
+    return companionOutputName(normalizeCompanionTitle(title, "bili_download"), normalizeCompanionKind(kind) || "dash", Number(quality) || 0);
+  }
+  const safe = safeFilename(source).replace(/\.(?:mp4|flv|m4s)$/i, "");
+  return `${safe.slice(0, 110) || "bili_download"}.${normalizeCompanionKind(kind) === "live" ? "flv" : "mp4"}`;
+}
+
+function normalizeCompanionMaxBytes(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return COMPANION_DEFAULT_MAX_BYTES;
+  }
+  return Math.max(1, Math.min(Math.floor(parsed), COMPANION_MAX_BYTES));
+}
+
+function normalizeCompanionDurationSeconds(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return COMPANION_DEFAULT_LIVE_DURATION_SECONDS;
+  }
+  return Math.max(1, Math.min(Math.floor(parsed), COMPANION_MAX_LIVE_DURATION_SECONDS));
+}
+
+function normalizeCompanionSegmentSeconds(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return COMPANION_DEFAULT_LIVE_SEGMENT_SECONDS;
+  }
+  return Math.max(1, Math.min(Math.floor(parsed), COMPANION_MAX_LIVE_SEGMENT_SECONDS));
+}
+
+function companionNonnegativeInteger(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return 0;
+  }
+  return Math.min(Math.floor(parsed), Number.MAX_SAFE_INTEGER);
+}
+
+function normalizeCompanionErrorMessage(value) {
+  const message = redactCompanionText(String(value || "")).replace(/[\r\n\t]+/g, " ").trim();
+  return message.slice(0, 500);
+}
+
+function redactCompanionText(value) {
+  // The native protocol guarantees that it never emits URLs, but keep this
+  // second boundary here as well: a third-party replacement host must not be
+  // able to smuggle an unsigned or otherwise non-query URL into task history.
+  return redactDiagnosticText(String(value || "")).replace(
+    /(?:(?:https?|wss?):\/\/|\/\/)[^\s"'<>`]+/gi,
+    "[URL redacted]"
+  );
+}
+
+function companionUnavailableMessage() {
+  return "The local streaming companion connection is unavailable. Install or restart the companion, then resume the task.";
+}
+
+function companionUnavailableError() {
+  return new Error(companionUnavailableMessage());
+}
+
+async function createBatchDownloadJob(payload = {}) {
+  await restoreBatchDownloadJobs();
+  const sourceItems = Array.isArray(payload?.items) ? payload.items.slice(0, BATCH_DOWNLOAD_JOB_ITEM_LIMIT) : [];
+  if (!sourceItems.length) {
+    throw new Error("A batch download job needs at least one page item.");
+  }
+
+  const now = new Date().toISOString();
+  const items = sourceItems.map((item, index) => createBatchDownloadJobItem(item, index + 1));
+  const job = {
+    id: createBatchDownloadJobId(),
+    tabId: normalizeTabId(payload?.tabId),
+    title: normalizeBatchDisplayText(payload?.title || ""),
+    state: "queued",
+    error: "",
+    currentIndex: 1,
+    createdAt: now,
+    updatedAt: now,
+    items
+  };
+  batchDownloadJobs.set(job.id, job);
+  pruneBatchDownloadJobs(job.id);
+  await persistBatchDownloadJobs();
+  return snapshotBatchDownloadJob(job);
+}
+
+async function getBatchDownloadJob(batchJobId) {
+  await restoreBatchDownloadJobs();
+  const job = batchDownloadJobs.get(String(batchJobId || ""));
+  if (!job) {
+    return null;
+  }
+  await synchronizeBatchDownloadJobsWithDirectTasks([job]);
+  return snapshotBatchDownloadJob(job);
+}
+
+async function listBatchDownloadJobs(payload = {}) {
+  await restoreBatchDownloadJobs();
+  const tabId = normalizeTabId(payload?.tabId);
+  const activeOnly = Boolean(payload?.activeOnly);
+  const jobs = Array.from(batchDownloadJobs.values())
+    .filter((job) => !tabId || job.tabId === tabId)
+    .filter((job) => !activeOnly || !isBatchDownloadJobTerminal(job))
+    .sort((left, right) => String(right.updatedAt).localeCompare(String(left.updatedAt)));
+  await synchronizeBatchDownloadJobsWithDirectTasks(jobs);
+  return jobs.map((job) => snapshotBatchDownloadJob(job));
+}
+
+async function updateBatchDownloadJob(payload = {}) {
+  await restoreBatchDownloadJobs();
+  const batchJobId = String(payload?.batchJobId || "");
+  const job = batchDownloadJobs.get(batchJobId);
+  if (!job) {
+    throw new Error("Batch download job was not found.");
+  }
+  const patch = payload?.patch && typeof payload.patch === "object" ? payload.patch : payload;
+  // Batch terminal states are one-way. A stale side-panel runner may still
+  // finish an awaited prepare/download after another panel has canceled the
+  // job; accepting its old in-progress patch would resurrect the queue.
+  if (isBatchDownloadJobTerminal(job)) {
+    return snapshotBatchDownloadJob(job);
+  }
+  let changed = false;
+
+  if (Object.prototype.hasOwnProperty.call(patch, "state")) {
+    const state = normalizeBatchDownloadJobState(patch.state, job.state);
+    changed = changed || state !== job.state;
+    job.state = state;
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, "error")) {
+    const error = redactDiagnosticText(String(patch.error || ""));
+    changed = changed || error !== job.error;
+    job.error = error;
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, "currentIndex")) {
+    const currentIndex = normalizeBatchCurrentIndex(patch.currentIndex, job.items.length, job.currentIndex);
+    changed = changed || currentIndex !== job.currentIndex;
+    job.currentIndex = currentIndex;
+  }
+
+  const itemUpdates = Array.isArray(patch.itemUpdates)
+    ? patch.itemUpdates
+    : (patch.item && typeof patch.item === "object" ? [patch.item] : []);
+  for (const itemPatch of itemUpdates) {
+    const index = normalizeBatchCurrentIndex(itemPatch?.index, job.items.length, 0);
+    if (!index || !job.items[index - 1]) {
+      throw new Error("Batch item index was not found.");
+    }
+    const previous = job.items[index - 1];
+    const next = createBatchDownloadJobItem({ ...previous, ...itemPatch }, index, previous);
+    job.items[index - 1] = next;
+    changed = true;
+  }
+
+  if (changed) {
+    job.updatedAt = new Date().toISOString();
+    await persistBatchDownloadJobs();
+  }
+  await synchronizeBatchDownloadJobsWithDirectTasks([job]);
+  return snapshotBatchDownloadJob(job);
+}
+
+function createBatchDownloadJobId() {
+  batchDownloadJobSequence += 1;
+  return `batch-${Date.now().toString(36)}-${batchDownloadJobSequence.toString(36)}`;
+}
+
+function createBatchDownloadJobItem(source, index, previous = null) {
+  const item = source && typeof source === "object" ? source : {};
+  const bvid = normalizeBvid(item.bvid ?? previous?.bvid);
+  const epId = normalizeId(item.epId ?? previous?.epId);
+  const cid = Number(item.cid ?? previous?.cid);
+  if ((!bvid && !epId) || !Number.isFinite(cid) || cid <= 0) {
+    throw new Error(`Batch item ${index} needs a video/episode ID and cid.`);
+  }
+  const mode = normalizeBatchDownloadMode(item.mode ?? previous?.mode);
+  const sourceKind = normalizeBatchDownloadSource(item.source ?? previous?.source, epId);
+  const title = normalizeBatchDisplayText(item.title ?? previous?.title ?? bvid ?? (epId ? `ep${epId}` : ""));
+  const itemId = normalizeBatchDisplayText(item.itemId ?? previous?.itemId ?? `item-${index}`).slice(0, 120) || `item-${index}`;
+  const directTaskId = normalizeBatchDirectTaskId(item.directTaskId ?? previous?.directTaskId);
+  const now = new Date().toISOString();
+  return {
+    index,
+    itemId,
+    bvid,
+    epId,
+    cid: Math.floor(cid),
+    quality: Math.max(Number(item.quality ?? previous?.quality) || 0, 0),
+    title,
+    source: sourceKind,
+    pageIndex: Math.max(Math.floor(Number(item.pageIndex ?? previous?.pageIndex) || index), 1),
+    pageLabel: normalizeBatchDisplayText(item.pageLabel ?? previous?.pageLabel ?? ""),
+    mode,
+    format: normalizeBatchDisplayText(item.format ?? previous?.format ?? "").slice(0, 80),
+    state: normalizeBatchDownloadJobState(item.state ?? previous?.state, "queued"),
+    error: redactDiagnosticText(String(item.error ?? previous?.error ?? "")),
+    directTaskId,
+    attempt: Math.max(Math.floor(Number(item.attempt ?? previous?.attempt) || 0), 0),
+    createdAt: String(previous?.createdAt || now),
+    updatedAt: now
+  };
+}
+
+function normalizeBatchDownloadJobState(value, fallback = "queued") {
+  const state = String(value || "").toLowerCase();
+  return ["queued", "in_progress", "paused", "complete", "interrupted", "canceled"].includes(state)
+    ? state
+    : fallback;
+}
+
+function normalizeBatchDownloadMode(value) {
+  const mode = String(value || "").toLowerCase();
+  return ["durl", "audio", "dash"].includes(mode) ? mode : "";
+}
+
+function normalizeBatchDownloadSource(value, epId) {
+  const source = String(value || "").toLowerCase();
+  if (["video", "bangumi"].includes(source)) {
+    return source;
+  }
+  return epId ? "bangumi" : "video";
+}
+
+function normalizeBatchDirectTaskId(value) {
+  const taskId = String(value || "").trim();
+  return /^direct-[a-z0-9-]+$/i.test(taskId) ? taskId.slice(0, 160) : "";
+}
+
+function normalizeBatchCurrentIndex(value, itemCount, fallback = 0) {
+  const index = Math.floor(Number(value));
+  if (!Number.isInteger(index) || index < 1 || index > Math.max(Number(itemCount) || 0, 0)) {
+    return fallback;
+  }
+  return index;
+}
+
+function normalizeBatchDisplayText(value) {
+  return redactDiagnosticText(String(value || "")).slice(0, 240);
+}
+
+function isBatchDownloadJobTerminal(job) {
+  return ["complete", "interrupted", "canceled"].includes(String(job?.state || ""));
+}
+
+async function restoreBatchDownloadJobs() {
+  if (batchDownloadJobsRestored) {
+    return;
+  }
+  if (batchDownloadJobsRestorePromise) {
+    return batchDownloadJobsRestorePromise;
+  }
+
+  batchDownloadJobsRestorePromise = (async () => {
+    try {
+      await restoreDirectDownloadTasks();
+      const stored = await chrome.storage?.local?.get(BATCH_DOWNLOAD_JOB_STORAGE_KEY);
+      const snapshots = Array.isArray(stored?.[BATCH_DOWNLOAD_JOB_STORAGE_KEY])
+        ? stored[BATCH_DOWNLOAD_JOB_STORAGE_KEY]
+        : [];
+      let changed = false;
+      for (const snapshot of snapshots) {
+        const batchJobId = String(snapshot?.batchJobId || "");
+        if (!batchJobId || batchDownloadJobs.has(batchJobId)) {
+          continue;
+        }
+        const job = restoreBatchDownloadJob(snapshot);
+        batchDownloadJobs.set(job.id, job);
+        changed = changed || JSON.stringify(snapshot) !== JSON.stringify(snapshotBatchDownloadJob(job));
+      }
+      pruneBatchDownloadJobs();
+      changed = (await synchronizeBatchDownloadJobsWithDirectTasks(Array.from(batchDownloadJobs.values()))) || changed;
+      if (changed) {
+        await persistBatchDownloadJobs();
+      }
+    } catch (_error) {
+      // The caller can still create a new batch job if an old snapshot cannot be read.
+    } finally {
+      batchDownloadJobsRestored = true;
+      batchDownloadJobsRestorePromise = null;
+    }
+  })();
+  return batchDownloadJobsRestorePromise;
+}
+
+function restoreBatchDownloadJob(snapshot) {
+  const now = new Date().toISOString();
+  const rawItems = Array.isArray(snapshot?.items) ? snapshot.items.slice(0, BATCH_DOWNLOAD_JOB_ITEM_LIMIT) : [];
+  const items = rawItems.map((item, index) => createBatchDownloadJobItem(item, index + 1));
+  return {
+    id: String(snapshot?.batchJobId || ""),
+    tabId: normalizeTabId(snapshot?.tabId),
+    title: normalizeBatchDisplayText(snapshot?.title || ""),
+    state: normalizeBatchDownloadJobState(snapshot?.state, "queued"),
+    error: redactDiagnosticText(String(snapshot?.error || "")),
+    currentIndex: normalizeBatchCurrentIndex(snapshot?.currentIndex, items.length, items.length ? 1 : 0),
+    createdAt: String(snapshot?.createdAt || now),
+    updatedAt: String(snapshot?.updatedAt || now),
+    items
+  };
+}
+
+async function synchronizeBatchDownloadJobsWithDirectTasks(jobs) {
+  let changed = false;
+  for (const job of jobs) {
+    if (!job || isBatchDownloadJobTerminal(job)) {
+      continue;
+    }
+    let hasInProgress = false;
+    let allComplete = job.items.length > 0;
+    for (const item of job.items) {
+      const task = item.directTaskId ? directDownloadTasks.get(item.directTaskId) : null;
+      if (task) {
+        const state = task.state === "starting"
+          ? "in_progress"
+          : normalizeBatchDownloadJobState(task.state, item.state);
+        const error = redactDiagnosticText(String(task.error || ""));
+        if (item.state !== state || item.error !== error) {
+          item.state = state;
+          item.error = error;
+          item.updatedAt = new Date().toISOString();
+          changed = true;
+        }
+      }
+      hasInProgress = hasInProgress || ["in_progress", "paused", "starting"].includes(item.state);
+      allComplete = allComplete && item.state === "complete";
+    }
+    const nextState = allComplete ? "complete" : (hasInProgress ? "in_progress" : job.state);
+    if (nextState !== job.state) {
+      job.state = nextState;
+      job.updatedAt = new Date().toISOString();
+      changed = true;
+    }
+  }
+  if (changed) {
+    await persistBatchDownloadJobs();
+  }
+  return changed;
+}
+
+function pruneBatchDownloadJobs(preserveJobId = "") {
+  let terminalCount = Array.from(batchDownloadJobs.values())
+    .filter(isBatchDownloadJobTerminal)
+    .length;
+  const removable = Array.from(batchDownloadJobs.values())
+    .filter((job) => job.id !== preserveJobId && isBatchDownloadJobTerminal(job))
+    .sort((left, right) => String(left.updatedAt).localeCompare(String(right.updatedAt)));
+  while (terminalCount > BATCH_DOWNLOAD_JOB_HISTORY_LIMIT && removable.length) {
+    const job = removable.shift();
+    batchDownloadJobs.delete(job.id);
+    terminalCount -= 1;
+  }
+}
+
+function batchDownloadJobSnapshotsForStorage() {
+  const jobs = Array.from(batchDownloadJobs.values());
+  const active = jobs.filter((job) => !isBatchDownloadJobTerminal(job));
+  const terminal = jobs
+    .filter(isBatchDownloadJobTerminal)
+    .sort((left, right) => String(right.updatedAt).localeCompare(String(left.updatedAt)))
+    .slice(0, BATCH_DOWNLOAD_JOB_HISTORY_LIMIT);
+  return [...active, ...terminal]
+    .map((job) => snapshotBatchDownloadJob(job))
+    .sort((left, right) => String(right.updatedAt).localeCompare(String(left.updatedAt)));
+}
+
+async function persistBatchDownloadJobs() {
+  const write = async () => {
+    try {
+      await chrome.storage?.local?.set({
+        [BATCH_DOWNLOAD_JOB_STORAGE_KEY]: batchDownloadJobSnapshotsForStorage()
+      });
+      return true;
+    } catch (_error) {
+      return false;
+    }
+  };
+  const operation = batchDownloadJobsPersistOperation.then(write, write);
+  batchDownloadJobsPersistOperation = operation.catch(() => {});
+  return operation;
+}
+
+function snapshotBatchDownloadJob(job) {
+  return sanitizeForMessage({
+    batchJobId: String(job?.id || job?.batchJobId || ""),
+    tabId: Number(job?.tabId) || 0,
+    title: normalizeBatchDisplayText(job?.title || ""),
+    state: normalizeBatchDownloadJobState(job?.state, "queued"),
+    error: redactDiagnosticText(String(job?.error || "")),
+    currentIndex: normalizeBatchCurrentIndex(job?.currentIndex, job?.items?.length, 0),
+    createdAt: String(job?.createdAt || ""),
+    updatedAt: String(job?.updatedAt || ""),
+    count: Array.isArray(job?.items) ? job.items.length : 0,
+    completedCount: (job?.items || []).filter((item) => item.state === "complete").length,
+    items: (job?.items || []).map((item, index) => ({
+      index: Number(item?.index) || index + 1,
+      itemId: normalizeBatchDisplayText(item?.itemId || `item-${index + 1}`).slice(0, 120),
+      bvid: normalizeBvid(item?.bvid),
+      epId: normalizeId(item?.epId),
+      cid: Number(item?.cid) || 0,
+      quality: Math.max(Number(item?.quality) || 0, 0),
+      title: normalizeBatchDisplayText(item?.title || ""),
+      source: normalizeBatchDownloadSource(item?.source, normalizeId(item?.epId)),
+      pageIndex: Math.max(Number(item?.pageIndex) || index + 1, 1),
+      pageLabel: normalizeBatchDisplayText(item?.pageLabel || ""),
+      mode: normalizeBatchDownloadMode(item?.mode),
+      format: normalizeBatchDisplayText(item?.format || "").slice(0, 80),
+      state: normalizeBatchDownloadJobState(item?.state, "queued"),
+      error: redactDiagnosticText(String(item?.error || "")),
+      directTaskId: normalizeBatchDirectTaskId(item?.directTaskId),
+      attempt: Math.max(Number(item?.attempt) || 0, 0),
+      createdAt: String(item?.createdAt || ""),
+      updatedAt: String(item?.updatedAt || "")
+    }))
+  });
 }
 
 async function prepareDirectDownload(payload) {
@@ -606,7 +3261,7 @@ function prepareDurlSegments({ bvid, epId = null, cid, quality, title, playUrl, 
       candidates: segmentPlan.candidates,
       context: {
         ...context,
-        downloadMethod: "page-blob"
+        downloadMethod: "native-download"
       }
     });
   }
@@ -1161,7 +3816,7 @@ function prepareAudioSegment({ bvid, epId = null, cid, title, playUrl }) {
       format: "audio",
       codecs: audioStream.codecs || "",
       mimeType: audioStream.mimeType || "",
-      downloadMethod: "page-blob"
+      downloadMethod: "native-download"
     }
   };
 
@@ -2002,43 +4657,6 @@ function timestampForFilename(date) {
   ].join("");
 }
 
-async function downloadFileWithDiagnostics({ options, context }) {
-  const diagnostic = createBaseDiagnostic({
-    mediaUrl: options.url,
-    filename: options.filename,
-    context
-  });
-  diagnostic.phase = "probing-dnr";
-  diagnostic.dnr = await testDnrRules(options.url);
-  await setLastDiagnostic(diagnostic);
-
-  try {
-    diagnostic.phase = "starting-download";
-    await setLastDiagnostic(diagnostic);
-    const id = await downloadFile(options);
-    diagnostic.downloadId = id;
-    diagnostic.phase = "download-started";
-    diagnostic.initialItem = pickDownloadItem(await getDownloadItem(id));
-    await setLastDiagnostic(diagnostic);
-
-    const observed = await observeDownload(id, diagnostic);
-    if (observed.item?.state === "interrupted" || observed.delta?.error) {
-      const reason = observed.item?.error || observed.delta?.error?.current || "download interrupted";
-      throw new DownloadDiagnosticError(`Download failed: ${reason}`, diagnostic);
-    }
-
-    return { id, diagnostic };
-  } catch (error) {
-    if (error instanceof DownloadDiagnosticError) {
-      throw error;
-    }
-    diagnostic.phase = "download-error";
-    diagnostic.error = error.message;
-    await setLastDiagnostic(diagnostic);
-    throw new DownloadDiagnosticError(error.message, diagnostic);
-  }
-}
-
 function downloadFile(options) {
   return new Promise((resolve, reject) => {
     chrome.downloads.download(options, (id) => {
@@ -2049,56 +4667,6 @@ function downloadFile(options) {
       }
       resolve(id);
     });
-  });
-}
-
-function observeDownload(id, diagnostic, timeoutMs = 12000) {
-  return new Promise((resolve) => {
-    let settled = false;
-    let timer = null;
-
-    const finish = async (payload) => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      if (timer) {
-        clearTimeout(timer);
-      }
-      chrome.downloads.onChanged.removeListener(listener);
-      await setLastDiagnostic(diagnostic);
-      resolve(payload);
-    };
-
-    const listener = async (delta) => {
-      if (delta.id !== id) {
-        return;
-      }
-
-      const item = await getDownloadItem(id);
-      diagnostic.events.push({
-        at: new Date().toISOString(),
-        delta: pickDownloadDelta(delta),
-        item: pickDownloadItem(item)
-      });
-      diagnostic.latestItem = pickDownloadItem(item);
-
-      if (item?.state === "complete" || item?.state === "interrupted" || delta.error) {
-        diagnostic.phase = item?.state || "download-changed";
-        await finish({ item, delta, timeout: false });
-        return;
-      }
-
-      await setLastDiagnostic(diagnostic);
-    };
-
-    chrome.downloads.onChanged.addListener(listener);
-    timer = setTimeout(async () => {
-      const item = await getDownloadItem(id);
-      diagnostic.phase = "download-observation-timeout";
-      diagnostic.latestItem = pickDownloadItem(item);
-      await finish({ item, delta: null, timeout: true });
-    }, timeoutMs);
   });
 }
 
@@ -2178,7 +4746,20 @@ async function getLastDiagnostic() {
 
   try {
     const stored = await chrome.storage?.local?.get(DIAGNOSTIC_STORAGE_KEY);
-    return stored?.[DIAGNOSTIC_STORAGE_KEY] || null;
+    const diagnostic = sanitizeForMessage(stored?.[DIAGNOSTIC_STORAGE_KEY] || null);
+    if (!diagnostic) {
+      return null;
+    }
+
+    // Older extension versions could persist a signed media URL. Rewrite a
+    // recovered diagnostic through the same boundary before exposing it again.
+    lastDiagnostic = diagnostic;
+    try {
+      await chrome.storage?.local?.set({ [DIAGNOSTIC_STORAGE_KEY]: diagnostic });
+    } catch (_error) {
+      // A failed migration must not hide an otherwise safe diagnostic.
+    }
+    return diagnostic;
   } catch (_error) {
     return null;
   }
@@ -2187,7 +4768,10 @@ async function getLastDiagnostic() {
 function errorResponse(error) {
   return {
     ok: false,
-    error: error.message,
+    // Exceptions from a failed media request can include signed CDN URLs,
+    // credentials, or a local output path. Keep the message useful without
+    // allowing this response path to bypass the diagnostic privacy boundary.
+    error: redactDiagnosticText(String(error?.message || "Unknown error")),
     diagnostic: sanitizeForMessage(error.diagnostic || lastDiagnostic || null)
   };
 }
@@ -2198,23 +4782,181 @@ function sanitizeForMessage(value) {
   }
 
   try {
-    return JSON.parse(JSON.stringify(value));
+    return sanitizeDiagnosticValue(value);
   } catch (_error) {
-    return {
+    return sanitizeDiagnosticValue({
       phase: value.phase || "diagnostic-serialization-error",
       error: value.error || "Diagnostic could not be serialized.",
-      context: sanitizeForMessage(value.context),
-      request: sanitizeForMessage(value.request),
-      latestItem: sanitizeForMessage(value.latestItem)
-    };
+      context: value.context,
+      request: value.request,
+      latestItem: value.latestItem
+    });
   }
 }
 
-class DownloadDiagnosticError extends Error {
-  constructor(message, diagnostic) {
-    super(message);
-    this.name = "DownloadDiagnosticError";
-    this.diagnostic = diagnostic;
+function sanitizeDiagnosticValue(value, seen = new WeakSet(), key = "") {
+  if (value === null || value === undefined) {
+    return value;
+  }
+
+  if (key && isSensitiveDiagnosticField(key)) {
+    return "[Sensitive value redacted]";
+  }
+
+  if (typeof value === "string") {
+    if (key === "filename") {
+      return summarizeDiagnosticFilename(value);
+    }
+    if (isLocalDiagnosticPath(value)) {
+      return isDiagnosticUrlField(key)
+        ? summarizeUrl(value)
+        : summarizeLocalDiagnosticPath(value);
+    }
+    if (isDiagnosticUrlField(key) && looksLikeDiagnosticUrl(value)) {
+      return summarizeUrl(value);
+    }
+    return redactDiagnosticText(value);
+  }
+
+  if (typeof value === "number" || typeof value === "boolean") {
+    return value;
+  }
+
+  if (typeof value === "bigint") {
+    return String(value);
+  }
+
+  if (typeof value !== "object") {
+    return undefined;
+  }
+
+  if (key === "blob" || (typeof Blob !== "undefined" && value instanceof Blob)) {
+    return undefined;
+  }
+
+  if (seen.has(value)) {
+    return "[Circular diagnostic value]";
+  }
+  seen.add(value);
+
+  if (Array.isArray(value)) {
+    return value.map((item) => sanitizeDiagnosticValue(item, seen));
+  }
+
+  const sanitized = {};
+  for (const [childKey, childValue] of Object.entries(value)) {
+    if (childKey === "blob") {
+      continue;
+    }
+
+    const child = sanitizeDiagnosticValue(childValue, seen, childKey);
+    if (child !== undefined) {
+      sanitized[childKey] = child;
+    }
+  }
+  return sanitized;
+}
+
+function isDiagnosticUrlField(key) {
+  return /url|uri|href|origin|referrer|referer|endpoint|redirect|location/i.test(String(key || "")) ||
+    key === "media";
+}
+
+function isSensitiveDiagnosticField(key) {
+  const normalized = String(key || "")
+    .replace(/([a-z])([A-Z])/g, "$1_$2")
+    .toLowerCase();
+  return /token|secret|cookie|authorization|credential|session|password|passwd/.test(normalized) ||
+    /(?:^|[_-])(?:sign(?:ature)?|csrf|(?:api|access)[_-]?key)(?:$|[_-])/.test(normalized);
+}
+
+function looksLikeDiagnosticUrl(value) {
+  return /^(?:(?:https?|wss?):)?\/\//i.test(String(value || "").trim());
+}
+
+function isLocalDiagnosticPath(value) {
+  const text = String(value || "").trim();
+  return /^file:\/\//i.test(text) ||
+    /^[a-z]:[\\/]/i.test(text) ||
+    /^\\\\/.test(text) ||
+    /^\/(?!\/)/.test(text);
+}
+
+function redactDiagnosticText(value) {
+  return redactLocalPathsInText(
+    redactSensitiveValuesInText(
+      redactSignedUrlsInText(value)
+    )
+  );
+}
+
+function redactSensitiveValuesInText(value) {
+  const sensitiveField = "(?:[\\w-]*(?:token|secret|cookie|authorization|credential|session|password|passwd)[\\w-]*|sign(?:ature)?|csrf|(?:api|access)[_-]?key)";
+  const assignmentPattern = new RegExp(
+    `((?:^|[\\s,;{(\\[?&])["']?${sensitiveField}["']?\\s*(?:=|:)\\s*(?:Bearer\\s+)?)` +
+      `(?!\\[Sensitive value redacted\\])(?:"(?:\\\\.|[^"])*"|'(?:\\\\.|[^'])*'|[^\\s,;}&\\])]+)`,
+    "gi"
+  );
+  let redacted = String(value).replace(assignmentPattern, "$1[Sensitive value redacted]");
+  redacted = redacted.replace(
+    /(\b(?:set-)?cookie\s*:\s*)[^\r\n|]*/gi,
+    "$1[Sensitive value redacted]"
+  );
+  return redacted.replace(
+    /(\bBearer\s+)(?!\[Sensitive value redacted\])[A-Za-z0-9._~+\/-]+=*/gi,
+    "$1[Sensitive value redacted]"
+  );
+}
+
+function redactLocalPathsInText(value) {
+  let redacted = String(value);
+  redacted = redacted.replace(/file:\/\/[^\s"'<>`)\]}]+/gi, (match) => summarizeLocalDiagnosticPath(match));
+  redacted = redacted.replace(
+    /(^|[\s"'`([{=,:;])(?:[a-z]:[\\/]|\\\\)[^\s"'<>`)\]}]+/gi,
+    (match, prefix) => `${prefix}${summarizeLocalDiagnosticPath(match.slice(prefix.length))}`
+  );
+  return redacted.replace(
+    /(^|[\s"'`([{=,:;])\/(?!\/)[^\s"'<>`)\]}]+/g,
+    (match, prefix) => `${prefix}${summarizeLocalDiagnosticPath(match.slice(prefix.length))}`
+  );
+}
+
+function summarizeLocalDiagnosticPath(value) {
+  const filename = summarizeDiagnosticFilename(value);
+  return filename ? `[local path ${filename}]` : "[local path redacted]";
+}
+
+function redactSignedUrlsInText(value) {
+  return String(value).replace(/(?:(?:https?|wss?):\/\/|\/\/)[^\s"'<>`]+/gi, (match) => {
+    if (/[?#]\.\.\.$/.test(match)) {
+      return match;
+    }
+    const summary = summarizeUrl(match);
+    const parsed = parseDiagnosticUrl(match);
+    if (!parsed) {
+      return /[?#]/.test(match) ? "[URL redacted]" : match;
+    }
+    if (!parsed?.search && !parsed?.hash) {
+      return match;
+    }
+
+    const suffix = parsed.search ? "?…" : "#…";
+    return summary?.host
+      ? `[URL ${summary.host}${summary.path}${suffix}]`
+      : "[URL redacted]";
+  });
+}
+
+function parseDiagnosticUrl(value) {
+  const text = String(value || "").trim();
+  if (!looksLikeDiagnosticUrl(text)) {
+    return null;
+  }
+
+  try {
+    return new URL(text.startsWith("//") ? `https:${text}` : text);
+  } catch (_error) {
+    return null;
   }
 }
 
@@ -2222,13 +4964,43 @@ function pickDownloadDelta(delta) {
   return {
     id: delta.id,
     state: delta.state || null,
-    error: delta.error || null,
-    danger: delta.danger || null,
-    url: delta.url || null,
-    finalUrl: delta.finalUrl || null,
+    error: sanitizeDiagnosticValue(delta.error, new WeakSet(), "error") || null,
+    danger: sanitizeDiagnosticValue(delta.danger, new WeakSet(), "danger") || null,
+    url: pickDownloadUrlDelta(delta.url),
+    finalUrl: pickDownloadUrlDelta(delta.finalUrl),
     mime: delta.mime || null,
-    filename: delta.filename || null,
+    filename: pickDownloadFilenameDelta(delta.filename),
     totalBytes: delta.totalBytes || null
+  };
+}
+
+function pickDownloadUrlDelta(value) {
+  if (!value) {
+    return null;
+  }
+
+  if (typeof value === "string") {
+    return summarizeUrl(value);
+  }
+
+  return {
+    previous: value.previous ? summarizeUrl(value.previous) : null,
+    current: value.current ? summarizeUrl(value.current) : null
+  };
+}
+
+function pickDownloadFilenameDelta(value) {
+  if (!value) {
+    return null;
+  }
+
+  if (typeof value === "string") {
+    return summarizeDiagnosticFilename(value);
+  }
+
+  return {
+    previous: value.previous ? summarizeDiagnosticFilename(value.previous) : null,
+    current: value.current ? summarizeDiagnosticFilename(value.current) : null
   };
 }
 
@@ -2241,10 +5013,10 @@ function pickDownloadItem(item) {
     id: item.id,
     url: summarizeUrl(item.url),
     finalUrl: summarizeUrl(item.finalUrl),
-    filename: item.filename,
+    filename: summarizeDiagnosticFilename(item.filename),
     mime: item.mime,
     state: item.state,
-    error: item.error,
+    error: redactDiagnosticText(String(item.error || "")),
     danger: item.danger,
     fileSize: item.fileSize,
     totalBytes: item.totalBytes,
@@ -2273,17 +5045,48 @@ function summarizeUrl(value) {
     return "";
   }
 
-  try {
-    const url = new URL(value);
+  if (isLocalDiagnosticPath(value)) {
+    return {
+      host: "",
+      path: "[local path redacted]",
+      searchLength: 0,
+      sample: summarizeLocalDiagnosticPath(value)
+    };
+  }
+
+  const url = parseDiagnosticUrl(value);
+  if (url) {
     return {
       host: url.host,
       path: url.pathname.slice(0, 180),
       searchLength: url.search.length,
       sample: `${url.origin}${url.pathname}${url.search ? "?..." : ""}`
     };
-  } catch (_error) {
-    return String(value).slice(0, 240);
   }
+
+  return {
+    host: "",
+    path: "",
+    searchLength: 0,
+    sample: "[unparseable URL]"
+  };
+}
+
+function summarizeDiagnosticFilename(value) {
+  const source = String(value || "").trim();
+  let normalized = source.replace(/\\/g, "/");
+  if (/^file:\/\//i.test(source)) {
+    try {
+      const url = new URL(source);
+      normalized = url.protocol === "file:" ? url.pathname.replace(/\\/g, "/") : normalized;
+    } catch (_error) {
+      normalized = source.replace(/^file:\/\/(?:localhost)?/i, "").replace(/\\/g, "/");
+    }
+  }
+  if (!/^(?:[a-z]:\/|\/)/i.test(normalized)) {
+    return normalized.slice(0, 240);
+  }
+  return normalized.split("/").filter(Boolean).pop()?.slice(0, 180) || "";
 }
 
 function isMediaHost(value) {
@@ -2292,7 +5095,8 @@ function isMediaHost(value) {
     return (
       host.endsWith("bilivideo.com") ||
       host.endsWith("bilivideo.cn") ||
-      host.endsWith("hdslb.com")
+      host.endsWith("hdslb.com") ||
+      host.endsWith("edge.mountaintoys.cn")
     );
   } catch (_error) {
     return false;

@@ -53,6 +53,58 @@
         </div>
       </section>
 
+      <section id="task-center" class="task-center" aria-label="&#19979;&#36733;&#20219;&#21153;">
+        <div class="task-center-head">
+          <span>&#20219;&#21153;&#20013;&#24515;</span>
+          <button id="task-center-refresh" type="button">&#21047;&#26032;</button>
+        </div>
+        <p id="task-center-note" class="task-center-note">&#27491;&#22312;&#35835;&#21462;&#24403;&#21069;&#39029;&#38754;&#30340;&#20219;&#21153;...</p>
+        <div id="task-list" class="task-list" aria-live="polite"></div>
+      </section>
+
+      <details class="safety-settings">
+        <summary>&#20869;&#23384;&#19982;&#24405;&#21046;&#20445;&#25252;</summary>
+        <p class="safety-note">DASH &#38656;&#21516;&#26102;&#32531;&#23384;&#35270;&#39057;&#12289;&#38899;&#39057;&#21644; MP4&#65307;&#36229;&#36807;&#19978;&#38480;&#20250;&#20572;&#27490;&#65292;&#19981;&#20445;&#23384;&#19981;&#23436;&#25972;&#25991;&#20214;&#12290;</p>
+        <div class="safety-grid">
+          <label>DASH &#25991;&#20214;&#19978;&#38480; (MB)
+            <input id="dash-max-file-mb" type="number" min="16" max="4096" step="1" inputmode="numeric">
+          </label>
+          <label>DASH &#20869;&#23384;&#39044;&#31639; (MB)
+            <input id="dash-max-memory-mb" type="number" min="128" max="8192" step="1" inputmode="numeric">
+          </label>
+          <label>&#30452;&#25773;&#26368;&#38271;&#24405;&#21046; (&#20998;&#38047;)
+            <input id="live-max-duration-minutes" type="number" min="1" max="720" step="1" inputmode="numeric">
+          </label>
+          <label>&#30452;&#25773;&#25991;&#20214;&#19978;&#38480; (MB)
+            <input id="live-max-file-mb" type="number" min="16" max="4096" step="1" inputmode="numeric">
+          </label>
+          <label>&#30452;&#25773;&#20869;&#23384;&#39044;&#31639; (MB)
+            <input id="live-max-memory-mb" type="number" min="32" max="8192" step="1" inputmode="numeric">
+          </label>
+        </div>
+        <p id="safety-settings-summary" class="safety-note"></p>
+        <button id="safety-save" class="safety-save" type="button">&#20445;&#23384;&#20445;&#25252;&#35774;&#32622;</button>
+      </details>
+
+      <details class="companion-settings">
+        <summary>&#26412;&#22320;&#27969;&#24335;&#21161;&#25163;&#65288;&#21487;&#36873;&#65289;</summary>
+        <p class="companion-note">&#20165;&#22788;&#29702;&#25171;&#24320;&#24403;&#21069;&#24080;&#21495;&#24050;&#33021;&#25773;&#25918;&#30340;&#27969;&#65307;&#21161;&#25163;&#19981;&#20250;&#35835;&#21462; Cookie&#12289;&#27983;&#35272;&#22120;&#37197;&#32622;&#25110;&#30003;&#35831;&#26032;&#30340;&#25773;&#25918;&#26435;&#38480;&#12290;</p>
+        <div class="companion-status-row">
+          <span id="companion-status" class="companion-status" data-state="unknown">&#23578;&#26410;&#26816;&#27979;</span>
+          <button id="companion-check" type="button">&#26816;&#27979;&#21161;&#25163;</button>
+        </div>
+        <label class="companion-option">
+          <input id="companion-prefer-dash" type="checkbox">
+          <span>&#20248;&#20808;&#29992;&#21161;&#25163;&#19979;&#36733;&#21333;&#20010; DASH&#65288;&#27983;&#35272;&#22120;&#20869;&#23384;&#19978;&#38480;&#30340;&#20219;&#21153;&#20250;&#33258;&#21160;&#23581;&#35797;&#65289;</span>
+        </label>
+        <label class="companion-option">
+          <input id="companion-prefer-live" type="checkbox">
+          <span>&#24405;&#21046;&#30452;&#25773;&#26102;&#20351;&#29992;&#21161;&#25163;&#20998;&#27573;&#33853;&#30424;</span>
+        </label>
+        <button id="companion-save" class="companion-save" type="button">&#20445;&#23384;&#21161;&#25163;&#20559;&#22909;</button>
+        <p class="companion-note">&#40664;&#35748;&#36755;&#20986;&#21040; Videos\BiliDownload&#65292;&#21407;&#22987;&#27969;&#30424;&#39044;&#31639;&#20026; 128 GiB&#65307;DASH &#21512;&#24182;&#36824;&#38656;&#35201;&#39069;&#22806;&#30340;&#31354;&#38388;&#12290;&#38656;&#20808;&#25353;&#39033;&#30446; README &#26500;&#24314;&#24182;&#27880;&#20876;&#26412;&#22320;&#21161;&#25163;&#12290;&#26410;&#23433;&#35013;&#26102;&#20250;&#32487;&#32493;&#20351;&#29992;&#27983;&#35272;&#22120;&#30340;&#23433;&#20840;&#19978;&#38480;&#12290;</p>
+      </details>
+
       <button id="download" class="primary" type="button">&#19979;&#36733;</button>
       <button id="download-audio" class="secondary" type="button">&#19979;&#36733;&#38899;&#39057;</button>
       <button id="live-record" class="primary" type="button" hidden>&#24320;&#22987;&#24405;&#21046;</button>

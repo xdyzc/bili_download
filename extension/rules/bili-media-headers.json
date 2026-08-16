@@ -20,12 +20,8 @@
     "condition": {
       "urlFilter": "||bilivideo.com/",
       "resourceTypes": [
-        "main_frame",
-        "sub_frame",
         "xmlhttprequest",
         "media",
-        "image",
-        "object",
         "other"
       ]
     }
@@ -51,12 +47,8 @@
     "condition": {
       "urlFilter": "||bilivideo.cn/",
       "resourceTypes": [
-        "main_frame",
-        "sub_frame",
         "xmlhttprequest",
         "media",
-        "image",
-        "object",
         "other"
       ]
     }
@@ -82,12 +74,8 @@
     "condition": {
       "urlFilter": "||hdslb.com/",
       "resourceTypes": [
-        "main_frame",
-        "sub_frame",
         "xmlhttprequest",
         "media",
-        "image",
-        "object",
         "other"
       ]
     }
@@ -113,12 +101,8 @@
     "condition": {
       "urlFilter": "||edge.mountaintoys.cn/",
       "resourceTypes": [
-        "main_frame",
-        "sub_frame",
         "xmlhttprequest",
         "media",
-        "image",
-        "object",
         "other"
       ]
     }

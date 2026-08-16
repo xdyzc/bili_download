@@ -27,13 +27,13 @@
     }
   ],
   "permissions": [
-    "activeTab",
     "declarativeNetRequest",
     "declarativeNetRequestFeedback",
     "scripting",
     "sidePanel",
     "storage",
-    "downloads"
+    "downloads",
+    "nativeMessaging"
   ],
   "declarative_net_request": {
     "rule_resources": [

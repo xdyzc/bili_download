@@ -179,15 +179,6 @@ test("popup contains MVP controls", async () => {
     "download-controls",
     "pause",
     "cancel",
-    "dash-max-file-mb",
-    "dash-max-memory-mb",
-    "live-max-duration-minutes",
-    "live-max-file-mb",
-    "live-max-memory-mb",
-    "safety-preset-description",
-    "safety-advanced",
-    "safety-settings-summary",
-    "safety-save",
     "companion-status",
     "companion-check",
     "companion-prefer-dash",
@@ -205,13 +196,12 @@ test("popup keeps advanced controls in a secondary settings view", async () => {
   const mainStart = html.indexOf('id="main-view"');
   const settingsStart = html.indexOf('id="settings-view"');
   const taskCenterStart = html.indexOf('id="task-center"');
-  const safetyStart = html.indexOf('class="safety-settings settings-section"');
   const companionStart = html.indexOf('class="companion-settings settings-section"');
   assert.ok(mainStart > 0);
   assert.ok(settingsStart > mainStart);
   assert.ok(taskCenterStart > settingsStart);
-  assert.ok(safetyStart > settingsStart);
   assert.ok(companionStart > settingsStart);
+  assert.equal(html.includes("下载保护"), false);
 
   const elements = {
     "#main-view": { hidden: false },
@@ -266,23 +256,8 @@ test("popup keeps advanced controls in a secondary settings view", async () => {
 });
 
 
-test("popup maps friendly download protection presets to safety limits", async () => {
+test("popup calculates download capacity from device memory and known video size", async () => {
   const code = await readFile("extension/src/popup.js", "utf8");
-  const description = textElement();
-  const summary = textElement();
-  const advanced = { open: false };
-  const numberInputs = {
-    "#dash-max-file-mb": textElement(),
-    "#dash-max-memory-mb": textElement(),
-    "#live-max-duration-minutes": textElement(),
-    "#live-max-file-mb": textElement(),
-    "#live-max-memory-mb": textElement()
-  };
-  const presetInputs = ["standard", "memory", "large", "custom"].map((value) => ({
-    value,
-    checked: value === "standard",
-    addEventListener() {}
-  }));
   const elements = {
     "#main-view": { hidden: false },
     "#settings-view": { hidden: true },
@@ -290,12 +265,9 @@ test("popup maps friendly download protection presets to safety limits", async (
     "#settings-open": buttonElement(),
     "#settings-back": buttonElement(),
     "#status": textElement(),
-    "#quality": selectElement(),
-    "#safety-preset-description": description,
-    "#safety-advanced": advanced,
-    "#safety-settings-summary": summary,
-    ...numberInputs
+    "#quality": selectElement()
   };
+  const testNavigator = { deviceMemory: 2 };
   const sandbox = {
     Array,
     Date,
@@ -310,13 +282,11 @@ test("popup maps friendly download protection presets to safety limits", async (
     URL,
     clearTimeout,
     setTimeout,
+    navigator: testNavigator,
     document: {
       addEventListener() {},
       querySelector(selector) {
         return elements[selector];
-      },
-      querySelectorAll(selector) {
-        return selector === 'input[name="safety-preset"]' ? presetInputs : [];
       }
     },
     chrome: {
@@ -330,21 +300,22 @@ test("popup maps friendly download protection presets to safety limits", async (
 
   vm.createContext(sandbox);
   vm.runInContext(code, sandbox);
-  sandbox.applySafetyPreset("memory");
-  assert.equal(numberInputs["#dash-max-file-mb"].value, "256");
-  assert.equal(numberInputs["#dash-max-memory-mb"].value, "768");
-  assert.equal(numberInputs["#live-max-duration-minutes"].value, "60");
-  assert.equal(presetInputs.find((input) => input.value === "memory").checked, true);
-  assert.match(description.textContent, /省内存/);
+  const lowMemoryDash = sandbox.getDashSafetyLimits();
+  const lowMemoryLive = sandbox.getLiveSafetyLimits();
+  testNavigator.deviceMemory = 16;
+  const highMemoryDash = sandbox.getDashSafetyLimits();
+  const highMemoryLive = sandbox.getLiveSafetyLimits();
+  assert.ok(highMemoryDash.maxInputBytes > lowMemoryDash.maxInputBytes);
+  assert.ok(highMemoryLive.maxBytes > lowMemoryLive.maxBytes);
 
-  numberInputs["#dash-max-file-mb"].value = "300";
-  sandbox.renderSafetySettingsSummary();
-  assert.equal(presetInputs.find((input) => input.value === "custom").checked, true);
-  assert.match(description.textContent, /自定义/);
-  assert.match(summary.textContent, /自动停止/);
-
-  sandbox.applySafetyPreset("custom");
-  assert.equal(advanced.open, true);
+  const smallVideo = {
+    segments: [{ size: lowMemoryDash.maxInputBytes - 1024 }]
+  };
+  const largeVideo = {
+    segments: [{ size: highMemoryDash.maxInputBytes }, { size: 1024 }]
+  };
+  assert.equal(sandbox.dashRequiresStreamingCompanion(smallVideo), false);
+  assert.equal(sandbox.dashRequiresStreamingCompanion(largeVideo), true);
 });
 
 
@@ -5102,7 +5073,7 @@ test("popup muxes DASH segments into one MP4 download", async () => {
 });
 
 
-test("popup blocks oversized DASH media before buffering it in memory", async () => {
+test("popup explains how to download oversized DASH media when enhanced download is unavailable", async () => {
   const code = await readFile("extension/src/popup.js", "utf8");
   const elements = {
     "#status": textElement(),
@@ -5141,6 +5112,7 @@ test("popup blocks oversized DASH media before buffering it in memory", async ()
     String,
     URL,
     console,
+    navigator: { deviceMemory: 0.25 },
     setTimeout,
     document: {
       addEventListener() {},
@@ -5160,6 +5132,12 @@ test("popup blocks oversized DASH media before buffering it in memory", async ()
               addListener() {}
             }
           };
+        },
+        async sendMessage(message) {
+          if (message.type === "BILI_DOWNLOAD_COMPANION_PING") {
+            return { ok: false, error: "companion unavailable" };
+          }
+          throw new Error(`unexpected runtime message: ${message.type}`);
         }
       },
       tabs: {
@@ -5171,20 +5149,15 @@ test("popup blocks oversized DASH media before buffering it in memory", async ()
 
   vm.createContext(sandbox);
   vm.runInContext(code, sandbox);
-  vm.runInContext(`state.safetySettings = {
-    dashMaxFileMb: 16,
-    dashMaxMemoryMb: 128,
-    liveMaxDurationMinutes: 120,
-    liveMaxFileMb: 1024
-  };`, sandbox);
 
-  const oversized = 17 * 1024 * 1024;
+  const oversized = sandbox.getDashSafetyLimits().maxInputBytes + 1;
   await assert.rejects(
-    sandbox.downloadDashAsMp4({
+    sandbox.downloadPreparedPayload({
+      mode: "dash",
       count: 2,
       segments: [{ size: oversized }, { size: 1024 }]
     }),
-    /下载保护/
+    /安装增强下载.*较低清晰度/
   );
   assert.equal(fetchCalls, 0);
 });
@@ -5244,6 +5217,7 @@ test("popup records a live FLV stream until the user stops it", async () => {
     },
     console,
     navigator: {
+      deviceMemory: 4,
       clipboard: {
         async writeText() {}
       }
@@ -5511,27 +5485,15 @@ test("popup records a live FLV stream until the user stops it", async () => {
   assert.equal(savedAnchors.length, savedCountBeforeImmediateStop);
   assert.match(statusElement.textContent, /未保存文件/);
 
-  vm.runInContext(`state.safetySettings = {
-    dashMaxFileMb: 512,
-    dashMaxMemoryMb: 1536,
-    liveMaxDurationMinutes: 120,
-    liveMaxFileMb: 1024,
-    liveMaxMemoryMb: 32
-  };`, sandbox);
-  livePacket = new Uint8Array(17 * 1024 * 1024);
+  vm.runInContext("navigator.deviceMemory = 0.25", sandbox);
+  livePacket = new Uint8Array(sandbox.getLiveSafetyLimits().maxBytes + 1);
   const savedCountBeforeLimit = savedAnchors.length;
   await sandbox.startLiveRecording();
 
   assert.equal(savedAnchors.length, savedCountBeforeLimit);
-  assert.match(statusElement.textContent, /安全上限/);
+  assert.match(statusElement.textContent, /自动停止/);
 
-  vm.runInContext(`state.safetySettings = {
-    dashMaxFileMb: 512,
-    dashMaxMemoryMb: 1536,
-    liveMaxDurationMinutes: 1,
-    liveMaxFileMb: 1024,
-    liveMaxMemoryMb: 1536
-  };`, sandbox);
+  vm.runInContext("navigator.deviceMemory = 4", sandbox);
   blockFirstLivePacket = true;
   pendingRead = null;
   const savedCountBeforeDurationLimit = savedAnchors.length;
@@ -5544,7 +5506,7 @@ test("popup records a live FLV stream until the user stops it", async () => {
   await durationLimited;
 
   assert.equal(savedAnchors.length, savedCountBeforeDurationLimit);
-  assert.match(statusElement.textContent, /安全上限/);
+  assert.match(statusElement.textContent, /自动停止/);
 
   liveCandidates = [{
     url: "https://live-primary.bilivideo.com/live/test.flv?token=1",
@@ -5569,12 +5531,12 @@ test("popup records a live FLV stream until the user stops it", async () => {
   }
   assert.deepEqual(liveFetchUrls.slice(-2), liveCandidates.map((candidate) => candidate.url));
   assert.equal(typeof liveLimitTimer, "function");
-  assert.equal(liveLimitDelay, 5000);
+  assert.equal(liveLimitDelay, sandbox.getLiveSafetyLimits().maxDurationMs - (55 * 1000));
   liveLimitTimer();
   await candidateDeadline;
 
   assert.equal(savedAnchors.length, savedCountBeforeCandidateDeadline);
-  assert.match(statusElement.textContent, /安全上限/);
+  assert.match(statusElement.textContent, /自动停止/);
   abortLiveReadWithNetworkError = false;
 });
 
@@ -6184,7 +6146,7 @@ test("background reconciles native tasks, routes progress by tab, and persists s
 });
 
 
-test("popup uses the explicitly enabled companion for DASH and live without retaining signed sources", async () => {
+test("popup automatically uses the companion for oversized DASH and explicitly enabled live recording", async () => {
   const code = await readFile("extension/src/popup.js", "utf8");
   const runtimeMessages = [];
   const statusElement = textElement();
@@ -6205,7 +6167,7 @@ test("popup uses the explicitly enabled companion for DASH and live without reta
     String,
     URL,
     console,
-    navigator: { clipboard: { async writeText() {} } },
+    navigator: { deviceMemory: 0.25, clipboard: { async writeText() {} } },
     setTimeout,
     clearTimeout,
     document: {
@@ -6279,7 +6241,7 @@ test("popup uses the explicitly enabled companion for DASH and live without reta
   vm.runInContext(code, sandbox);
   vm.runInContext(`
     state.tabId = 71;
-    state.companionSettings = { preferDash: true, preferLive: true };
+    state.companionSettings = { preferDash: false, preferLive: true };
     state.live = {
       roomId: "100",
       title: "Popup Live",
@@ -6289,6 +6251,7 @@ test("popup uses the explicitly enabled companion for DASH and live without reta
     state.page = { type: "live", roomId: "100", title: "Popup Live", url: "https://live.bilibili.com/100" };
   `, sandbox);
 
+  const automaticDashLimit = sandbox.getDashSafetyLimits().maxInputBytes;
   const dashPrepared = {
     mode: "dash",
     count: 2,
@@ -6296,13 +6259,13 @@ test("popup uses the explicitly enabled companion for DASH and live without reta
       {
         url: "https://video.example.hdslb.com/video.m4s?token=popup-dash-secret",
         candidates: [{ url: "https://video.example.hdslb.com/video.m4s?token=popup-dash-secret" }],
-        size: 123,
+        size: automaticDashLimit,
         context: { role: "video", title: "Popup Dash" }
       },
       {
         url: "https://audio.example.hdslb.com/audio.m4s?token=popup-dash-secret",
         candidates: [{ url: "https://audio.example.hdslb.com/audio.m4s?token=popup-dash-secret" }],
-        size: 45,
+        size: 1,
         context: { role: "audio", title: "Popup Dash" }
       }
     ]

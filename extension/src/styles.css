@@ -418,51 +418,6 @@ select:disabled {
   color: #a3382d;
 }
 
-.safety-settings {
-  margin-top: 12px;
-  padding: 10px 12px 12px;
-  background: var(--panel);
-  border: 1px solid var(--line);
-  border-radius: 8px;
-}
-
-.safety-settings summary {
-  color: var(--text);
-  cursor: pointer;
-  font-size: 12px;
-  font-weight: 600;
-}
-
-.safety-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px;
-  margin-top: 10px;
-}
-
-.safety-grid label {
-  display: grid;
-  gap: 4px;
-}
-
-.safety-grid input {
-  height: 32px;
-  padding: 0 8px;
-  font-size: 12px;
-}
-
-.safety-note {
-  margin-top: 8px;
-  font-size: 12px;
-}
-
-.safety-save {
-  width: 100%;
-  height: 32px;
-  margin-top: 8px;
-  font-size: 12px;
-}
-
 .companion-settings {
   margin-top: 12px;
   padding: 10px 12px 12px;
@@ -645,13 +600,11 @@ select:disabled {
 
 .settings-section,
 .settings-view .task-center,
-.settings-view .safety-settings,
 .settings-view .companion-settings {
   margin-top: 0;
 }
 
 .settings-view .task-center,
-.settings-view .safety-settings,
 .settings-view .companion-settings,
 .settings-view .diagnostic-settings {
   padding: 12px 0 14px;
@@ -674,93 +627,6 @@ select:disabled {
   font-size: 14px;
   line-height: 1.35;
   letter-spacing: 0;
-}
-
-.safety-presets {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  margin-top: 10px;
-}
-
-.safety-presets label {
-  position: relative;
-  color: var(--text);
-  cursor: pointer;
-}
-
-.safety-presets input {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  opacity: 0;
-}
-
-.safety-presets span {
-  display: grid;
-  min-height: 36px;
-  padding: 0 7px;
-  place-items: center;
-  background: var(--panel);
-  border: 1px solid var(--line);
-  border-right: 0;
-  font-size: 12px;
-  text-align: center;
-}
-
-.safety-presets label:first-child span {
-  border-radius: 6px 0 0 6px;
-}
-
-.safety-presets label:last-child span {
-  border-right: 1px solid var(--line);
-  border-radius: 0 6px 6px 0;
-}
-
-.safety-presets input:checked + span {
-  position: relative;
-  background: #fff0f5;
-  border-color: var(--accent);
-  color: #a92f5a;
-  font-weight: 600;
-}
-
-.safety-presets input:disabled + span {
-  color: #a7a7a0;
-  cursor: default;
-}
-
-.safety-presets input:focus-visible + span {
-  outline: 3px solid var(--focus);
-  outline-offset: 1px;
-  z-index: 1;
-}
-
-.advanced-settings {
-  margin-top: 10px;
-  padding-top: 8px;
-  border-top: 1px solid var(--line);
-}
-
-.settings-view .advanced-settings > summary {
-  min-height: 22px;
-  color: var(--muted);
-  font-size: 12px;
-  line-height: 22px;
-}
-
-.advanced-group {
-  margin-top: 12px;
-}
-
-.advanced-group h3 {
-  margin: 0 0 7px;
-  font-size: 12px;
-  font-weight: 600;
-  letter-spacing: 0;
-}
-
-.advanced-group .safety-grid {
-  margin-top: 0;
 }
 
 .section-heading {
@@ -808,27 +674,8 @@ select:disabled {
   }
 
   .primary-actions,
-  .safety-grid,
   .diagnostic-settings {
     grid-template-columns: 1fr;
-  }
-
-  .safety-presets {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
-  .safety-presets label:nth-child(2) span {
-    border-right: 1px solid var(--line);
-    border-radius: 0 6px 6px 0;
-  }
-
-  .safety-presets label:nth-child(3) span {
-    border-top: 0;
-    border-radius: 6px 0 0 6px;
-  }
-
-  .safety-presets label:nth-child(4) span {
-    border-top: 0;
   }
 
   .diagnostic-settings .secondary {

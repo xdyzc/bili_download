@@ -39,50 +39,21 @@ const PARALLEL_RANGE_MIN_BYTES = 8 * 1024 * 1024;
 const PARALLEL_RANGE_CHUNK_BYTES = 4 * 1024 * 1024;
 const PARALLEL_RANGE_CONCURRENCY = 4;
 const MEBIBYTE = 1024 * 1024;
-const SAFETY_SETTINGS_STORAGE_KEY = "downloadSafetySettings";
+const GIBIBYTE = 1024 * MEBIBYTE;
 const COMPANION_SETTINGS_STORAGE_KEY = "streamCompanionSettings";
 const DIRECT_TASK_REFRESH_INTERVAL_MS = 2500;
 const BATCH_TASK_REFRESH_INTERVAL_MS = 4000;
 const COMPANION_TASK_REFRESH_INTERVAL_MS = 2500;
 const DASH_MUX_MEMORY_MULTIPLIER = 3;
 const LIVE_RECORDING_MEMORY_MULTIPLIER = 3;
-const SAFETY_SETTINGS_DEFAULTS = Object.freeze({
-  dashMaxFileMb: 512,
-  dashMaxMemoryMb: 1536,
-  liveMaxDurationMinutes: 120,
-  liveMaxFileMb: 1024,
-  liveMaxMemoryMb: 1536
-});
-const SAFETY_SETTINGS_BOUNDS = Object.freeze({
-  dashMaxFileMb: { min: 16, max: 4096 },
-  dashMaxMemoryMb: { min: 128, max: 8192 },
-  liveMaxDurationMinutes: { min: 1, max: 720 },
-  liveMaxFileMb: { min: 16, max: 4096 },
-  liveMaxMemoryMb: { min: 32, max: 8192 }
-});
-const SAFETY_SETTINGS_PRESETS = Object.freeze({
-  standard: Object.freeze({ ...SAFETY_SETTINGS_DEFAULTS }),
-  memory: Object.freeze({
-    dashMaxFileMb: 256,
-    dashMaxMemoryMb: 768,
-    liveMaxDurationMinutes: 60,
-    liveMaxFileMb: 512,
-    liveMaxMemoryMb: 768
-  }),
-  large: Object.freeze({
-    dashMaxFileMb: 2048,
-    dashMaxMemoryMb: 6144,
-    liveMaxDurationMinutes: 240,
-    liveMaxFileMb: 2048,
-    liveMaxMemoryMb: 6144
-  })
-});
-const SAFETY_PRESET_DESCRIPTIONS = Object.freeze({
-  standard: "推荐：适合大多数视频和直播录制。",
-  memory: "省内存：适合内存较小的电脑，超大视频可能需要降低清晰度。",
-  large: "大文件：适合 4K 或较长视频，会占用更多内存和磁盘空间。",
-  custom: "自定义：使用高级设置中的限制。"
-});
+const DEVICE_MEMORY_FALLBACK_GIB = 4;
+const DEVICE_MEMORY_MIN_GIB = 0.25;
+const DEVICE_MEMORY_MAX_GIB = 32;
+const BROWSER_MEMORY_BUDGET_RATIO = 0.35;
+const BROWSER_MEMORY_BUDGET_MIN_BYTES = 64 * MEBIBYTE;
+const BROWSER_MEMORY_BUDGET_MAX_BYTES = 6 * GIBIBYTE;
+const LIVE_RECORDING_MAX_DURATION_MS = 6 * 60 * 60 * 1000;
+const DASH_BROWSER_CAPACITY_MESSAGE = "这个视频较大，浏览器无法安全合并。请安装增强下载，或选择较低清晰度。";
 const COMPANION_SETTINGS_DEFAULTS = Object.freeze({
   preferDash: false,
   preferLive: false
@@ -133,8 +104,7 @@ const state = {
   activeView: "main",
   refreshGeneration: 0,
   pagePickerOpen: false,
-  selectedPageCids: null,
-  safetySettings: normalizeSafetySettings(SAFETY_SETTINGS_DEFAULTS)
+  selectedPageCids: null
 };
 
 const mainView = document.querySelector("#main-view");
@@ -167,16 +137,6 @@ const progressSpeed = document.querySelector("#progress-speed");
 const downloadControls = document.querySelector("#download-controls");
 const pauseButton = document.querySelector("#pause");
 const cancelButton = document.querySelector("#cancel");
-const dashMaxFileInput = document.querySelector("#dash-max-file-mb");
-const dashMaxMemoryInput = document.querySelector("#dash-max-memory-mb");
-const liveMaxDurationInput = document.querySelector("#live-max-duration-minutes");
-const liveMaxFileInput = document.querySelector("#live-max-file-mb");
-const liveMaxMemoryInput = document.querySelector("#live-max-memory-mb");
-const safetyPresetInputs = Array.from(document.querySelectorAll?.("input[name=\"safety-preset\"]") || []);
-const safetyPresetDescription = document.querySelector("#safety-preset-description");
-const safetyAdvancedSettings = document.querySelector("#safety-advanced");
-const safetySettingsSummary = document.querySelector("#safety-settings-summary");
-const safetySaveButton = document.querySelector("#safety-save");
 const companionStatusElement = document.querySelector("#companion-status");
 const companionCheckButton = document.querySelector("#companion-check");
 const companionPreferDashInput = document.querySelector("#companion-prefer-dash");
@@ -205,7 +165,6 @@ qualitySelect.addEventListener?.("change", () => {
 });
 pauseButton?.addEventListener("click", togglePauseDownload);
 cancelButton?.addEventListener("click", cancelDownload);
-safetySaveButton?.addEventListener("click", saveSafetySettings);
 companionCheckButton?.addEventListener("click", () => {
   checkStreamingCompanion({ userInitiated: true }).catch(() => {});
 });
@@ -213,16 +172,6 @@ companionSaveButton?.addEventListener("click", saveCompanionSettings);
 taskCenterRefreshButton?.addEventListener("click", () => {
   refreshTaskCenter({ resumeBatch: false }).catch(() => {});
 });
-for (const input of safetyPresetInputs) {
-  input.addEventListener?.("change", () => {
-    if (input.checked) {
-      applySafetyPreset(input.value);
-    }
-  });
-}
-for (const input of [dashMaxFileInput, dashMaxMemoryInput, liveMaxDurationInput, liveMaxFileInput, liveMaxMemoryInput]) {
-  input?.addEventListener("input", renderSafetySettingsSummary);
-}
 const progressPort = chrome.runtime.connect({ name: PROGRESS_PORT_NAME });
 progressPort.onMessage.addListener((message) => {
   if (message?.type !== PROGRESS_MESSAGE_TYPE) {
@@ -263,7 +212,7 @@ chrome.tabs?.onUpdated?.addListener((tabId, changeInfo) => {
 
 async function initialize() {
   renderActiveView();
-  await Promise.all([loadSafetySettings(), loadCompanionSettings()]);
+  await loadCompanionSettings();
   await refreshFromActiveTab({ force: true });
 }
 
@@ -296,30 +245,6 @@ function renderActiveView() {
   }
   if (viewTitleElement) {
     viewTitleElement.textContent = showSettings ? "任务与设置" : "Bili Download";
-  }
-}
-
-async function loadSafetySettings() {
-  let stored = null;
-  try {
-    stored = await chrome.storage?.local?.get(SAFETY_SETTINGS_STORAGE_KEY);
-  } catch (_error) {
-    // Keep the conservative defaults when extension storage is unavailable.
-  }
-  state.safetySettings = normalizeSafetySettings(stored?.[SAFETY_SETTINGS_STORAGE_KEY]);
-  renderSafetySettings();
-}
-
-async function saveSafetySettings() {
-  state.safetySettings = normalizeSafetySettings(readSafetySettingsInputs());
-  renderSafetySettings();
-  try {
-    await chrome.storage?.local?.set({
-      [SAFETY_SETTINGS_STORAGE_KEY]: state.safetySettings
-    });
-    setStatus("已保存下载保护设置");
-  } catch (_error) {
-    setStatus("保护设置已生效，但未能保存到浏览器");
   }
 }
 
@@ -425,124 +350,41 @@ async function ensureStreamingCompanionAvailable() {
     : checkStreamingCompanion();
 }
 
-function normalizeSafetySettings(value) {
-  const source = value || {};
-  return Object.fromEntries(Object.entries(SAFETY_SETTINGS_DEFAULTS).map(([key, fallback]) => {
-    const bounds = SAFETY_SETTINGS_BOUNDS[key];
-    const numeric = Number(source[key]);
-    const normalized = Number.isFinite(numeric)
-      ? Math.min(Math.max(Math.round(numeric), bounds.min), bounds.max)
-      : fallback;
-    return [key, normalized];
-  }));
+function getDeviceMemoryGiB() {
+  const reported = typeof navigator !== "undefined"
+    ? Number(navigator.deviceMemory)
+    : 0;
+  const memoryGiB = Number.isFinite(reported) && reported > 0
+    ? reported
+    : DEVICE_MEMORY_FALLBACK_GIB;
+  return Math.min(Math.max(memoryGiB, DEVICE_MEMORY_MIN_GIB), DEVICE_MEMORY_MAX_GIB);
 }
 
-function readSafetySettingsInputs() {
+function getBrowserMemoryBudgetBytes() {
+  const estimated = Math.floor(getDeviceMemoryGiB() * GIBIBYTE * BROWSER_MEMORY_BUDGET_RATIO);
+  return Math.min(
+    Math.max(estimated, BROWSER_MEMORY_BUDGET_MIN_BYTES),
+    BROWSER_MEMORY_BUDGET_MAX_BYTES
+  );
+}
+
+function getDashSafetyLimits() {
+  const maxMemoryBytes = getBrowserMemoryBudgetBytes();
+  const maxInputBytes = Math.floor(maxMemoryBytes / DASH_MUX_MEMORY_MULTIPLIER);
   return {
-    dashMaxFileMb: dashMaxFileInput?.value,
-    dashMaxMemoryMb: dashMaxMemoryInput?.value,
-    liveMaxDurationMinutes: liveMaxDurationInput?.value,
-    liveMaxFileMb: liveMaxFileInput?.value,
-    liveMaxMemoryMb: liveMaxMemoryInput?.value
+    maxMemoryBytes,
+    maxInputBytes
   };
 }
 
-function renderSafetySettings() {
-  const settings = state.safetySettings;
-  writeSafetySettingsInputs(settings);
-  syncSafetyPresetSelection(settings);
-  renderSafetySettingsSummary();
-}
-
-function writeSafetySettingsInputs(settings) {
-  if (dashMaxFileInput) {
-    dashMaxFileInput.value = String(settings.dashMaxFileMb);
-  }
-  if (dashMaxMemoryInput) {
-    dashMaxMemoryInput.value = String(settings.dashMaxMemoryMb);
-  }
-  if (liveMaxDurationInput) {
-    liveMaxDurationInput.value = String(settings.liveMaxDurationMinutes);
-  }
-  if (liveMaxFileInput) {
-    liveMaxFileInput.value = String(settings.liveMaxFileMb);
-  }
-  if (liveMaxMemoryInput) {
-    liveMaxMemoryInput.value = String(settings.liveMaxMemoryMb);
-  }
-}
-
-function applySafetyPreset(presetId) {
-  if (presetId === "custom") {
-    if (safetyAdvancedSettings) {
-      safetyAdvancedSettings.open = true;
-    }
-    renderSafetyPresetDescription("custom");
-    return;
-  }
-  const preset = SAFETY_SETTINGS_PRESETS[presetId];
-  if (!preset) {
-    return;
-  }
-  writeSafetySettingsInputs(preset);
-  syncSafetyPresetSelection(preset);
-  renderSafetySettingsSummary();
-}
-
-function syncSafetyPresetSelection(settings) {
-  const presetId = matchingSafetyPreset(settings);
-  for (const input of safetyPresetInputs) {
-    input.checked = input.value === presetId;
-  }
-  renderSafetyPresetDescription(presetId);
-  return presetId;
-}
-
-function matchingSafetyPreset(settings) {
-  const normalized = normalizeSafetySettings(settings);
-  for (const [presetId, preset] of Object.entries(SAFETY_SETTINGS_PRESETS)) {
-    if (Object.keys(SAFETY_SETTINGS_DEFAULTS).every((key) => normalized[key] === preset[key])) {
-      return presetId;
-    }
-  }
-  return "custom";
-}
-
-function renderSafetyPresetDescription(presetId) {
-  if (safetyPresetDescription) {
-    safetyPresetDescription.textContent = SAFETY_PRESET_DESCRIPTIONS[presetId] || SAFETY_PRESET_DESCRIPTIONS.custom;
-  }
-}
-
-function renderSafetySettingsSummary() {
-  if (!safetySettingsSummary) {
-    return;
-  }
-  const settings = normalizeSafetySettings(readSafetySettingsInputs());
-  syncSafetyPresetSelection(settings);
-  safetySettingsSummary.textContent = "达到限制时会自动停止，避免浏览器占用过多内存。";
-}
-
-function getDashSafetyLimits(settings = state.safetySettings) {
-  const normalized = normalizeSafetySettings(settings);
-  const maxFileBytes = normalized.dashMaxFileMb * MEBIBYTE;
-  const maxMemoryBytes = normalized.dashMaxMemoryMb * MEBIBYTE;
+function getLiveSafetyLimits() {
+  const maxMemoryBytes = getBrowserMemoryBudgetBytes();
+  const maxBytes = Math.floor(maxMemoryBytes / LIVE_RECORDING_MEMORY_MULTIPLIER);
   return {
-    maxFileBytes,
     maxMemoryBytes,
-    maxInputBytes: Math.min(maxFileBytes, Math.floor(maxMemoryBytes / DASH_MUX_MEMORY_MULTIPLIER))
-  };
-}
-
-function getLiveSafetyLimits(settings = state.safetySettings) {
-  const normalized = normalizeSafetySettings(settings);
-  const maxFileBytes = normalized.liveMaxFileMb * MEBIBYTE;
-  const maxMemoryBytes = normalized.liveMaxMemoryMb * MEBIBYTE;
-  return {
-    maxFileBytes,
-    maxMemoryBytes,
-    maxBytes: Math.min(maxFileBytes, Math.floor(maxMemoryBytes / LIVE_RECORDING_MEMORY_MULTIPLIER)),
-    maxDurationMs: normalized.liveMaxDurationMinutes * 60 * 1000
+    maxFileBytes: maxBytes,
+    maxBytes,
+    maxDurationMs: LIVE_RECORDING_MAX_DURATION_MS
   };
 }
 
@@ -554,15 +396,21 @@ function knownSegmentSize(segment) {
   return normalizeMediaLimitBytes(readCandidates(segment)[0]?.size);
 }
 
+function knownDashInputBytes(prepared) {
+  return (prepared?.segments || []).reduce((total, segment) => (
+    total + knownSegmentSize(segment)
+  ), 0);
+}
+
+function dashRequiresStreamingCompanion(prepared) {
+  const expectedInputBytes = knownDashInputBytes(prepared);
+  return expectedInputBytes > 0 && expectedInputBytes > getDashSafetyLimits().maxInputBytes;
+}
+
 function assertDashInputWithinSafetyLimits(inputBytes, safety, phase) {
   const bytes = normalizeMediaLimitBytes(inputBytes);
   if (!bytes) {
     return;
-  }
-  if (bytes > safety.maxFileBytes) {
-    throw createMediaSafetyLimitError(
-      `当前视频为 ${formatBytes(bytes)}，超过下载保护允许的单个视频大小 ${formatBytes(safety.maxFileBytes)}；未开始合并。请降低清晰度，或在“下载保护”的高级设置中调高上限。`
-    );
   }
   if (bytes > safety.maxInputBytes) {
     throw dashSafetyLimitError(safety, bytes, phase);
@@ -573,13 +421,8 @@ function dashSafetyLimitError(safety, bytes, phase) {
   return createMediaSafetyLimitError(dashSafetyLimitMessage(safety, bytes, phase));
 }
 
-function dashSafetyLimitMessage(safety, bytes = 0, phase = "下载") {
-  const memoryBound = safety.maxInputBytes < safety.maxFileBytes;
-  const limitLabel = memoryBound
-    ? `视频合并内存 ${formatBytes(safety.maxMemoryBytes)}`
-    : `单个视频上限 ${formatBytes(safety.maxFileBytes)}`;
-  const measured = normalizeMediaLimitBytes(bytes);
-  return `视频${phase}${measured ? `媒体为 ${formatBytes(measured)}，` : ""}超过${limitLabel}允许的大小；已停止且未保存该文件。请降低清晰度，或在“下载保护”的高级设置中调高上限。`;
+function dashSafetyLimitMessage() {
+  return DASH_BROWSER_CAPACITY_MESSAGE;
 }
 
 function normalizeMediaLimitBytes(value) {
@@ -603,12 +446,12 @@ function liveRecordingResultStatus(diagnostic, fallbackFilename = "") {
   const savedToDisk = saved.savedToDisk === true && Number(saved.size) > 0;
   if (!savedToDisk) {
     return saved.stopReason === "duration" || saved.stopReason === "size"
-      ? "已达到直播录制安全上限，但尚未接收到直播数据，未保存文件"
+      ? "为避免浏览器内存不足，录制已自动停止；尚未接收到直播数据，未保存文件"
       : "已停止直播录制，未保存文件（尚未接收到直播数据）";
   }
   const filename = filenameForPageDownload(saved.filename || fallbackFilename);
   if (saved.stopReason === "duration" || saved.stopReason === "size") {
-    return `已达到直播录制安全上限，已自动停止并保存已录制部分: ${filename}`;
+    return `为避免浏览器内存不足，录制已自动停止并保存已录制部分: ${filename}`;
   }
   return `${TEXT.liveRecorded}: ${filename}`;
 }
@@ -1370,10 +1213,18 @@ async function downloadPreparedPayload(prepared, statusText = TEXT.downloading, 
 }
 
 async function shouldUseStreamingCompanionForDash(prepared) {
-  if (!state.companionSettings.preferDash) {
+  const requiresCompanion = dashRequiresStreamingCompanion(prepared);
+  if (!state.companionSettings.preferDash && !requiresCompanion) {
     return false;
   }
-  return ensureStreamingCompanionAvailable();
+  const available = await ensureStreamingCompanionAvailable();
+  if (requiresCompanion && !available) {
+    throw createMediaSafetyLimitError(DASH_BROWSER_CAPACITY_MESSAGE);
+  }
+  if (requiresCompanion) {
+    setStatus("视频较大，正在使用增强下载...");
+  }
+  return available;
 }
 
 async function downloadPreparedCompanionPayload(prepared, options = {}) {
@@ -2574,9 +2425,7 @@ async function cancelBatchJob(jobId) {
 
 async function downloadDashAsMp4(prepared) {
   const safety = getDashSafetyLimits();
-  const expectedInputBytes = prepared.segments.reduce((total, segment) => (
-    total + knownSegmentSize(segment)
-  ), 0);
+  const expectedInputBytes = knownDashInputBytes(prepared);
   assertDashInputWithinSafetyLimits(expectedInputBytes, safety, "预计");
 
   const downloads = [];
@@ -2625,9 +2474,6 @@ async function downloadDashAsMp4(prepared) {
       audioBlob: audio.blob,
       outputName: dashOutputFilename(prepared)
     });
-    if (merged?.blob?.size > safety.maxFileBytes) {
-      throw new Error(`合并后的视频为 ${formatBytes(merged.blob.size)}，超过下载保护允许的单个视频大小 ${formatBytes(safety.maxFileBytes)}；未保存文件。请降低清晰度，或在“下载保护”的高级设置中调高上限。`);
-    }
     await waitForDownloadControl();
     throwIfDownloadCanceled();
     const downloadFilename = filenameForPageDownload(merged.filename);
@@ -4728,24 +4574,6 @@ function updateControls() {
       !hasVideoId ||
       !hasMultiplePages ||
       !hasSelectedPages;
-  }
-  const safetyLocked = Boolean(state.downloadControl);
-  for (const input of [
-    ...safetyPresetInputs,
-    dashMaxFileInput,
-    dashMaxMemoryInput,
-    liveMaxDurationInput,
-    liveMaxFileInput,
-    liveMaxMemoryInput
-  ]) {
-    if (input) {
-      input.disabled = safetyLocked;
-      input.title = safetyLocked ? "下载或录制进行中；保护设置仅可在下一项任务开始前调整。" : "";
-    }
-  }
-  if (safetySaveButton) {
-    safetySaveButton.disabled = safetyLocked;
-    safetySaveButton.title = safetyLocked ? "下载或录制进行中；保护设置仅可在下一项任务开始前调整。" : "";
   }
   updatePageSelectionAction();
   diagnosticButton.disabled = state.busy || !state.lastDiagnostic;

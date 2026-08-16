@@ -2299,6 +2299,7 @@ function describeCompanionLivePreparation(prepared) {
   }
 
   const title = normalizeCompanionTitle(live.title || context.title, `live_${roomKey}`);
+  const siteOutputName = String(segment?.filename || "").split(/[\\/]/).at(-1) || "";
   return {
     kind: "live",
     metadata: {
@@ -2311,7 +2312,9 @@ function describeCompanionLivePreparation(prepared) {
       source: "live",
       format: "flv"
     },
-    outputName: companionOutputName(title, "live", quality),
+    outputName: site === "bilibili"
+      ? companionOutputName(title, "live", quality)
+      : normalizeCompanionOutputName(siteOutputName, "live", title, quality),
     liveSources: readCompanionSourceUrls(segment, site),
     totalBytes: 0,
     videoExpectedBytes: 0,

@@ -2197,6 +2197,10 @@ test("multi-site live registry loads and prepares Douyu and Huya recordings", as
   });
   assert.equal(preparedDouyu.live.site, "douyu");
   assert.match(preparedDouyu.segments[0].filename, /^BiliDownload\/斗鱼_Fixture Anchor_Fixture Douyu Room_\d{8}_\d{6}\.flv$/);
+  assert.match(
+    sandbox.describeCompanionLivePreparation(preparedDouyu).outputName,
+    /^斗鱼_Fixture Anchor_Fixture Douyu Room_\d{8}_\d{6}\.flv$/
+  );
 
   sandbox.location.origin = "https://www.huya.com";
   sandbox.location.href = "https://www.huya.com/fixture-anchor";
@@ -2219,6 +2223,10 @@ test("multi-site live registry loads and prepares Douyu and Huya recordings", as
   assert.equal(preparedHuya.live.site, "huya");
   assert.equal(preparedHuya.segments[0].candidates.length, 3);
   assert.match(preparedHuya.segments[0].filename, /^BiliDownload\/虎牙_Fixture Anchor_Fixture Huya Room_\d{8}_\d{6}\.flv$/);
+  assert.match(
+    sandbox.describeCompanionLivePreparation(preparedHuya).outputName,
+    /^虎牙_Fixture Anchor_Fixture Huya Room_\d{8}_\d{6}\.flv$/
+  );
   await assert.rejects(
     sandbox.prepareLiveRecording({
       site: "huya",

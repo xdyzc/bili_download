@@ -11,6 +11,12 @@ from bili_download.video_id import BiliVideoRef
 
 
 class FakeResponse(BytesIO):
+    def __init__(self, value: bytes, *, content_length: int | None = None) -> None:
+        super().__init__(value)
+        self.headers = {}
+        if content_length is not None:
+            self.headers["Content-Length"] = str(content_length)
+
     def __enter__(self):
         return self
 
@@ -72,7 +78,7 @@ def test_downloader_writes_segments_to_file(tmp_path) -> None:
     result = downloader.download("BV1xx411c7mD", output_dir=tmp_path)
 
     assert result.path.read_bytes() == b"hello world"
-    assert result.path.name == "Test Video.mp4"
+    assert result.path.name == "Test Video_BV1xx411c7mD.mp4"
     assert result.bytes_written == 11
     assert result.segments == 2
 
@@ -220,3 +226,117 @@ def test_downloader_rejects_dash_only_response(tmp_path) -> None:
 
     with pytest.raises(UnsupportedStreamError):
         downloader.download("BV1xx411c7mD", output_dir=tmp_path)
+
+
+def test_downloader_retries_backup_after_truncated_response(tmp_path) -> None:
+    play_url = PlayUrl(
+        quality=16,
+        format="mp4",
+        accept_quality=(16,),
+        accept_description=("360P",),
+        segments=(
+            StreamSegment(
+                url="https://example.test/short.mp4",
+                backup_urls=("https://example.test/complete.mp4",),
+                size=5,
+            ),
+        ),
+    )
+
+    class RetryClient(FakeClient):
+        def open_stream(self, urls, *, referer: str):
+            url = tuple(urls)[0]
+            return FakeResponse(b"bad" if "short" in url else b"hello")
+
+    result = BiliDownloader(client=RetryClient(play_url)).download(
+        "BV1xx411c7mD",
+        output_dir=tmp_path,
+    )
+
+    assert result.path.read_bytes() == b"hello"
+    assert result.bytes_written == 5
+
+
+def test_downloader_does_not_publish_when_all_sources_are_truncated(tmp_path) -> None:
+    play_url = PlayUrl(
+        quality=16,
+        format="mp4",
+        accept_quality=(16,),
+        accept_description=("360P",),
+        segments=(StreamSegment(url="https://example.test/short.mp4", size=5),),
+    )
+
+    class ShortClient(FakeClient):
+        def open_stream(self, urls, *, referer: str):
+            return FakeResponse(b"bad")
+
+    with pytest.raises(downloader_module.DownloadIntegrityError, match="all media sources failed"):
+        BiliDownloader(client=ShortClient(play_url)).download(
+            "BV1xx411c7mD",
+            output_dir=tmp_path,
+        )
+
+    assert not (tmp_path / "Test Video_BV1xx411c7mD.mp4").exists()
+
+
+def test_dash_merge_failure_preserves_existing_output(monkeypatch, tmp_path) -> None:
+    play_url = PlayUrl(
+        quality=80,
+        format="dash",
+        accept_quality=(80,),
+        accept_description=("1080P",),
+        segments=(),
+        dash_videos=(DashMedia(id=80, url="https://example.test/video.m4s"),),
+        dash_audios=(DashMedia(id=30280, url="https://example.test/audio.m4s"),),
+    )
+    output = tmp_path / "existing.mp4"
+    output.write_bytes(b"old-media")
+
+    def fail_merge(*args, **kwargs):
+        raise UnsupportedStreamError("merge failed")
+
+    monkeypatch.setattr(downloader_module, "_merge_with_ffmpeg", fail_merge)
+
+    with pytest.raises(UnsupportedStreamError, match="merge failed"):
+        BiliDownloader(client=FakeClient(play_url)).download(
+            "BV1xx411c7mD",
+            output_file=output,
+            overwrite=True,
+        )
+
+    assert output.read_bytes() == b"old-media"
+
+
+def test_staging_paths_are_unique_and_windows_device_names_are_safe(tmp_path) -> None:
+    output = tmp_path / "video.mp4"
+    first = downloader_module._new_staging_path(output, suffix=".part")
+    second = downloader_module._new_staging_path(output, suffix=".part")
+    try:
+        assert first != second
+        assert downloader_module._safe_filename("CON") == "_CON"
+        assert downloader_module._safe_filename("Lpt9.txt") == "_Lpt9.txt"
+    finally:
+        first.unlink(missing_ok=True)
+        second.unlink(missing_ok=True)
+
+
+def test_ffmpeg_merge_stages_before_atomic_replace(monkeypatch, tmp_path) -> None:
+    video = tmp_path / "video.part"
+    audio = tmp_path / "audio.part"
+    output = tmp_path / "output.mp4"
+    video.write_bytes(b"video")
+    audio.write_bytes(b"audio")
+    output.write_bytes(b"old")
+    monkeypatch.setattr(downloader_module, "_find_ffmpeg", lambda: "ffmpeg")
+
+    def fake_run(command, **kwargs):
+        staging = downloader_module.Path(command[-1])
+        assert staging != output
+        staging.write_bytes(b"new")
+        return type("Completed", (), {"returncode": 0, "stderr": b""})()
+
+    monkeypatch.setattr(downloader_module.subprocess, "run", fake_run)
+
+    downloader_module._merge_with_ffmpeg(video, audio, output, overwrite=True)
+
+    assert output.read_bytes() == b"new"

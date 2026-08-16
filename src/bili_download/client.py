@@ -7,8 +7,8 @@ import gzip
 import zlib
 from typing import Any, Iterable
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
-from urllib.request import Request, build_opener
+from urllib.parse import urlencode, urlparse
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .models import DashMedia, LoginStatus, PlayUrl, StreamSegment, VideoInfo, VideoPage
 from .video_id import BiliVideoRef
@@ -20,6 +20,8 @@ DEFAULT_USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/125.0 Safari/537.36"
 )
+MEDIA_CDN_SUFFIXES = ("bilivideo.com", "bilivideo.cn")
+SENSITIVE_REDIRECT_HEADERS = ("Cookie", "Authorization", "Proxy-Authorization")
 
 
 class BiliApiError(RuntimeError):
@@ -30,16 +32,32 @@ class BiliNetworkError(RuntimeError):
     """Raised when a request cannot be completed."""
 
 
+class SafeMediaRedirectHandler(HTTPRedirectHandler):
+    """Reject non-CDN redirects and strip credentials from media requests."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _validate_media_url(newurl)
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected is not None:
+            for header in SENSITIVE_REDIRECT_HEADERS:
+                redirected.remove_header(header)
+        return redirected
+
+
 class BiliClient:
     def __init__(
         self,
         *,
         timeout: int = 20,
         opener: Any | None = None,
+        media_opener: Any | None = None,
         cookie_header: str = "",
     ) -> None:
         self.timeout = timeout
         self._opener = opener or build_opener()
+        self._media_opener = media_opener or (
+            opener if opener is not None else build_opener(SafeMediaRedirectHandler())
+        )
         self._cookie_header = cookie_header
 
     def get_login_status(self) -> LoginStatus:
@@ -63,25 +81,37 @@ class BiliClient:
         )
         payload = self._get_json("/x/web-interface/view", params)
         data = _expect_data(payload)
-        pages = tuple(
-            VideoPage(
-                index=int(page["page"]),
-                cid=int(page["cid"]),
-                title=str(page.get("part") or f"P{page['page']}"),
-                duration=_optional_int(page.get("duration")),
+        raw_pages = data.get("pages")
+        if not isinstance(raw_pages, list):
+            raise BiliApiError("video metadata did not include a pages array")
+        pages: list[VideoPage] = []
+        for raw_page in raw_pages:
+            if not isinstance(raw_page, dict):
+                raise BiliApiError("video metadata included an invalid page")
+            index = _required_int(raw_page.get("page"), "video page number")
+            pages.append(
+                VideoPage(
+                    index=index,
+                    cid=_required_int(raw_page.get("cid"), "video page cid"),
+                    title=str(raw_page.get("part") or f"P{index}"),
+                    duration=_optional_int(raw_page.get("duration")),
+                )
             )
-            for page in data.get("pages", [])
-        )
         if not pages:
             raise BiliApiError("video metadata did not include any pages")
 
         owner = data.get("owner") or {}
+        if not isinstance(owner, dict):
+            owner = {}
+        bvid = data.get("bvid")
+        if not isinstance(bvid, str) or not bvid:
+            raise BiliApiError("video metadata did not include a valid bvid")
         return VideoInfo(
-            bvid=str(data["bvid"]),
-            aid=int(data["aid"]),
-            title=str(data.get("title") or data["bvid"]),
+            bvid=bvid,
+            aid=_required_int(data.get("aid"), "video aid"),
+            title=str(data.get("title") or bvid),
             owner_name=str(owner.get("name") or ""),
-            pages=pages,
+            pages=tuple(pages),
         )
 
     def get_play_url(
@@ -107,6 +137,8 @@ class BiliClient:
         )
         data = _expect_data(payload)
         durl = data.get("durl") or []
+        if not isinstance(durl, list):
+            raise BiliApiError("play-url response included an invalid durl array")
         segments = tuple(
             StreamSegment(
                 url=str(segment["url"]),
@@ -114,9 +146,17 @@ class BiliClient:
                 size=_optional_int(segment.get("size")),
             )
             for segment in durl
-            if segment.get("url")
+            if isinstance(segment, dict) and segment.get("url")
         )
         dash_data = data.get("dash") or {}
+        if not isinstance(dash_data, dict):
+            raise BiliApiError("play-url response included an invalid dash object")
+        dash_videos = dash_data.get("video") or ()
+        dash_audios = dash_data.get("audio") or ()
+        if not isinstance(dash_videos, (list, tuple)) or not isinstance(
+            dash_audios, (list, tuple)
+        ):
+            raise BiliApiError("play-url response included invalid DASH streams")
         return PlayUrl(
             quality=_optional_int(data.get("quality")),
             format=str(data.get("format") or ""),
@@ -127,13 +167,15 @@ class BiliClient:
             segments=segments,
             dash_videos=tuple(
                 _parse_dash_media(item)
-                for item in dash_data.get("video") or ()
-                if item.get("base_url") or item.get("baseUrl")
+                for item in dash_videos
+                if isinstance(item, dict)
+                and (item.get("base_url") or item.get("baseUrl"))
             ),
             dash_audios=tuple(
                 _parse_dash_media(item)
-                for item in dash_data.get("audio") or ()
-                if item.get("base_url") or item.get("baseUrl")
+                for item in dash_audios
+                if isinstance(item, dict)
+                and (item.get("base_url") or item.get("baseUrl"))
             ),
         )
 
@@ -162,13 +204,18 @@ class BiliClient:
     def open_stream(self, urls: Iterable[str], *, referer: str):
         last_error: Exception | None = None
         for url in urls:
-            request = Request(
-                url,
-                headers=_download_headers(referer, cookie_header=self._cookie_header),
-            )
             try:
-                return self._opener.open(request, timeout=self.timeout)
-            except (HTTPError, URLError) as exc:
+                _validate_media_url(url)
+                request = Request(url, headers=_download_headers(referer))
+                response = self._media_opener.open(request, timeout=self.timeout)
+                final_url = response.geturl() if hasattr(response, "geturl") else url
+                try:
+                    _validate_media_url(final_url)
+                except BiliNetworkError:
+                    response.close()
+                    raise
+                return response
+            except (HTTPError, URLError, BiliNetworkError) as exc:
                 last_error = exc
 
         raise BiliNetworkError(f"could not open media stream: {last_error}")
@@ -196,11 +243,16 @@ class BiliClient:
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise BiliApiError("Bilibili returned invalid JSON") from exc
 
+        if not isinstance(payload, dict):
+            raise BiliApiError("Bilibili returned a non-object JSON response")
         return payload
 
 
 def _expect_data(payload: dict[str, Any]) -> dict[str, Any]:
-    code = int(payload.get("code", -1))
+    try:
+        code = int(payload.get("code", -1))
+    except (TypeError, ValueError) as exc:
+        raise BiliApiError("Bilibili response included an invalid status code") from exc
     if code != 0:
         message = payload.get("message") or payload.get("msg") or "unknown error"
         raise BiliApiError(f"Bilibili API error {code}: {message}")
@@ -214,6 +266,13 @@ def _expect_data(payload: dict[str, Any]) -> dict[str, Any]:
 def _optional_int(value: Any) -> int | None:
     if value is None or value == "":
         return None
+
+
+def _required_int(value: Any, label: str) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise BiliApiError(f"Bilibili response did not include a valid {label}") from exc
     try:
         return int(value)
     except (TypeError, ValueError):
@@ -254,16 +313,34 @@ def _json_headers(referer: str, *, cookie_header: str = "") -> dict[str, str]:
     return headers
 
 
-def _download_headers(referer: str, *, cookie_header: str = "") -> dict[str, str]:
-    headers = {
+def _download_headers(referer: str) -> dict[str, str]:
+    return {
         "Accept": "*/*",
         "Origin": "https://www.bilibili.com",
         "Referer": referer,
         "User-Agent": DEFAULT_USER_AGENT,
     }
-    if cookie_header:
-        headers["Cookie"] = cookie_header
-    return headers
+
+
+def _validate_media_url(url: str) -> None:
+    try:
+        parsed = urlparse(str(url))
+        port = parsed.port
+    except ValueError as exc:
+        raise BiliNetworkError("media URL is invalid") from exc
+    hostname = (parsed.hostname or "").rstrip(".").lower()
+    if parsed.scheme.lower() != "https" or not hostname or parsed.username or parsed.password:
+        raise BiliNetworkError("media URL must be an authenticated-free HTTPS CDN URL")
+    if port not in (None, 443):
+        raise BiliNetworkError("media URL used a disallowed port")
+    allowed = any(
+        hostname == suffix or hostname.endswith(f".{suffix}")
+        for suffix in MEDIA_CDN_SUFFIXES
+    )
+    if hostname.startswith("upos-") and hostname.endswith(".akamaized.net"):
+        allowed = True
+    if not allowed:
+        raise BiliNetworkError("media URL host is not an allowed Bilibili CDN")
 
 
 def _xml_headers(referer: str, *, cookie_header: str = "") -> dict[str, str]:

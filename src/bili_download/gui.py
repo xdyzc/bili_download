@@ -309,7 +309,7 @@ class DownloadApp:
                     video,
                     output_dir=output_dir,
                     quality=quality,
-                    overwrite=True,
+                    overwrite=False,
                     danmaku=danmaku,
                     progress_callback=on_progress,
                 )

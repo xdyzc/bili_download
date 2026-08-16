@@ -267,7 +267,7 @@ def test_interactive_mode_downloads_with_user_input(monkeypatch, capsys, tmp_pat
             assert output_dir == tmp_path / "downloads"
             assert quality == 80
             assert progress is True
-            assert overwrite is True
+            assert overwrite is False
             assert danmaku is False
             return DownloadResult(
                 path=tmp_path / "downloads" / "Test Video.mp4",

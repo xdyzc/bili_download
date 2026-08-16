@@ -5,12 +5,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import re
 import time
 from typing import Any
 
 
 class CookieLoadError(RuntimeError):
     """Raised when a cookie file cannot be parsed."""
+
+
+COOKIE_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 
 @dataclass(frozen=True)
@@ -49,8 +53,8 @@ def _cookies_from_browser_json(items: list[Any]) -> str:
         if not isinstance(item, dict):
             continue
 
-        domain = str(item.get("domain") or "")
-        if "bilibili.com" not in domain:
+        domain = str(item.get("domain") or "").strip().lstrip(".").rstrip(".").lower()
+        if domain != "bilibili.com" and not domain.endswith(".bilibili.com"):
             continue
 
         expires = item.get("expirationDate")
@@ -63,7 +67,7 @@ def _cookies_from_browser_json(items: list[Any]) -> str:
 
         name = item.get("name")
         value = item.get("value")
-        if not name or value is None:
+        if not _is_valid_cookie_pair(name, value):
             continue
         pairs.append(f"{name}={value}")
 
@@ -73,8 +77,19 @@ def _cookies_from_browser_json(items: list[Any]) -> str:
 def _cookies_from_mapping(mapping: dict[str, Any]) -> str:
     pairs = []
     for name, value in mapping.items():
-        if value is None:
+        if not _is_valid_cookie_pair(name, value):
             continue
         pairs.append(f"{name}={value}")
     return "; ".join(pairs)
+
+
+def _is_valid_cookie_pair(name: Any, value: Any) -> bool:
+    if not isinstance(name, str) or not name or value is None:
+        return False
+    text_value = str(value)
+    if COOKIE_CONTROL_RE.search(name) or COOKIE_CONTROL_RE.search(text_value):
+        return False
+    if any(character in name for character in ";=, \t") or ";" in text_value:
+        return False
+    return True
 

@@ -8,7 +8,7 @@ import sys
 
 from .client import BiliApiError, BiliClient, BiliNetworkError
 from .cookies import CookieLoadError, load_cookie_file
-from .downloader import BiliDownloader, UnsupportedStreamError
+from .downloader import BiliDownloader, DownloadIntegrityError, UnsupportedStreamError
 from .video_id import parse_bili_video_ref
 
 
@@ -39,7 +39,7 @@ def main(argv: list[str] | None = None) -> int:
         "-o",
         "--output",
         type=Path,
-        help="output file path; defaults to downloads/<video-title>.<ext>",
+        help="output file path; defaults to downloads/<video-title>_<BV>.<ext>",
     )
     download_parser.add_argument(
         "--output-dir",
@@ -103,6 +103,7 @@ def main(argv: list[str] | None = None) -> int:
         BiliApiError,
         BiliNetworkError,
         CookieLoadError,
+        DownloadIntegrityError,
         UnsupportedStreamError,
     ) as exc:
         print(f"error: {exc}")
@@ -275,7 +276,6 @@ def _interactive() -> int:
         video,
         "--output-dir",
         str(download_dir),
-        "--overwrite",
         "--progress",
     ]
     if quality:

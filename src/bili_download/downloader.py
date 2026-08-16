@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import replace
+import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
-from typing import Callable
+from typing import Callable, Iterator
 
-from .client import BiliClient
+from .client import BiliClient, BiliNetworkError
 from .danmaku import parse_danmaku_xml, write_ass
 from .models import DashMedia, DownloadResult, PlayUrl, StreamSegment, VideoInfo, VideoPage
 from .video_id import parse_bili_video_ref
@@ -23,6 +26,10 @@ ProgressCallback = Callable[[str, int, int | None, bool], None]
 
 class UnsupportedStreamError(RuntimeError):
     """Raised when the first downloader version cannot handle a stream."""
+
+
+class DownloadIntegrityError(RuntimeError):
+    """Raised when a media response cannot be published as a complete file."""
 
 
 class BiliDownloader:
@@ -70,32 +77,24 @@ class BiliDownloader:
             )
 
         path.parent.mkdir(parents=True, exist_ok=True)
-        if path.exists() and not overwrite:
-            raise FileExistsError(f"output file already exists: {path}")
-
-        part_path = path.with_name(f"{path.name}.part")
-        if part_path.exists():
-            part_path.unlink()
-
-        referer = f"https://www.bilibili.com/video/{video.bvid}/"
-        total = sum(segment.size or 0 for segment in play_url.segments) or None
-        bytes_written = 0
-        with part_path.open("wb") as destination:
-            for segment in play_url.segments:
-                bytes_written += self._write_stream(
-                    segment,
-                    referer=referer,
-                    destination=destination,
-                    label="video",
-                    total=total,
-                    initial=bytes_written,
-                    progress=progress,
-                    progress_callback=progress_callback,
-                )
-
-        if path.exists() and overwrite:
-            path.unlink()
-        part_path.replace(path)
+        with _reserve_output(path, overwrite=overwrite):
+            part_path = _new_staging_path(path, suffix=".part")
+            referer = f"https://www.bilibili.com/video/{video.bvid}/"
+            total = sum(segment.size or 0 for segment in play_url.segments) or None
+            bytes_written = 0
+            with part_path.open("wb") as destination:
+                for segment in play_url.segments:
+                    bytes_written += self._write_stream(
+                        segment,
+                        referer=referer,
+                        destination=destination,
+                        label="video",
+                        total=total,
+                        initial=bytes_written,
+                        progress=progress,
+                        progress_callback=progress_callback,
+                    )
+            os.replace(part_path, path)
 
         result = DownloadResult(
             path=path,
@@ -134,45 +133,39 @@ class BiliDownloader:
 
         path = path.with_suffix(".mp4")
         path.parent.mkdir(parents=True, exist_ok=True)
-        if path.exists() and not overwrite:
-            raise FileExistsError(f"output file already exists: {path}")
+        with _reserve_output(path, overwrite=overwrite):
+            video_part = _new_staging_path(path, suffix=".video.part")
+            audio_part = _new_staging_path(path, suffix=".audio.part")
+            referer = f"https://www.bilibili.com/video/{video.bvid}/"
+            bytes_written = 0
+            with video_part.open("wb") as destination:
+                bytes_written += self._write_stream(
+                    video_stream,
+                    referer=referer,
+                    destination=destination,
+                    label=f"video qn={video_stream.id}",
+                    total=video_stream.size,
+                    progress=progress,
+                    progress_callback=progress_callback,
+                )
+            with audio_part.open("wb") as destination:
+                bytes_written += self._write_stream(
+                    audio_stream,
+                    referer=referer,
+                    destination=destination,
+                    label="audio",
+                    total=audio_stream.size,
+                    progress=progress,
+                    progress_callback=progress_callback,
+                )
 
-        video_part = path.with_name(f"{path.name}.video.part")
-        audio_part = path.with_name(f"{path.name}.audio.part")
-        for temp_path in (video_part, audio_part):
-            if temp_path.exists():
-                temp_path.unlink()
-
-        referer = f"https://www.bilibili.com/video/{video.bvid}/"
-        bytes_written = 0
-        with video_part.open("wb") as destination:
-            bytes_written += self._write_stream(
-                video_stream,
-                referer=referer,
-                destination=destination,
-                label=f"video qn={video_stream.id}",
-                total=video_stream.size,
-                progress=progress,
-                progress_callback=progress_callback,
-            )
-        with audio_part.open("wb") as destination:
-            bytes_written += self._write_stream(
-                audio_stream,
-                referer=referer,
-                destination=destination,
-                label="audio",
-                total=audio_stream.size,
-                progress=progress,
-                progress_callback=progress_callback,
-            )
-
-        if progress_callback:
-            progress_callback("merge", 0, None, False)
-        _merge_with_ffmpeg(video_part, audio_part, path, overwrite=overwrite)
-        if progress_callback:
-            progress_callback("merge", 1, 1, True)
-        video_part.unlink(missing_ok=True)
-        audio_part.unlink(missing_ok=True)
+            if progress_callback:
+                progress_callback("merge", 0, None, False)
+            _merge_with_ffmpeg(video_part, audio_part, path, overwrite=overwrite)
+            if progress_callback:
+                progress_callback("merge", 1, 1, True)
+            video_part.unlink(missing_ok=True)
+            audio_part.unlink(missing_ok=True)
 
         result = DownloadResult(
             path=path,
@@ -205,22 +198,26 @@ class BiliDownloader:
         xml_path = result.path.with_name(f"{result.path.stem}.danmaku.xml")
         ass_path = result.path.with_name(f"{result.path.stem}.danmaku.ass")
         video_path = _danmaku_output_path(result.path)
-        if video_path.exists() and not overwrite:
-            raise FileExistsError(f"danmaku output file already exists: {video_path}")
+        if not overwrite:
+            existing = next((path for path in (video_path, xml_path, ass_path) if path.exists()), None)
+            if existing is not None:
+                raise FileExistsError(f"danmaku output file already exists: {existing}")
 
         xml_text = self.client.get_danmaku_xml(
             cid=result.page.cid,
             bvid=result.video.bvid,
         )
-        xml_path.write_text(xml_text, encoding="utf-8")
+        _write_text_atomic(xml_path, xml_text)
         events = parse_danmaku_xml(xml_text)
+        ass_staging = _new_staging_path(ass_path, suffix=".ass")
         write_ass(
             events,
-            ass_path,
+            ass_staging,
             width=width or 1920,
             height=height or 1080,
             video_duration=result.page.duration,
         )
+        os.replace(ass_staging, ass_path)
         if not events:
             return replace(
                 result,
@@ -231,12 +228,13 @@ class BiliDownloader:
 
         if progress_callback:
             progress_callback("danmaku", 0, None, False)
-        _burn_ass_with_ffmpeg(
-            result.path,
-            ass_path,
-            video_path,
-            overwrite=overwrite,
-        )
+        with _reserve_output(video_path, overwrite=overwrite):
+            _burn_ass_with_ffmpeg(
+                result.path,
+                ass_path,
+                video_path,
+                overwrite=overwrite,
+            )
         if progress_callback:
             progress_callback("danmaku", 1, 1, True)
         return replace(
@@ -259,25 +257,61 @@ class BiliDownloader:
         progress: bool,
         progress_callback: ProgressCallback | None = None,
     ) -> int:
-        written = 0
-        started = time.monotonic()
-        with self.client.open_stream(stream.urls, referer=referer) as response:
-            total = total or _content_length(response)
-            while True:
-                chunk = response.read(CHUNK_SIZE)
-                if not chunk:
-                    break
-                destination.write(chunk)
-                written += len(chunk)
-                if progress:
-                    _print_progress(label, initial + written, total, started)
-                if progress_callback:
-                    progress_callback(label, initial + written, total, False)
-        if progress:
-            _print_progress(label, initial + written, total, started, done=True)
-        if progress_callback:
-            progress_callback(label, initial + written, total, True)
-        return written
+        start_position = destination.tell()
+        last_error: Exception | None = None
+        for url in stream.urls:
+            destination.seek(start_position)
+            destination.truncate()
+            written = 0
+            started = time.monotonic()
+            try:
+                with self.client.open_stream((url,), referer=referer) as response:
+                    response_length = _content_length(response)
+                    expected = stream.size if stream.size and stream.size > 0 else response_length
+                    progress_total = total or expected
+                    while True:
+                        chunk = response.read(CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        destination.write(chunk)
+                        written += len(chunk)
+                        if progress:
+                            _print_progress(
+                                label,
+                                initial + written,
+                                progress_total,
+                                started,
+                            )
+                        if progress_callback:
+                            progress_callback(
+                                label,
+                                initial + written,
+                                progress_total,
+                                False,
+                            )
+                if expected is not None and written != expected:
+                    raise DownloadIntegrityError(
+                        f"media response was truncated: expected {expected} bytes, received {written}"
+                    )
+            except (BiliNetworkError, OSError, TimeoutError, DownloadIntegrityError) as exc:
+                last_error = exc
+                continue
+
+            if progress:
+                _print_progress(
+                    label,
+                    initial + written,
+                    progress_total,
+                    started,
+                    done=True,
+                )
+            if progress_callback:
+                progress_callback(label, initial + written, progress_total, True)
+            return written
+
+        destination.seek(start_position)
+        destination.truncate()
+        raise DownloadIntegrityError(f"all media sources failed: {last_error}") from last_error
 
     def get_available_qualities(
         self,
@@ -356,7 +390,7 @@ def _default_output_path(
     page: VideoPage,
     play_url: PlayUrl,
 ) -> Path:
-    name = _safe_filename(video.title)
+    name = f"{_safe_filename(video.title)}_{_safe_filename(video.bvid)}"
     if len(video.pages) > 1:
         name = f"{name}_P{page.index}_{_safe_filename(page.title)}"
     return output_dir / f"{name}{_extension_for(play_url)}"
@@ -365,7 +399,11 @@ def _default_output_path(
 def _safe_filename(value: str, *, fallback: str = "bili_video") -> str:
     cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", value).strip(" ._")
     cleaned = re.sub(r"\s+", " ", cleaned)
-    return cleaned[:120] or fallback
+    cleaned = cleaned[:120] or fallback
+    stem = cleaned.split(".", 1)[0].lower()
+    if stem in {"con", "prn", "aux", "nul"} or re.fullmatch(r"(?:com|lpt)[1-9]", stem):
+        cleaned = f"_{cleaned}"
+    return cleaned
 
 
 def _extension_for(play_url: PlayUrl) -> str:
@@ -441,7 +479,10 @@ def _danmaku_output_path(path: Path) -> Path:
 
 
 def _escape_ass_filter_path(path: Path) -> str:
-    return str(path).replace("\\", "/").replace(":", "\\:")
+    escaped = str(path).replace("\\", "/")
+    for character in ("\\", ":", "'", ",", ";", "[", "]"):
+        escaped = escaped.replace(character, f"\\{character}")
+    return escaped
 
 
 def _frame_rate_number(value: str) -> int:
@@ -466,18 +507,18 @@ def _merge_with_ffmpeg(
             f"to install the bundled ffmpeg helper. Temporary files: {video_part}, {audio_part}"
         )
 
-    if output_path.exists() and overwrite:
-        output_path.unlink()
+    temp_path = _new_staging_path(output_path, suffix=".mux.mp4")
     command = [
         ffmpeg,
-        "-y" if overwrite else "-n",
+        "-y",
+        "-nostdin",
         "-i",
         str(video_part),
         "-i",
         str(audio_part),
         "-c",
         "copy",
-        str(output_path),
+        str(temp_path),
     ]
     completed = subprocess.run(
         command,
@@ -485,11 +526,13 @@ def _merge_with_ffmpeg(
         stderr=subprocess.PIPE,
     )
     if completed.returncode != 0:
+        temp_path.unlink(missing_ok=True)
         stderr = completed.stderr.decode("utf-8", errors="replace")
         raise UnsupportedStreamError(
             "ffmpeg failed to merge DASH video and audio. "
             f"Temporary files: {video_part}, {audio_part}\n{stderr.strip()}"
         )
+    _publish_staging_file(temp_path, output_path, label="merged DASH output")
 
 
 def _burn_ass_with_ffmpeg(
@@ -507,16 +550,13 @@ def _burn_ass_with_ffmpeg(
             f"Original video: {input_path}; ASS: {ass_path}"
         )
 
-    temp_path = output_path.with_name(f"{output_path.name}.tmp.mp4")
-    if temp_path.exists():
-        temp_path.unlink()
-    if output_path.exists() and overwrite:
-        output_path.unlink()
+    temp_path = _new_staging_path(output_path, suffix=".danmaku.mp4")
 
     command = [
         ffmpeg,
         "-hide_banner",
-        "-y" if overwrite else "-n",
+        "-y",
+        "-nostdin",
         "-i",
         str(input_path),
         "-vf",
@@ -550,9 +590,58 @@ def _burn_ass_with_ffmpeg(
             f"Original video: {input_path}; ASS: {ass_path}\n{stderr.strip()}"
         )
 
-    if output_path.exists() and overwrite:
-        output_path.unlink()
-    temp_path.replace(output_path)
+    _publish_staging_file(temp_path, output_path, label="danmaku output")
+
+
+def _new_staging_path(output_path: Path, *, suffix: str) -> Path:
+    descriptor, raw_path = tempfile.mkstemp(
+        dir=output_path.parent,
+        prefix=f".{output_path.stem}.",
+        suffix=suffix,
+    )
+    os.close(descriptor)
+    return Path(raw_path)
+
+
+@contextmanager
+def _reserve_output(output_path: Path, *, overwrite: bool) -> Iterator[None]:
+    reserved = False
+    if not overwrite:
+        try:
+            descriptor = os.open(output_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            raise FileExistsError(f"output file already exists: {output_path}") from None
+        else:
+            os.close(descriptor)
+            reserved = True
+    try:
+        yield
+        if not output_path.is_file() or output_path.stat().st_size <= 0:
+            raise DownloadIntegrityError(f"output file was not finalized: {output_path}")
+    except Exception:
+        if reserved:
+            output_path.unlink(missing_ok=True)
+        raise
+
+
+def _publish_staging_file(staging_path: Path, output_path: Path, *, label: str) -> None:
+    try:
+        if not staging_path.is_file() or staging_path.stat().st_size <= 0:
+            raise DownloadIntegrityError(f"{label} is empty")
+        os.replace(staging_path, output_path)
+    except Exception:
+        staging_path.unlink(missing_ok=True)
+        raise
+
+
+def _write_text_atomic(output_path: Path, value: str) -> None:
+    staging_path = _new_staging_path(output_path, suffix=".txt")
+    try:
+        staging_path.write_text(value, encoding="utf-8")
+        os.replace(staging_path, output_path)
+    except Exception:
+        staging_path.unlink(missing_ok=True)
+        raise
 
 
 def _find_ffmpeg() -> str | None:

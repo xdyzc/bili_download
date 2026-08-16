@@ -10,7 +10,7 @@ if (-not (Test-Path $Python)) {
 }
 
 Write-Host "Installing project and build dependencies..."
-& $Python -m pip install -e ".[build]" pytest
+& $Python -m pip install -e ".[build,test]"
 
 Write-Host "Running tests..."
 & $Python -m pytest

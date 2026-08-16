@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Python test dependencies
+        run: python -m pip install -e ".[test]"
+
+      - name: Run Python tests
+        run: python -m pytest -q
+
+      - name: Run extension tests
+        run: npm test
+
+      - name: Check extension syntax
+        run: npm run test:syntax
+
+      - uses: browser-actions/setup-chrome@v1
+        id: chrome
+        with:
+          chrome-version: stable
+
+      - name: Run unpacked Chrome smoke test
+        run: npm run test:browser
+        env:
+          BILI_CHROMIUM_EXECUTABLE: ${{ steps.chrome.outputs.chrome-path }}

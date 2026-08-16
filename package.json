@@ -1,0 +1,14 @@
+{
+  "name": "bili-download-workspace",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Unified verification commands for the Bili Download extension.",
+  "scripts": {
+    "test": "node --test extension/tests/smoke.mjs extension/companion/tests/background-companion.test.mjs",
+    "test:browser": "node --test extension/tests/chromium-unpacked-smoke.mjs",
+    "test:syntax": "node --check extension/src/background.js && node --check extension/src/popup.js && node --check extension/src/content.js && node --check extension/src/dash-muxer.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

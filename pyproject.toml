@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "A learning-first Bilibili downloader project."
 requires-python = ">=3.11"
 dependencies = [
-    "imageio-ffmpeg>=0.6",
+    "imageio-ffmpeg==0.6.0",
 ]
 
 [project.scripts]
@@ -12,7 +12,7 @@ bili-download = "bili_download.cli:main"
 bili-download-gui = "bili_download.gui:main"
 
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools==83.0.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
@@ -20,9 +20,12 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
-testpaths = ["tests"]
+testpaths = ["tests", "extension/companion/tests"]
 
 [project.optional-dependencies]
 build = [
-    "pyinstaller>=6.0",
+    "pyinstaller==6.15.0",
+]
+test = [
+    "pytest==9.1.1",
 ]

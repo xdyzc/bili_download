@@ -40,13 +40,15 @@
 
 ```powershell
 python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e . pytest
+.\.venv\Scripts\python.exe -m pip install -e ".[test]"
 ```
 
 运行测试：
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest
+npm test
+npm run test:syntax
 ```
 
 解析一个 Bilibili 视频地址：

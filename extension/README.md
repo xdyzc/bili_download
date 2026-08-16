@@ -64,16 +64,16 @@ extension storage.
 
 ## Verify
 
-Run the fast source-level smoke test from the project root (Node.js 22 or newer):
+Run the fast source-level smoke tests from the project root (Node.js 22 or newer):
 
 ```powershell
-node --test extension\tests\smoke.mjs
+npm test
 ```
 
 Run the unpacked-Chromium smoke test as well when a compatible Chromium build is available:
 
 ```powershell
-node --test extension\tests\chromium-unpacked-smoke.mjs
+npm run test:browser
 ```
 
 The Chromium smoke test starts an isolated temporary browser profile, loads the `extension` directory unpacked, and does **not** contact Bilibili or start a download. It verifies that:

@@ -67,12 +67,15 @@ test("unpacked Chromium loads the extension, compiles narrowed DNR rules, and re
     const popupSession = await attachToTarget(cdp, popupTarget.targetId);
     let popupState;
     let extensionState;
+    let responsiveStates;
     try {
       popupState = await waitForCondition(async () => {
         const value = await evaluateInSession(cdp, popupSession, `
           (() => {
             const requiredIds = [
               "status",
+              "account-label",
+              "page-id-label",
               "quality",
               "download",
               "download-audio",
@@ -112,15 +115,22 @@ test("unpacked Chromium loads the extension, compiles narrowed DNR rules, and re
             backgroundPing = { ok: false, error: String(error && error.message || error) };
           }
           const types = ${JSON.stringify([...ALLOWED_MEDIA_RESOURCE_TYPES, ...DISALLOWED_MEDIA_RESOURCE_TYPES])};
-          const matchResults = await Promise.all(types.map(async (type) => {
+          const scenarios = [
+            { name: "bilibili", url: "https://smoke.hdslb.com/media/unpacked-check.mp4", initiator: "https://www.bilibili.com" },
+            { name: "douyu", url: "https://smoke.douyucdn.cn/live/unpacked-check.flv", initiator: "https://www.douyu.com" },
+            { name: "huya", url: "https://smoke.flv.huya.com/src/unpacked-check.flv", initiator: "https://www.huya.com" },
+            { name: "huya-redirect", url: "https://smoke.mobgslb.tbcache.com/src/unpacked-check.flv", initiator: "https://www.huya.com" }
+          ];
+          const matchResults = await Promise.all(scenarios.flatMap((scenario) => types.map(async (type) => {
             try {
               const result = await chrome.declarativeNetRequest.testMatchOutcome({
-                url: "https://smoke.hdslb.com/media/unpacked-check.mp4",
+                url: scenario.url,
                 type,
-                initiator: "https://www.bilibili.com",
+                initiator: scenario.initiator,
                 tabId: -1
               });
               return {
+                name: scenario.name,
                 type,
                 matchedRules: (result.matchedRules || []).map((rule) => ({
                   ruleId: rule.ruleId,
@@ -128,9 +138,9 @@ test("unpacked Chromium loads the extension, compiles narrowed DNR rules, and re
                 }))
               };
             } catch (error) {
-              return { type, error: String(error && error.message || error) };
+              return { name: scenario.name, type, error: String(error && error.message || error) };
             }
-          }));
+          })));
 
           return {
             id: chrome.runtime.id,
@@ -142,6 +152,36 @@ test("unpacked Chromium loads the extension, compiles narrowed DNR rules, and re
           };
         })()
       `);
+
+      responsiveStates = [];
+      await cdp.send("Page.enable", {}, popupSession);
+      for (const width of [440, 320]) {
+        await cdp.send("Emulation.setDeviceMetricsOverride", {
+          width,
+          height: 900,
+          deviceScaleFactor: 1,
+          mobile: false
+        }, popupSession);
+        const layout = await evaluateInSession(cdp, popupSession, `
+          (() => {
+            document.getElementById("status").textContent = "正在读取一个很长的直播间标题，状态文字应当自然换行且不能遮挡后续控件";
+            document.getElementById("title").value = "这是一个用于检查窄侧栏布局的很长直播间标题 Fixture Long Live Room Title";
+            document.getElementById("account").textContent = "一个很长的主播名称 Fixture Anchor Name";
+            const ids = ["status", "account", "bvid", "title", "quality", "download", "live-record"];
+            return {
+              width: innerWidth,
+              clientWidth: document.documentElement.clientWidth,
+              scrollWidth: document.documentElement.scrollWidth,
+              boxes: ids.map((id) => {
+                const rect = document.getElementById(id).getBoundingClientRect();
+                return { id, left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom };
+              })
+            };
+          })()
+        `);
+        const screenshot = await cdp.send("Page.captureScreenshot", { format: "png" }, popupSession);
+        responsiveStates.push({ ...layout, screenshotBytes: screenshot.data?.length || 0 });
+      }
     } finally {
       await detachTarget(cdp, popupSession);
     }
@@ -150,18 +190,34 @@ test("unpacked Chromium loads the extension, compiles narrowed DNR rules, and re
     assert.deepEqual(popupState.missing, []);
     assert.equal(extensionState.id, extensionId);
     assert.equal(extensionState.permissions.includes("activeTab"), false, "fixed Bilibili host permissions make activeTab unnecessary");
-    assert.deepEqual(extensionState.enabledRulesets, ["bili_media_headers"]);
+    assert.deepEqual(extensionState.enabledRulesets.sort(), ["bili_media_headers", "live_media_headers"]);
     assert.equal(extensionState.backgroundPing?.ok, true, `background.js should respond to a harmless message: ${extensionState.backgroundPing?.error || "no response"}`);
 
-    for (const resourceType of ALLOWED_MEDIA_RESOURCE_TYPES) {
-      const result = extensionState.matchResults.find((item) => item.type === resourceType);
-      assert.equal(result?.error, undefined, `DNR testMatchOutcome should evaluate ${resourceType}: ${result?.error || "unknown error"}`);
-      assert.deepEqual(result?.matchedRules, [{ ruleId: 3, rulesetId: "bili_media_headers" }]);
+    const expectedRules = {
+      bilibili: { ruleId: 3, rulesetId: "bili_media_headers" },
+      douyu: { ruleId: 101, rulesetId: "live_media_headers" },
+      huya: { ruleId: 102, rulesetId: "live_media_headers" },
+      "huya-redirect": { ruleId: 103, rulesetId: "live_media_headers" }
+    };
+    for (const [name, expectedRule] of Object.entries(expectedRules)) {
+      for (const resourceType of ALLOWED_MEDIA_RESOURCE_TYPES) {
+        const result = extensionState.matchResults.find((item) => item.name === name && item.type === resourceType);
+        assert.equal(result?.error, undefined, `DNR should evaluate ${name} ${resourceType}: ${result?.error || "unknown error"}`);
+        assert.deepEqual(result?.matchedRules, [expectedRule]);
+      }
+      for (const resourceType of DISALLOWED_MEDIA_RESOURCE_TYPES) {
+        const result = extensionState.matchResults.find((item) => item.name === name && item.type === resourceType);
+        assert.equal(result?.error, undefined, `DNR should evaluate ${name} ${resourceType}: ${result?.error || "unknown error"}`);
+        assert.deepEqual(result?.matchedRules, [], `${name} ${resourceType} must not receive media-header overrides`);
+      }
     }
-    for (const resourceType of DISALLOWED_MEDIA_RESOURCE_TYPES) {
-      const result = extensionState.matchResults.find((item) => item.type === resourceType);
-      assert.equal(result?.error, undefined, `DNR testMatchOutcome should evaluate ${resourceType}: ${result?.error || "unknown error"}`);
-      assert.deepEqual(result?.matchedRules, [], `${resourceType} must not receive media-header overrides`);
+    for (const responsive of responsiveStates) {
+      assert.equal(responsive.scrollWidth <= responsive.clientWidth, true, `${responsive.width}px layout must not overflow horizontally`);
+      assert.ok(responsive.screenshotBytes > 1000, `${responsive.width}px layout should render a non-empty screenshot`);
+      for (const box of responsive.boxes) {
+        assert.ok(box.left >= 0 && box.right <= responsive.clientWidth, `${box.id} must remain inside the ${responsive.width}px viewport`);
+        assert.ok(box.bottom >= box.top, `${box.id} must have a stable box`);
+      }
     }
 
   } catch (error) {

@@ -6,8 +6,8 @@ from the browser extension and is not enabled merely by placing this directory
 in the repository.
 
 The browser extension must continue to obtain every media URL through the
-normal, currently signed-in Bilibili page/API flow. The companion never logs
-in, reads a browser profile, imports a Cookie file, calls Bilibili APIs, or
+normal, currently authorized page/API flow. The companion never logs in,
+reads a browser profile, imports a Cookie file, calls site APIs, or
 tries to bypass quality, membership, region, DRM, or copyright restrictions.
 
 ## What it does
@@ -46,18 +46,18 @@ segment set explicitly.
 
 This is a strict boundary, not a convenience workaround.
 
-- It accepts only HTTPS media URLs on the Bilibili CDN suffixes already used by
-  the extension: `bilivideo.com`, `bilivideo.cn`, `hdslb.com`, and
-  `edge.mountaintoys.cn` (including their subdomains). HTTP redirects are
-  revalidated against the same allowlist rather than followed to an arbitrary
-  host.
-- It rejects Bilibili API URLs, non-HTTPS URLs, credentials embedded in a URL,
+- It accepts only HTTPS media URLs paired with the matching page origin:
+  Bilibili uses `bilivideo.com`, `bilivideo.cn`, `hdslb.com`, and
+  `edge.mountaintoys.cn`; Douyu uses `douyucdn.cn`; Huya uses `flv.huya.com`
+  and the verified redirect family `mobgslb.tbcache.com`. Every redirect is
+  checked against the same site-specific pairing.
+- It rejects cross-site CDN combinations, site API URLs, non-HTTPS URLs, credentials embedded in a URL,
   `Cookie`, `Authorization`, `headers`, proxy settings, user-agent overrides,
   browser-profile paths, and Cookie-file fields.
 - The only request headers it constructs are a fixed user agent plus safe
   `Accept`, `Origin`, `Referer`, and (for finite DASH resume) `Range` headers.
-  The provided referer is canonicalized to one of the public Bilibili page
-  origins; arbitrary headers are never accepted.
+  The provided referer is canonicalized to one of the supported public page
+  origins and determines the fixed `Origin`; arbitrary headers are never accepted.
 - Signed URL strings, query strings, and raw network exception text remain only
   in the running process. They are omitted from native events, manifests,
   errors, and terminal output. A completed/canceled task clears its in-memory
@@ -143,6 +143,8 @@ only in memory; it does not recreate or persist a task record.
 Start a live recording. `outputName` is a basename, not a path. Segment files
 are named `<outputName>.segment-0001.flv`, and the manifest is
 `<outputName>.live.manifest.json` inside the host output directory.
+The `referer` must match the source family: `https://live.bilibili.com/`,
+`https://www.douyu.com/`, or `https://www.huya.com/`.
 
 ```json
 {

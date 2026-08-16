@@ -6,7 +6,8 @@
   "scripts": {
     "test": "node --test extension/tests/smoke.mjs extension/companion/tests/background-companion.test.mjs",
     "test:browser": "node --test extension/tests/chromium-unpacked-smoke.mjs",
-    "test:syntax": "node --check extension/src/background.js && node --check extension/src/popup.js && node --check extension/src/content.js && node --check extension/src/dash-muxer.mjs"
+    "test:syntax": "node --check extension/src/background.js && node --check extension/src/popup.js && node --check extension/src/content.js && node --check extension/src/dash-muxer.mjs && node --check extension/tests/chromium-unpacked-smoke.mjs && node --check extension/tests/live-site-probe.mjs",
+    "probe:live": "node extension/tests/live-site-probe.mjs"
   },
   "engines": {
     "node": ">=22"

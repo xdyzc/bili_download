@@ -6,7 +6,7 @@ streaming companion.
 ## Current Version
 
 - Manifest V3 Chrome/Edge extension.
-- Reads the current Bilibili video page and extracts the BV id.
+- Reads Bilibili video/Bangumi pages and Bilibili, Douyu, or Huya desktop live-room pages.
 - Uses the browser's current Bilibili login cookie and shows the detected account in the popup.
 - Fetches video metadata, all cookie-accessible qualities, and DASH stream metadata from Bilibili web APIs.
 - Downloads directly available non-DASH streams as a single browser download.
@@ -14,6 +14,9 @@ streaming companion.
 - Falls back to the browser downloads API and records diagnostics if page-context downloading fails.
 - Optionally delegates a user-selected single DASH download or live recording to
   a separately installed Native Messaging companion for streaming disk output.
+- Records HTTPS FLV + AVC live streams at the qualities exposed by the current
+  page session. Douyu uses its page-provided official resolver; Huya uses the
+  public player data already present on the page.
 - No local `bili.json` import is needed for the extension.
 
 ## Current Limits
@@ -21,8 +24,8 @@ streaming companion.
 - Browser-side DASH muxing currently remuxes supported MP4-based DASH streams without re-encoding.
 - Danmaku download and burning are not handled yet.
 - The extension only downloads content that the current browser session can access.
-- Page-context downloads and browser muxing still buffer media in memory before saving. The side panel therefore applies configurable DASH file/memory limits (default 512 MB input and 1.5 GB memory budget) and stops unsafe downloads before they can grow without bounds.
-- Live FLV recording also buffers data in memory. It has configurable duration, file-size, and memory-budget limits (default 120 minutes, 1 GB file size, and 1.5 GB memory budget). Its effective buffer cap is the lower of the file limit and memory budget divided by a conservative 3× save peak; it automatically stops when either size or duration is reached and does not save an empty recording.
+- Page-context downloads, browser muxing, and browser live recording still buffer media in memory. The extension derives conservative limits from media metadata and the device's reported memory, then stops before an unsafe buffer can grow without bounds. These protections are automatic rather than user-facing settings.
+- The first multi-site live release supports only standard desktop room pages and HTTPS FLV + AVC. It does not support HLS, HEVC, replay, mobile pages, scheduled recording, danmaku, or chat capture.
 
 - The optional companion is never selected silently: enable it in the side
   panel first. It writes to `%USERPROFILE%\Videos\BiliDownload` by default and
@@ -37,7 +40,7 @@ streaming companion.
 2. Enable developer mode.
 3. Choose "Load unpacked".
 4. Select this `extension` folder.
-5. Open a Bilibili video page and click the extension icon.
+5. Open a supported Bilibili video/live page, Douyu numeric room, or Huya numeric/alias room and click the extension icon.
 
 Downloaded files are placed under the browser downloads folder in a `BiliDownload` subfolder.
 
@@ -47,7 +50,7 @@ The browser-only path works immediately after loading the extension. The local
 companion is opt-in: it can stream a currently authorized DASH or live source
 to disk without keeping the entire recording in browser memory. It does not
 receive browser cookies, `Authorization`, arbitrary headers, browser-profile
-paths, or Bilibili API URLs.
+paths, site API URLs, or arbitrary request headers.
 
 Build and register the companion only after loading this unpacked extension,
 because its native-host manifest must contain the extension ID shown by
@@ -76,10 +79,10 @@ Run the unpacked-Chromium smoke test as well when a compatible Chromium build is
 npm run test:browser
 ```
 
-The Chromium smoke test starts an isolated temporary browser profile, loads the `extension` directory unpacked, and does **not** contact Bilibili or start a download. It verifies that:
+The Chromium smoke test starts an isolated temporary browser profile, loads the `extension` directory unpacked, and does **not** contact a live site or start a download. It verifies that:
 
 - the MV3 extension page receives its runtime and `background.js` responds to a harmless diagnostic request;
-- Chrome has enabled the `bili_media_headers` ruleset and evaluates it for `xmlhttprequest`, `media`, and `other` requests;
+- Chrome has enabled both media-header rulesets and evaluates the Bilibili, Douyu, and Huya rules for `xmlhttprequest`, `media`, and `other` requests;
 - the same rule does not match `main_frame`, `sub_frame`, `image`, or `object`; and
 - the side-panel document renders its core controls.
 
@@ -90,13 +93,20 @@ $env:BILI_CHROMIUM_EXECUTABLE = 'C:\path\to\chrome.exe'
 node --test extension\tests\chromium-unpacked-smoke.mjs
 ```
 
-For an authenticated end-to-end download check, load the extension manually and use only media you are authorized to download. Confirm both a native single-file download and a DASH/page-context download on a small file. The automated test deliberately does not use browser cookies, live Bilibili requests, or real media transfers.
+For an authenticated end-to-end download check, load the extension manually and use only media you are authorized to download. Confirm both a native single-file download and a DASH/page-context download on a small file. The automated test deliberately does not use browser cookies, live-site requests, or real media transfers.
+
+An explicit metadata-only real-site probe is available for manual validation. It never requests a media URL and is disabled unless opted in:
+
+```powershell
+$env:BILI_ENABLE_LIVE_PROBE = '1'
+npm run probe:live
+```
 
 ## Permission and DNR Scope
 
-- `activeTab` is not requested: every supported page execution target is already covered by the declared Bilibili hosts and the popup rejects non-Bilibili URLs before injecting a script.
-- The API, page, live, and four known media-CDN host families remain declared because the current API calls, page-context fallback, live recording, and CDN candidates use them. No localhost or catch-all host permission is requested.
-- Media-header DNR rules apply only to the four Bilibili media-CDN families and only to `xmlhttprequest`, `media`, and `other`. `other` is retained for browser-managed native downloads; `xmlhttprequest` and `media` support extension/page fetching and media requests. Navigation, frames, images, and objects never receive the overridden `Referer`/`Origin` headers.
+- `activeTab` is not requested: every supported page execution target is covered by explicit Bilibili, Douyu, and Huya page hosts, and the panel rejects unrelated URLs before injection.
+- Host permissions include only the required page/API hosts and verified media-CDN families. No localhost or catch-all permission is requested.
+- Site-specific DNR rules set the matching Bilibili, Douyu, or Huya `Referer` and `Origin` only for `xmlhttprequest`, `media`, and `other`. Navigation, frames, images, and objects never receive those overrides.
 - `declarativeNetRequestFeedback` remains intentionally: the extension's user-facing diagnostics use `testMatchOutcome` and best-effort rule-match events to explain a failed media request. It does not broaden the host list or permit request modification beyond the static rules above.
 - `nativeMessaging` is requested solely for the optional host named
   `com.bili_download.stream_companion`. The extension opens it only after the
@@ -104,7 +114,11 @@ For an authenticated end-to-end download check, load the extension manually and 
   registration restricts which extension IDs may connect; it does not grant
   host permissions, browser-profile access, or cookie access.
 
-## Next Milestone
+## Supported live URL forms
 
-Add danmaku and subtitle export while preserving the extension's existing
-privacy and task-recovery boundaries.
+- Bilibili: `https://live.bilibili.com/<numeric-room>`
+- Douyu: `https://www.douyu.com/<numeric-room>`
+- Huya: `https://www.huya.com/<numeric-room-or-anchor-alias>`
+
+All access stays within the current browser session. The extension does not
+bypass login, payment, region, DRM, or copyright restrictions.

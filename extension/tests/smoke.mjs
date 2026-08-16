@@ -150,6 +150,11 @@ test("popup contains MVP controls", async () => {
   const html = await readFile("extension/src/popup.html", "utf8");
 
   for (const id of [
+    "main-view",
+    "settings-view",
+    "view-title",
+    "settings-open",
+    "settings-back",
     "status",
     "account",
     "bvid",
@@ -189,6 +194,73 @@ test("popup contains MVP controls", async () => {
   ]) {
     assert.match(html, new RegExp(`id="${id}"`));
   }
+});
+
+
+test("popup keeps advanced controls in a secondary settings view", async () => {
+  const html = await readFile("extension/src/popup.html", "utf8");
+  const code = await readFile("extension/src/popup.js", "utf8");
+  const mainStart = html.indexOf('id="main-view"');
+  const settingsStart = html.indexOf('id="settings-view"');
+  const taskCenterStart = html.indexOf('id="task-center"');
+  const safetyStart = html.indexOf('class="safety-settings settings-section"');
+  const companionStart = html.indexOf('class="companion-settings settings-section"');
+  assert.ok(mainStart > 0);
+  assert.ok(settingsStart > mainStart);
+  assert.ok(taskCenterStart > settingsStart);
+  assert.ok(safetyStart > settingsStart);
+  assert.ok(companionStart > settingsStart);
+
+  const elements = {
+    "#main-view": { hidden: false },
+    "#settings-view": { hidden: true },
+    "#view-title": textElement(),
+    "#settings-open": buttonElement(),
+    "#settings-back": buttonElement(),
+    "#status": textElement(),
+    "#quality": selectElement()
+  };
+  const sandbox = {
+    Array,
+    Date,
+    Error,
+    Map,
+    Number,
+    Promise,
+    RegExp,
+    Set,
+    String,
+    URL,
+    clearTimeout,
+    setTimeout,
+    document: {
+      addEventListener() {},
+      querySelector(selector) {
+        return elements[selector];
+      }
+    },
+    chrome: {
+      runtime: {
+        connect() {
+          return { onMessage: { addListener() {} } };
+        }
+      }
+    }
+  };
+
+  vm.createContext(sandbox);
+  vm.runInContext(code, sandbox);
+  sandbox.showSettingsView();
+  assert.equal(elements["#main-view"].hidden, true);
+  assert.equal(elements["#settings-view"].hidden, false);
+  assert.equal(elements["#settings-open"].hidden, true);
+  assert.equal(elements["#settings-back"].hidden, false);
+  assert.equal(elements["#view-title"].textContent, "任务与设置");
+
+  sandbox.showMainView();
+  assert.equal(elements["#main-view"].hidden, false);
+  assert.equal(elements["#settings-view"].hidden, true);
+  assert.equal(elements["#view-title"].textContent, "Bili Download");
 });
 
 

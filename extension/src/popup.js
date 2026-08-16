@@ -107,12 +107,18 @@ const state = {
   batchResumeTimer: null,
   taskCenterLoading: false,
   taskCenterRefreshTimer: null,
+  activeView: "main",
   refreshGeneration: 0,
   pagePickerOpen: false,
   selectedPageCids: null,
   safetySettings: normalizeSafetySettings(SAFETY_SETTINGS_DEFAULTS)
 };
 
+const mainView = document.querySelector("#main-view");
+const settingsView = document.querySelector("#settings-view");
+const viewTitleElement = document.querySelector("#view-title");
+const settingsOpenButton = document.querySelector("#settings-open");
+const settingsBackButton = document.querySelector("#settings-back");
 const statusElement = document.querySelector("#status");
 const accountElement = document.querySelector("#account");
 const bvidInput = document.querySelector("#bvid");
@@ -156,6 +162,8 @@ const taskCenterNote = document.querySelector("#task-center-note");
 const taskList = document.querySelector("#task-list");
 
 document.addEventListener("DOMContentLoaded", initialize);
+settingsOpenButton?.addEventListener("click", showSettingsView);
+settingsBackButton?.addEventListener("click", showMainView);
 copyButton?.addEventListener("click", copyBvid);
 downloadButton?.addEventListener("click", downloadSelectedQuality);
 downloadAudioButton?.addEventListener("click", downloadCurrentAudio);
@@ -221,8 +229,41 @@ chrome.tabs?.onUpdated?.addListener((tabId, changeInfo) => {
 });
 
 async function initialize() {
+  renderActiveView();
   await Promise.all([loadSafetySettings(), loadCompanionSettings()]);
   await refreshFromActiveTab({ force: true });
+}
+
+function showSettingsView() {
+  state.activeView = "settings";
+  renderActiveView();
+  refreshTaskCenter({ resumeBatch: false, silent: true }).catch(() => {});
+  settingsBackButton?.focus?.();
+}
+
+function showMainView() {
+  state.activeView = "main";
+  renderActiveView();
+  settingsOpenButton?.focus?.();
+}
+
+function renderActiveView() {
+  const showSettings = state.activeView === "settings";
+  if (mainView) {
+    mainView.hidden = showSettings;
+  }
+  if (settingsView) {
+    settingsView.hidden = !showSettings;
+  }
+  if (settingsOpenButton) {
+    settingsOpenButton.hidden = showSettings;
+  }
+  if (settingsBackButton) {
+    settingsBackButton.hidden = !showSettings;
+  }
+  if (viewTitleElement) {
+    viewTitleElement.textContent = showSettings ? "任务与设置" : "Bili Download";
+  }
 }
 
 async function loadSafetySettings() {
@@ -400,7 +441,7 @@ function renderSafetySettingsSummary() {
   const settings = normalizeSafetySettings(readSafetySettingsInputs());
   const dashLimits = getDashSafetyLimits(settings);
   const liveLimits = getLiveSafetyLimits(settings);
-  safetySettingsSummary.textContent = `DASH 实际缓冲上限约 ${formatBytes(dashLimits.maxInputBytes)}（按合并峰值约 ${DASH_MUX_MEMORY_MULTIPLIER} 倍估算）；直播实际缓冲上限约 ${formatBytes(liveLimits.maxBytes)}（按保存峰值约 ${LIVE_RECORDING_MEMORY_MULTIPLIER} 倍估算），达到时长或大小上限会自动停止。`;
+  safetySettingsSummary.textContent = `实际缓冲上限：DASH ${formatBytes(dashLimits.maxInputBytes)} · 直播 ${formatBytes(liveLimits.maxBytes)}。达到时长或大小上限时自动停止。`;
 }
 
 function getDashSafetyLimits(settings = state.safetySettings) {

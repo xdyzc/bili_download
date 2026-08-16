@@ -134,6 +134,7 @@ test("background opens the side panel from the toolbar action", async () => {
 
 test("media header rules use declarative request modification", async () => {
   const rules = JSON.parse(await readFile("extension/rules/bili-media-headers.json", "utf8"));
+  const liveRules = JSON.parse(await readFile("extension/rules/live-media-headers.json", "utf8"));
   const rule = rules[0];
 
   assert.deepEqual(
@@ -154,6 +155,21 @@ test("media header rules use declarative request modification", async () => {
       ["Origin", "set"]
     ]
   );
+  assert.deepEqual(
+    liveRules.map((item) => item.condition.urlFilter),
+    ["||douyucdn.cn/", "||flv.huya.com/", "||mobgslb.tbcache.com/"]
+  );
+  assert.deepEqual(
+    liveRules.map((item) => item.action.requestHeaders.map((header) => header.value)),
+    [
+      ["https://www.douyu.com/", "https://www.douyu.com"],
+      ["https://www.huya.com/", "https://www.huya.com"],
+      ["https://www.huya.com/", "https://www.huya.com"]
+    ]
+  );
+  for (const item of liveRules) {
+    assert.deepEqual(item.condition.resourceTypes, ["xmlhttprequest", "media", "other"]);
+  }
 });
 
 
@@ -2122,6 +2138,96 @@ test("Huya page adapter filters AVC qualities and builds three HTTPS CDN candida
   const missing = await sandbox.readHuyaLiveStateInPage(0, false);
   assert.equal(missing.ok, false);
   assert.match(missing.error, /播放器尚未准备好/);
+});
+
+
+test("multi-site live registry loads and prepares Douyu and Huya recordings", async () => {
+  const douyuFixture = JSON.parse(await readFile("extension/tests/fixtures/douyu-betard.json", "utf8"));
+  const douyuStream = JSON.parse(await readFile("extension/tests/fixtures/douyu-stream.json", "utf8"));
+  const huyaFixture = JSON.parse(await readFile("extension/tests/fixtures/huya-player.json", "utf8"));
+  const sandbox = await backgroundUnitSandbox({
+    fetch: async (url) => {
+      if (String(url).includes("/betard/999001")) {
+        return jsonResponse(douyuFixture);
+      }
+      throw new Error(`unexpected fixture fetch: ${url}`);
+    }
+  });
+  sandbox.hyPlayerConfig = { stream: huyaFixture };
+  sandbox.chrome.scripting = {
+    async executeScript(details) {
+      if (details.func.name === "fetchJsonInPage") {
+        return [{ result: { ok: true, responseOk: true, status: 200, payload: douyuFixture } }];
+      }
+      if (details.func.name === "resolveDouyuStreamInPage") {
+        return [{
+          result: {
+            ok: true,
+            payload: {
+              roomId: douyuStream.room_id,
+              rate: douyuStream.rate,
+              rtmpUrl: douyuStream.rtmp_url,
+              rtmpLive: douyuStream.rtmp_live,
+              isMixed: douyuStream.is_mixed,
+              rtcUrl: douyuStream.rtc_stream_url
+            }
+          }
+        }];
+      }
+      if (details.func.name === "readHuyaLiveStateInPage") {
+        return [{ result: await sandbox.readHuyaLiveStateInPage(...details.args) }];
+      }
+      throw new Error(`unexpected script injection: ${details.func.name}`);
+    }
+  };
+
+  const douyu = await sandbox.loadLive({
+    site: "douyu",
+    roomKey: "999001",
+    tabId: 11,
+    url: "https://www.douyu.com/999001"
+  });
+  assert.equal(douyu.site, "douyu");
+  assert.equal(douyu.qualities.length, 4);
+  const preparedDouyu = await sandbox.prepareLiveRecording({
+    site: "douyu",
+    roomKey: "999001",
+    quality: 4,
+    tabId: 11
+  });
+  assert.equal(preparedDouyu.live.site, "douyu");
+  assert.match(preparedDouyu.segments[0].filename, /^BiliDownload\/斗鱼_Fixture Anchor_Fixture Douyu Room_\d{8}_\d{6}\.flv$/);
+
+  sandbox.location.origin = "https://www.huya.com";
+  sandbox.location.href = "https://www.huya.com/fixture-anchor";
+  sandbox.location.pathname = "/fixture-anchor";
+  const huya = await sandbox.loadLive({
+    site: "huya",
+    roomKey: "fixture-anchor",
+    tabId: 12,
+    url: "https://www.huya.com/fixture-anchor"
+  });
+  assert.equal(huya.site, "huya");
+  assert.equal(huya.roomKey, "999002");
+  assert.equal(huya.qualities.length, 3);
+  const preparedHuya = await sandbox.prepareLiveRecording({
+    site: "huya",
+    roomKey: "fixture-anchor",
+    quality: 2000,
+    tabId: 12
+  });
+  assert.equal(preparedHuya.live.site, "huya");
+  assert.equal(preparedHuya.segments[0].candidates.length, 3);
+  assert.match(preparedHuya.segments[0].filename, /^BiliDownload\/虎牙_Fixture Anchor_Fixture Huya Room_\d{8}_\d{6}\.flv$/);
+  await assert.rejects(
+    sandbox.prepareLiveRecording({
+      site: "huya",
+      roomKey: "fixture-anchor",
+      quality: 9999,
+      tabId: 12
+    }),
+    /Quality 9999/
+  );
 });
 
 
@@ -5331,6 +5437,99 @@ test("popup explains how to download oversized DASH media when enhanced download
 });
 
 
+test("popup labels Huya alias rooms and Douyu numeric rooms with site-aware fields", async () => {
+  const code = await readFile("extension/src/popup.js", "utf8");
+  const accountLabel = textElement();
+  const account = textElement();
+  const pageIdLabel = textElement();
+  const pageId = textElement();
+  const elements = {
+    "#status": textElement(),
+    "#account-label": accountLabel,
+    "#account": account,
+    "#page-id-label": pageIdLabel,
+    "#bvid": pageId,
+    "#title": textElement(),
+    "#quality": selectElement(),
+    "#quality-size": textElement(),
+    "#download": buttonElement(),
+    "#download-audio": buttonElement(),
+    "#live-record": buttonElement(),
+    "#page-picker-toggle": buttonElement(),
+    "#page-picker": panelElement(),
+    "#download-selected-page-audio": buttonElement(),
+    "label[for=\"quality\"]": textElement()
+  };
+  const sandbox = {
+    AbortController,
+    Blob,
+    Date,
+    Error,
+    RegExp,
+    String,
+    URL,
+    console,
+    navigator: { deviceMemory: 4 },
+    setTimeout,
+    clearTimeout,
+    document: {
+      addEventListener() {},
+      querySelector(selector) { return elements[selector]; }
+    },
+    chrome: {
+      runtime: {
+        connect() {
+          return { onMessage: { addListener() {} } };
+        }
+      },
+      tabs: {
+        onActivated: { addListener() {} },
+        onUpdated: { addListener() {} }
+      }
+    }
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(code, sandbox);
+
+  vm.runInContext(`
+    state.page = {
+      type: "live",
+      site: "huya",
+      roomKey: "fixture-anchor",
+      roomId: null,
+      title: "Fixture Huya Room",
+      url: "https://www.huya.com/fixture-anchor"
+    };
+    state.account = null;
+  `, sandbox);
+  sandbox.renderMode();
+  sandbox.renderAccount();
+  assert.equal(accountLabel.textContent, "站点");
+  assert.equal(account.textContent, "虎牙");
+  assert.equal(pageIdLabel.textContent, "房间标识");
+  assert.equal(sandbox.displayPageId(vm.runInContext("state.page", sandbox)), "fixture-anchor");
+
+  vm.runInContext(`state.page.site = "douyu"; state.page.roomKey = "999001"; state.page.roomId = 999001;`, sandbox);
+  sandbox.renderMode();
+  sandbox.renderAccount();
+  assert.equal(account.textContent, "斗鱼");
+  assert.equal(pageIdLabel.textContent, "房间号");
+  assert.equal(sandbox.siteFromUrl("https://www.douyu.com/999001"), "douyu");
+  assert.equal(sandbox.extractLiveRoomKey("https://www.huya.com/fixture-anchor", "huya"), "fixture-anchor");
+  assert.equal(sandbox.extractLiveRoomKey("https://www.huya.com/search", "huya"), "");
+  const task = sandbox.rememberCompanionTask({
+    taskId: "fixture-live-task",
+    tabId: 1,
+    kind: "live",
+    title: "同名直播",
+    metadata: { site: "huya" },
+    state: "in_progress"
+  });
+  assert.equal(task.site, "huya");
+  assert.equal(sandbox.taskCenterTitle("companion", task), "虎牙直播录制 · 同名直播");
+});
+
+
 test("popup records a live FLV stream until the user stops it", async () => {
   const code = await readFile("extension/src/popup.js", "utf8");
   const runtimeMessages = [];
@@ -5512,6 +5711,8 @@ test("popup records a live FLV stream until the user stops it", async () => {
         async sendMessage() {
           return {
             type: "live",
+            site: "bilibili",
+            roomKey: "6",
             roomId: 6,
             title: "Live Test",
             url: "https://live.bilibili.com/6"
@@ -5542,6 +5743,8 @@ test("popup records a live FLV stream until the user stops it", async () => {
               ok: true,
               payload: {
                 source: "live",
+                site: "bilibili",
+                roomKey: "7734200",
                 roomId: 7734200,
                 shortId: 6,
                 title: "Live Test",
@@ -5572,7 +5775,7 @@ test("popup records a live FLV stream until the user stops it", async () => {
                 mode: "live",
                 count: 1,
                 format: "flv",
-                live: { roomId: 7734200, title: "Live Test" },
+                live: { site: "bilibili", roomKey: "7734200", roomId: 7734200, title: "Live Test" },
                 segments: [{
                   url: liveCandidates[0].url,
                   filename: "BiliDownload/Live Test_20260628_120000.flv",
@@ -5638,6 +5841,9 @@ test("popup records a live FLV stream until the user stops it", async () => {
   assert.match(statusElement.textContent, /直播录制已保存/);
   const prepareMessage = runtimeMessages.find((message) => message.type === "BILI_DOWNLOAD_PREPARE_LIVE_RECORDING");
   assert.equal(prepareMessage.payload.quality, 250);
+  assert.equal(prepareMessage.payload.site, "bilibili");
+  assert.equal(prepareMessage.payload.roomKey, "7734200");
+  assert.equal(prepareMessage.payload.tabId, 99);
   const savedDiagnostic = runtimeMessages
     .filter((message) => message.type === "BILI_DOWNLOAD_SAVE_DIAGNOSTIC")
     .at(-1).payload;

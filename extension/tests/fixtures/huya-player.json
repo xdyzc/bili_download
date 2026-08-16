@@ -39,13 +39,13 @@
           "sFlvUrlSuffix": "flv",
           "sFlvAntiCode": "token=redacted"
         }
-      ],
-      "vMultiStreamInfo": [
-        { "sDisplayName": "HDR", "iBitRate": 4200, "iCodecType": 1 },
-        { "sDisplayName": "蓝光10M", "iBitRate": 0, "iCodecType": 0 },
-        { "sDisplayName": "蓝光4M", "iBitRate": 4000, "iCodecType": 0 },
-        { "sDisplayName": "超清", "iBitRate": 2000, "iCodecType": 0 }
       ]
     }
+  ],
+  "vMultiStreamInfo": [
+    { "sDisplayName": "HDR", "iBitRate": 4200, "iCodecType": 1 },
+    { "sDisplayName": "蓝光10M", "iBitRate": 0, "iCodecType": 0 },
+    { "sDisplayName": "蓝光4M", "iBitRate": 4000, "iCodecType": 0 },
+    { "sDisplayName": "超清", "iBitRate": 2000, "iCodecType": 0 }
   ]
 }

@@ -766,7 +766,9 @@ async function prepareHuyaLiveRecording(payload) {
     throw new Error("当前虎牙直播间未开播，不能开始录制。");
   }
   const qualities = normalizeHuyaQualities(live.qualities);
-  const quality = qualities.find((item) => item.code === requestedQuality) || qualities[0];
+  const quality = requestedQuality
+    ? qualities.find((item) => item.code === requestedQuality)
+    : qualities[0];
   if (!quality || !Array.isArray(live.candidates) || !live.candidates.length) {
     throw unavailableQualityError(requestedQuality);
   }
@@ -997,7 +999,10 @@ async function readHuyaLiveStateInPage(requestedQuality, includeSources) {
   const group = groups.find((item) => Number(item?.gameLiveInfo?.codecType) === 0) || null;
   const info = group?.gameLiveInfo || groups[0]?.gameLiveInfo || {};
   const roomKey = String(info.profileRoom || info.privateHost || location.pathname.split("/").filter(Boolean)[0] || "");
-  const qualities = (Array.isArray(group?.vMultiStreamInfo) ? group.vMultiStreamInfo : [])
+  const qualitySource = Array.isArray(stream.vMultiStreamInfo)
+    ? stream.vMultiStreamInfo
+    : (Array.isArray(group?.vMultiStreamInfo) ? group.vMultiStreamInfo : []);
+  const qualities = qualitySource
     .map((item) => ({
       label: String(item?.sDisplayName || ""),
       bitrate: Number(item?.iBitRate) || 0,
@@ -3069,6 +3074,9 @@ function companionDownloadTaskProgress(task) {
     nativeDownload: false,
     companionDownload: true,
     companionKind: normalizeCompanionKind(task?.kind),
+    site: normalizeCompanionKind(task?.kind) === "live"
+      ? normalizeLiveSite(task?.metadata?.site)
+      : "",
     phase: normalizeCompanionPhase(task?.phase),
     recoverable: Boolean(task?.recoverable),
     reconnectAttempt: companionNonnegativeInteger(task?.reconnectAttempt),

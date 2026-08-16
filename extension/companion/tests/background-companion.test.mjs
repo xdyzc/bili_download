@@ -211,6 +211,51 @@ function dashPrepared(token = "first-token") {
   };
 }
 
+function livePrepared(site = "huya", token = "first-live-token") {
+  const settings = {
+    bilibili: {
+      roomKey: "100",
+      roomId: 100,
+      title: "Bilibili fixture live",
+      url: `https://live.example.bilivideo.com/live.flv?token=${token}`
+    },
+    douyu: {
+      roomKey: "999001",
+      roomId: 999001,
+      title: "斗鱼_Fixture Anchor_Fixture Room",
+      url: `https://fixture.douyucdn.cn/live/stream.flv?token=${token}`
+    },
+    huya: {
+      roomKey: "999002",
+      roomId: 999002,
+      title: "虎牙_Fixture Anchor_Fixture Room",
+      url: `https://tx.flv.huya.com/src/stream.flv?token=${token}`
+    }
+  }[site];
+  return {
+    mode: "live",
+    format: "flv",
+    live: {
+      site,
+      roomKey: settings.roomKey,
+      roomId: settings.roomId,
+      quality: 2000,
+      title: settings.title
+    },
+    segments: [{
+      candidates: [{ url: settings.url, kind: "primary" }],
+      context: {
+        site,
+        roomKey: settings.roomKey,
+        roomId: settings.roomId,
+        quality: 2000,
+        title: settings.title,
+        role: "live"
+      }
+    }]
+  };
+}
+
 function connectProgressPort(harness) {
   const messages = [];
   const port = {
@@ -397,6 +442,94 @@ test("background companion starts DASH privately, relays progress, refreshes, ca
     payload: { taskId: secondStartMessage.taskId }
   });
   assert.equal(completed.payload.state, "complete");
+});
+
+test("background companion preserves live site metadata and makes page reauthorization recoverable", async () => {
+  const harness = await createHarness();
+  const startPromise = sendRuntimeMessage(harness.listeners.message, {
+    type: "BILI_DOWNLOAD_START_COMPANION",
+    payload: {
+      tabId: 77,
+      prepared: livePrepared("huya", "signed-live-token")
+    }
+  });
+  await waitFor(() => harness.nativePorts.length === 1 && harness.nativePorts[0].sent.length === 1);
+  const native = harness.nativePorts[0];
+  const startMessage = native.sent[0];
+  assert.equal(startMessage.type, "start_live");
+  assert.equal(startMessage.payload.referer, "https://www.huya.com/");
+  assert.equal(startMessage.payload.sources[0].includes("signed-live-token"), true);
+  native.emit({
+    version: 1,
+    type: "accepted",
+    requestId: startMessage.requestId,
+    taskId: startMessage.taskId,
+    kind: "live"
+  });
+  const started = await startPromise;
+  assert.equal(started.ok, true);
+  assert.equal(started.payload.metadata.site, "huya");
+  assert.equal(started.payload.metadata.roomKey, "999002");
+  harness.sandbox.__liveTaskId = startMessage.taskId;
+  const progressSite = vm.runInContext(
+    "companionDownloadTaskProgress(companionDownloadTasks.get(__liveTaskId)).site",
+    harness.sandbox
+  );
+  assert.equal(progressSite, "huya");
+  assert.equal(JSON.stringify(started.payload).includes("signed-live-token"), false);
+  assert.equal(JSON.stringify(harness.storage[STORAGE_KEY]).includes("signed-live-token"), false);
+
+  harness.sandbox.__freshLivePrepared = livePrepared("huya", "fresh-live-token");
+  vm.runInContext("prepareLiveRecording = async () => __freshLivePrepared;", harness.sandbox);
+  native.emit({
+    version: 1,
+    type: "refresh_required",
+    taskId: startMessage.taskId,
+    kind: "live",
+    reason: "source_expired"
+  });
+  await waitFor(() => native.sent.some((message) => message.type === "refresh_live_sources"));
+  const refreshMessage = native.sent.find((message) => message.type === "refresh_live_sources");
+  assert.equal(refreshMessage.payload.referer, "https://www.huya.com/");
+  assert.equal(refreshMessage.payload.sources[0].includes("fresh-live-token"), true);
+  native.emit({
+    version: 1,
+    type: "sources_refreshed",
+    requestId: refreshMessage.requestId,
+    taskId: startMessage.taskId,
+    kind: "live"
+  });
+  await flush();
+
+  vm.runInContext("prepareLiveRecording = async () => { throw new Error('tab navigated'); };", harness.sandbox);
+  native.emit({
+    version: 1,
+    type: "refresh_required",
+    taskId: startMessage.taskId,
+    kind: "live",
+    reason: "source_expired"
+  });
+  await waitFor(async () => {
+    const response = await sendRuntimeMessage(harness.listeners.message, {
+      type: "BILI_DOWNLOAD_GET_COMPANION_TASK",
+      payload: { taskId: startMessage.taskId }
+    });
+    return response.payload?.state === "interrupted";
+  });
+  const interrupted = await sendRuntimeMessage(harness.listeners.message, {
+    type: "BILI_DOWNLOAD_GET_COMPANION_TASK",
+    payload: { taskId: startMessage.taskId }
+  });
+  assert.equal(interrupted.payload.recoverable, true);
+  assert.match(interrupted.payload.error, /回到原直播间后重试/);
+
+  const legacy = vm.runInContext(`normalizeCompanionTaskMetadata({
+    roomId: 100,
+    quality: 80,
+    title: "Legacy live"
+  }, "live")`, harness.sandbox);
+  assert.equal(legacy.site, "bilibili");
+  assert.equal(legacy.roomKey, "100");
 });
 
 test("background companion shares one native host across concurrent tasks", async () => {

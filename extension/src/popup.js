@@ -1342,12 +1342,14 @@ function normalizeCompanionTaskState(value) {
 }
 
 function rememberCompanionTask(task) {
+  const site = String(task?.site || task?.metadata?.site || "").toLowerCase();
   const normalized = {
     taskId: String(task?.taskId || "").replace(/[^a-z0-9_-]/gi, "").slice(0, 160),
     tabId: Number(task?.tabId) || 0,
     kind: ["dash", "live"].includes(String(task?.kind || "").toLowerCase())
       ? String(task.kind).toLowerCase()
       : "",
+    site: site ? normalizeSite(site) : "",
     title: safeCompanionDisplayText(task?.title || "", 240),
     outputName: safeCompanionOutputName(task?.outputName || ""),
     state: normalizeCompanionTaskState(task?.state || task?.taskState),
@@ -1381,6 +1383,7 @@ function receiveCompanionTaskProgress(payload) {
     taskId: payload.taskId,
     tabId: payload.tabId ?? previous.tabId,
     kind: payload.companionKind || payload.kind || previous.kind,
+    site: payload.site || previous.site,
     title: payload.title || previous.title,
     outputName: payload.outputName || previous.outputName,
     state: payload.taskState || payload.state || previous.state,
@@ -1873,7 +1876,9 @@ function taskCenterTitle(kind, item) {
     return String(item.title || item.label || "多分 P 下载队列");
   }
   if (kind === "companion") {
-    const label = item.kind === "live" ? "直播录制" : "高清视频";
+    const label = item.kind === "live"
+      ? `${siteDisplayName(item.site || "bilibili")}直播录制`
+      : "高清视频";
     return `${label} · ${String(item.title || item.outputName || "增强下载")}`;
   }
   const segment = Array.isArray(item.segments) ? item.segments[0] : null;

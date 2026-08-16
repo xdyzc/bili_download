@@ -36,7 +36,7 @@ jobs:
       - name: Check extension syntax
         run: npm run test:syntax
 
-      - uses: browser-actions/setup-chrome@v1
+      - uses: browser-actions/setup-chrome@v2
         id: chrome
         with:
           chrome-version: stable

@@ -493,6 +493,77 @@ def test_live_splits_reopened_connections_and_writes_a_url_free_manifest(tmp_pat
 
 
 @with_tmp_path
+def test_huya_live_treats_short_flv_eof_as_expected_rollover(tmp_path: Path) -> None:
+    source = "https://tx.flv.huya.com/src/stream.flv?wsSecret=redacted&wsTime=123&codec=265"
+    clock = FakeClock()
+
+    def flv_fragment(timestamp: int, value: int) -> bytes:
+        tag = bytearray(16)
+        tag[0] = 9
+        tag[3] = 1
+        tag[4:7] = timestamp.to_bytes(3, "big")
+        tag[7] = (timestamp >> 24) & 0xFF
+        tag[11] = value
+        tag[12:16] = (12).to_bytes(4, "big")
+        return b"FLV\x01\x05\x00\x00\x00\x09\x00\x00\x00\x00" + bytes(tag)
+
+    class RollingHuyaOpener:
+        def __init__(self) -> None:
+            self.requests = []
+
+        def open(self, request, timeout: int):
+            self.requests.append((request, timeout))
+            index = len(self.requests)
+            return ClockedResponse([flv_fragment(index * 100, index)], clock, seconds_per_chunk=1)
+
+    opener = RollingHuyaOpener()
+    events: list[dict] = []
+    host = companion.CompanionHost(
+        output_dir=tmp_path,
+        max_disk_bytes=4096,
+        opener=opener,
+        muxer=fake_mux,
+        emit=events.append,
+        clock=clock,
+    )
+
+    task = host.handle({
+        "version": 1,
+        "type": "start_live",
+        "requestId": "huya_live_request",
+        "taskId": "huya_live",
+        "payload": {
+            "outputName": "Huya session",
+            "referer": "https://www.huya.com/fixture-anchor",
+            "sources": [source],
+            "maxBytes": 1024,
+            "maxDurationSeconds": 3,
+            "segmentDurationSeconds": 3,
+        },
+    })
+    assert task is not None and task.thread is not None
+    task.thread.join(timeout=2)
+    assert not task.thread.is_alive()
+
+    manifest = json.loads(task.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["status"] == "completed"
+    assert manifest["segmentCount"] == 3
+    assert not any(event.get("phase") == "reconnecting" for event in events)
+    assert not any(event["type"] == "refresh_required" for event in events)
+    request_urls = [request.full_url for request, _timeout in opener.requests]
+    assert len(request_urls) == 3
+    assert len(set(request_urls)) == 3
+    assert all("timeStamp=" in url for url in request_urls)
+    assert all("codec=" not in url for url in request_urls)
+    assert "startPts=" not in request_urls[0]
+    assert "startPts=101" in request_urls[1]
+    assert "startPts=201" in request_urls[2]
+    artifacts = serialized_artifacts(events, task.manifest_path)
+    assert "wsSecret" not in artifacts
+    assert "https://" not in artifacts
+
+
+@with_tmp_path
 def test_live_requests_fresh_sources_after_expiry_without_persisting_them(tmp_path: Path) -> None:
     old_source = "https://expired.bilivideo.com/live.flv?token=old-live-token"
     fresh_source = "https://fresh.bilivideo.com/live.flv?token=fresh-live-token"
@@ -695,6 +766,36 @@ def test_live_media_policies_pair_each_referer_with_its_own_cdn_family() -> None
             companion.ProtocolError,
             lambda referer=referer, source=source: companion._source_list([source], referer=referer),
         )
+
+
+def test_huya_live_connection_url_only_refreshes_safe_transport_parameters() -> None:
+    source = (
+        "https://tx.flv.huya.com/src/stream.flv"
+        "?wsSecret=redacted&wsTime=123&ratio=2000&codec=265&startPts=10&timeStamp=old"
+    )
+    with patch.object(companion.time, "time_ns", return_value=987654321):
+        refreshed = companion._live_connection_url(
+            source,
+            "https://www.huya.com/fixture-anchor",
+            7,
+            456,
+        )
+    parsed = companion.urlparse(refreshed)
+    query = dict(companion.parse_qsl(parsed.query, keep_blank_values=True))
+    assert parsed.scheme == "https"
+    assert parsed.hostname == "tx.flv.huya.com"
+    assert parsed.path == "/src/stream.flv"
+    assert query["wsSecret"] == "redacted"
+    assert query["wsTime"] == "123"
+    assert query["ratio"] == "2000"
+    assert query["timeStamp"] == "987654321-7"
+    assert query["startPts"] == "457"
+    assert "codec" not in query
+    assert companion._live_connection_url(
+        source,
+        "https://live.bilibili.com/123",
+        7,
+    ) == source
 
 
 def test_redirect_policy_allows_huya_cdn_failover_and_rejects_cross_site_targets() -> None:

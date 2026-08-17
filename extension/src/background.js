@@ -1010,6 +1010,60 @@ async function readHuyaLiveStateInPage(requestedQuality, includeSources) {
     }));
   const candidates = [];
   if (includeSources && group) {
+    let roomPlayer = null;
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      roomPlayer = globalThis.TT_ROOM_PLAYER;
+      if (typeof roomPlayer?.initComplete === "function") {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    if (typeof roomPlayer?.initComplete !== "function") {
+      return { ok: false, error: "虎牙官方播放器尚未准备好，请刷新直播页后重试。" };
+    }
+
+    const officialPlayer = await new Promise((resolve) => {
+      let settled = false;
+      const finish = (value) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        resolve(value || null);
+      };
+      const timeout = setTimeout(() => finish(null), 5000);
+      try {
+        roomPlayer.initComplete((player) => {
+          clearTimeout(timeout);
+          finish(player);
+        });
+      } catch (_error) {
+        clearTimeout(timeout);
+        finish(null);
+      }
+    });
+    const anticode = officialPlayer?.vcore?.h5player?.player?.anticode;
+    let officialAntiCode = String(anticode?.getAnticode?.() || "").replace(/^\?/, "");
+    if ((!officialAntiCode || anticode?.isInvalid?.()) && typeof anticode?.valid === "function") {
+      const refreshed = await Promise.race([
+        Promise.resolve().then(() => anticode.valid()).then(() => true).catch(() => false),
+        new Promise((resolve) => setTimeout(() => resolve(false), 5000))
+      ]);
+      if (refreshed) {
+        officialAntiCode = String(anticode.getAnticode?.() || "").replace(/^\?/, "");
+      }
+    }
+    const officialParams = new URLSearchParams(officialAntiCode);
+    if (
+      !officialAntiCode ||
+      officialAntiCode.length > 2048 ||
+      /[\r\n]/.test(officialAntiCode) ||
+      !officialParams.get("wsSecret") ||
+      !officialParams.get("wsTime")
+    ) {
+      return { ok: false, error: "虎牙官方播放器没有提供可用的录制授权，请刷新直播页后重试。" };
+    }
+
     const requestedBitrate = Number(requestedQuality) === 10000 ? 0 : Number(requestedQuality) || 0;
     const seen = new Set();
     for (const item of group.gameStreamInfoList) {
@@ -1019,18 +1073,19 @@ async function readHuyaLiveStateInPage(requestedQuality, includeSources) {
       const suffix = String(item?.sFlvUrlSuffix || "").toLowerCase();
       const base = String(item?.sFlvUrl || "").replace(/^http:\/\//i, "https://").replace(/\/+$/, "");
       const streamName = String(item?.sStreamName || "");
-      const antiCode = String(item?.sFlvAntiCode || "").replace(/^\?/, "");
-      if (suffix !== "flv" || !base || !streamName || !antiCode) {
+      if (suffix !== "flv" || !base || !streamName) {
         continue;
       }
       let url = "";
       try {
-        const parsed = new URL(`${base}/${streamName}.${suffix}?${antiCode}`);
+        const parsed = new URL(`${base}/${streamName}.${suffix}?${officialAntiCode}`);
         if (requestedBitrate > 0) {
           parsed.searchParams.set("ratio", String(requestedBitrate));
         } else {
           parsed.searchParams.delete("ratio");
         }
+        parsed.searchParams.delete("codec");
+        parsed.searchParams.set("timeStamp", String(Date.now()));
         const host = parsed.hostname.toLowerCase();
         if (parsed.protocol === "https:" && (host === "flv.huya.com" || host.endsWith(".flv.huya.com"))) {
           url = parsed.href;

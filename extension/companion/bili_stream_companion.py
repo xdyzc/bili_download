@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, BinaryIO, Callable, Mapping
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 import argparse
 import json
@@ -162,6 +162,7 @@ class TaskContext:
     segment_seconds: int = DEFAULT_LIVE_SEGMENT_SECONDS
     bytes_written: int = 0
     segment_count: int = 0
+    live_last_timestamp: int = -1
     manifest: dict[str, Any] = field(default_factory=dict)
     thread: threading.Thread | None = None
 
@@ -916,6 +917,10 @@ class CompanionHost:
 
                 bytes_in_segment = _existing_size(part_path)
                 if bytes_in_segment > 0:
+                    if _is_huya_referer(referer):
+                        last_timestamp = _last_flv_media_timestamp(part_path)
+                        if last_timestamp >= 0:
+                            context.live_last_timestamp = last_timestamp
                     segment_path.parent.mkdir(parents=True, exist_ok=True)
                     part_path.replace(segment_path)
                     context.release_live_part(part_path)
@@ -944,6 +949,13 @@ class CompanionHost:
                 # a transport error starts a fresh FLV file so headers are never
                 # blindly concatenated across independent live connections.
                 if result is not None and result.reason == "segment_duration":
+                    failed_candidates.clear()
+                    continue
+                if (
+                    result is not None
+                    and result.reason == "source_ended"
+                    and _is_huya_referer(referer)
+                ):
                     failed_candidates.clear()
                     continue
                 if failure is None:
@@ -1005,7 +1017,13 @@ class CompanionHost:
         context: TaskContext,
         segment_index: int,
     ) -> "LiveConnectionResult":
-        request = Request(url, headers=_media_request_headers(referer))
+        request_url = _live_connection_url(
+            url,
+            referer,
+            segment_index,
+            context.live_last_timestamp,
+        )
+        request = Request(request_url, headers=_media_request_headers(referer))
         response = None
         try:
             response = self._opener.open(request, timeout=20)
@@ -1535,6 +1553,58 @@ def _site_for_referer(value: str) -> str | None:
         if host in policy["referer_hosts"]:
             return site
     return None
+
+
+def _is_huya_referer(value: str) -> bool:
+    return _site_for_referer(value) == "huya"
+
+
+def _live_connection_url(
+    value: str,
+    referer: str,
+    segment_index: int,
+    last_timestamp: int = -1,
+) -> str:
+    if not _is_huya_referer(referer):
+        return value
+    parsed = urlparse(value)
+    query = [
+        (key, item)
+        for key, item in parse_qsl(parsed.query, keep_blank_values=True)
+        if key not in {"timeStamp", "startPts", "codec"}
+    ]
+    query.append(("timeStamp", f"{time.time_ns()}-{max(int(segment_index), 0)}"))
+    if int(last_timestamp) >= 0:
+        query.append(("startPts", str(int(last_timestamp) + 1)))
+    return urlunparse(parsed._replace(query=urlencode(query)))
+
+
+def _last_flv_media_timestamp(path: Path) -> int:
+    try:
+        with path.open("rb") as stream:
+            header = stream.read(9)
+            if len(header) != 9 or header[:4] != b"FLV\x01":
+                return -1
+            data_offset = int.from_bytes(header[5:9], "big")
+            if data_offset < 9:
+                return -1
+            stream.seek(data_offset + 4)
+            last_timestamp = -1
+            while True:
+                tag = stream.read(11)
+                if not tag:
+                    return last_timestamp
+                if len(tag) != 11:
+                    return -1
+                data_size = int.from_bytes(tag[1:4], "big")
+                timestamp = int.from_bytes(tag[4:7], "big") | (tag[7] << 24)
+                payload = stream.read(data_size + 4)
+                if len(payload) != data_size + 4:
+                    return -1
+                if tag[0] in {8, 9}:
+                    last_timestamp = max(last_timestamp, timestamp)
+    except OSError:
+        return -1
 
 
 def _allowed_cdn_host(host: str, *, site: str) -> bool:

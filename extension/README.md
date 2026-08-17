@@ -120,5 +120,13 @@ npm run probe:live
 - Douyu: `https://www.douyu.com/<numeric-room>`
 - Huya: `https://www.huya.com/<numeric-room-or-anchor-alias>`
 
+Huya recording reuses the official player authorization already present on the
+open room page. Browser recording reconnects Huya's short AVC FLV responses
+with the player-supported timestamp cursor and removes overlapping FLV tags
+before saving one file. The optional companion keeps independently playable
+FLV segments and advances the same cursor between connections. Return to the
+original room page if that page is closed or the official player is no longer
+available to refresh an expired source.
+
 All access stays within the current browser session. The extension does not
 bypass login, payment, region, DRM, or copyright restrictions.

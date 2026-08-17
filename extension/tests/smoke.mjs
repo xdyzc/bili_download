@@ -2097,6 +2097,26 @@ test("Huya page adapter filters AVC qualities and builds three HTTPS CDN candida
   const fixture = JSON.parse(await readFile("extension/tests/fixtures/huya-player.json", "utf8"));
   const sandbox = await backgroundUnitSandbox();
   sandbox.hyPlayerConfig = { stream: fixture };
+  sandbox.TT_ROOM_PLAYER = {
+    initComplete(callback) {
+      callback({
+        vcore: {
+          h5player: {
+            player: {
+              anticode: {
+                getAnticode() {
+                  return "wsSecret=official-redacted&wsTime=12345678&seqid=1";
+                },
+                isInvalid() {
+                  return false;
+                }
+              }
+            }
+          }
+        }
+      });
+    }
+  };
   sandbox.location.pathname = "/fixture-anchor";
 
   const result = await sandbox.readHuyaLiveStateInPage(2000, true);
@@ -2119,10 +2139,28 @@ test("Huya page adapter filters AVC qualities and builds three HTTPS CDN candida
     assert.ok(url.hostname.endsWith(".flv.huya.com"));
     assert.equal(url.searchParams.get("ratio"), "2000");
     assert.equal(url.searchParams.getAll("ratio").length, 1);
+    assert.equal(url.searchParams.get("wsSecret"), "official-redacted");
+    assert.equal(url.searchParams.has("timeStamp"), true);
+    assert.equal(url.searchParams.has("codec"), false);
   }
 
   const sourceResult = await sandbox.readHuyaLiveStateInPage(10000, true);
   assert.equal(new URL(sourceResult.payload.candidates[0].url).searchParams.has("ratio"), false);
+
+  delete sandbox.TT_ROOM_PLAYER;
+  sandbox.setTimeout = (callback) => {
+    callback();
+    return 1;
+  };
+  const missingOfficialPlayer = await sandbox.readHuyaLiveStateInPage(2000, true);
+  assert.equal(missingOfficialPlayer.ok, false);
+  assert.match(missingOfficialPlayer.error, /官方播放器尚未准备好/);
+  sandbox.TT_ROOM_PLAYER = {
+    initComplete() {}
+  };
+  const timedOutOfficialPlayer = await sandbox.readHuyaLiveStateInPage(2000, true);
+  assert.equal(timedOutOfficialPlayer.ok, false);
+  assert.match(timedOutOfficialPlayer.error, /录制授权/);
 
   sandbox.hyPlayerConfig = { stream: { data: [] } };
   const offline = await sandbox.readHuyaLiveStateInPage(0, false);
@@ -2154,6 +2192,26 @@ test("multi-site live registry loads and prepares Douyu and Huya recordings", as
     }
   });
   sandbox.hyPlayerConfig = { stream: huyaFixture };
+  sandbox.TT_ROOM_PLAYER = {
+    initComplete(callback) {
+      callback({
+        vcore: {
+          h5player: {
+            player: {
+              anticode: {
+                getAnticode() {
+                  return "wsSecret=official-redacted&wsTime=12345678&seqid=1";
+                },
+                isInvalid() {
+                  return false;
+                }
+              }
+            }
+          }
+        }
+      });
+    }
+  };
   sandbox.chrome.scripting = {
     async executeScript(details) {
       if (details.func.name === "fetchJsonInPage") {
@@ -5815,6 +5873,71 @@ test("popup records a live FLV stream until the user stops it", async () => {
 
   vm.createContext(sandbox);
   vm.runInContext(code, sandbox);
+
+  const PopupUint8Array = vm.runInContext("Uint8Array", sandbox);
+  const flvTag = (type, timestamp, value) => {
+    const tag = new Uint8Array(16);
+    tag[0] = type;
+    tag[3] = 1;
+    tag[4] = (timestamp >>> 16) & 0xff;
+    tag[5] = (timestamp >>> 8) & 0xff;
+    tag[6] = timestamp & 0xff;
+    tag[7] = (timestamp >>> 24) & 0xff;
+    tag[11] = value;
+    tag[15] = 12;
+    return tag;
+  };
+  const flvFragment = (tags) => {
+    const header = new Uint8Array([0x46, 0x4c, 0x56, 0x01, 0x05, 0, 0, 0, 9, 0, 0, 0, 0]);
+    const total = header.byteLength + tags.reduce((sum, tag) => sum + tag.byteLength, 0);
+    const bytes = new Uint8Array(total);
+    bytes.set(header, 0);
+    let offset = header.byteLength;
+    for (const tag of tags) {
+      bytes.set(tag, offset);
+      offset += tag.byteLength;
+    }
+    return new PopupUint8Array(bytes);
+  };
+  const firstFragment = flvFragment([
+    flvTag(18, 100, 1),
+    flvTag(9, 100, 2),
+    flvTag(8, 110, 3),
+    flvTag(9, 200, 4)
+  ]);
+  const firstMerged = sandbox.mergeHuyaFlvFragment(firstFragment, -1, true);
+  assert.equal(firstMerged.lastTimestamp, 200);
+  assert.equal(firstMerged.bytes.byteLength, firstFragment.byteLength);
+  const secondFragment = flvFragment([
+    flvTag(18, 150, 5),
+    flvTag(9, 190, 6),
+    flvTag(8, 210, 7),
+    flvTag(9, 240, 8)
+  ]);
+  const secondMerged = sandbox.mergeHuyaFlvFragment(secondFragment, 200, false);
+  assert.equal(secondMerged.lastTimestamp, 240);
+  assert.equal(secondMerged.bytes.byteLength, 32);
+  assert.deepEqual(Array.from(secondMerged.bytes), [
+    ...Array.from(flvTag(8, 210, 7)),
+    ...Array.from(flvTag(9, 240, 8))
+  ]);
+  const interruptedFragment = new PopupUint8Array(firstFragment.byteLength + 3);
+  interruptedFragment.set(firstFragment, 0);
+  interruptedFragment.set([9, 0, 1], firstFragment.byteLength);
+  const interruptedMerged = sandbox.mergeHuyaFlvFragment(interruptedFragment, -1, true, true);
+  assert.equal(interruptedMerged.bytes.byteLength, firstFragment.byteLength);
+  assert.throws(
+    () => sandbox.mergeHuyaFlvFragment(interruptedFragment, -1, true),
+    /截断/
+  );
+  const reconnectUrl = new URL(sandbox.huyaRecordingRequestUrl(
+    "https://tx.flv.huya.com/src/stream.flv?wsSecret=redacted&wsTime=123&codec=265",
+    5000,
+    2
+  ));
+  assert.equal(reconnectUrl.searchParams.get("startPts"), "3000");
+  assert.match(reconnectUrl.searchParams.get("timeStamp"), /^\d+-2$/);
+  assert.equal(reconnectUrl.searchParams.has("codec"), false);
 
   await sandbox.initialize();
   assert.equal(bvidInput.value, "7734200");

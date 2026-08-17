@@ -2584,7 +2584,9 @@ async function recordLiveSegment(segment, control) {
         segmentCount: 1,
         candidateIndex: index + 1,
         candidateCount: candidates.length,
-        totalBytes: 0
+        totalBytes: 0,
+        site: normalizeSite(segment.context?.site),
+        candidates: normalizeSite(segment.context?.site) === "huya" ? candidates : null
       });
       diagnostic.candidateAttempts.push({
         at: new Date().toISOString(),
@@ -2666,6 +2668,14 @@ async function recordLiveSegment(segment, control) {
 }
 
 async function fetchLiveRecording(url, filename, control, progressContext) {
+  if (normalizeSite(progressContext?.site) === "huya") {
+    return fetchHuyaLiveRecording(
+      Array.isArray(progressContext?.candidates) ? progressContext.candidates : [{ url, kind: "primary", size: 0 }],
+      filename,
+      control,
+      progressContext
+    );
+  }
   const abortController = new AbortController();
   control.abortControllers.add(abortController);
   const safety = getLiveSafetyLimits();
@@ -2834,6 +2844,363 @@ async function fetchLiveRecording(url, filename, control, progressContext) {
     }
     control.abortControllers.delete(abortController);
   }
+}
+
+async function fetchHuyaLiveRecording(initialCandidates, filename, control, progressContext) {
+  const abortController = new AbortController();
+  control.abortControllers.add(abortController);
+  const safety = getLiveSafetyLimits();
+  const maxBytes = safety.maxBytes;
+  const maxDurationMs = safety.maxDurationMs;
+  const recordingStartedAt = Number(control.liveStartedAt) || Date.now();
+  const deadlineAt = Number(control.liveDeadlineAt) || recordingStartedAt + maxDurationMs;
+  control.liveStartedAt = recordingStartedAt;
+  control.liveDeadlineAt = deadlineAt;
+  let candidates = normalizeHuyaRecordingCandidates(initialCandidates);
+  const chunks = [];
+  let receivedBytes = 0;
+  let response = null;
+  let stoppedByUser = false;
+  let stoppedBySafetyLimit = false;
+  let stopReason = "";
+  let limitTimer = null;
+  let lastTimestamp = -1;
+  let reconnectSequence = 0;
+  let candidateIndex = 0;
+  let consecutiveFailures = 0;
+  let stalledConnections = 0;
+  let refreshRounds = 0;
+
+  const durationMs = () => Math.max(Date.now() - recordingStartedAt, 0);
+  const stoppedResult = (savedToDisk = false, blob = null) => ({
+    ok: true,
+    responseOk: Boolean(response?.ok),
+    status: response?.status || 0,
+    statusText: response?.statusText || "",
+    mime: blob?.type || response?.headers?.get("content-type") || "video/x-flv",
+    size: blob?.size || receivedBytes,
+    totalBytes: blob?.size || receivedBytes,
+    receivedBytes,
+    durationMs: durationMs(),
+    filename,
+    mode: "live-flv",
+    savedToDisk,
+    stoppedByUser: stoppedByUser || control.canceled,
+    stoppedBySafetyLimit,
+    stopReason,
+    maxBytes,
+    maxFileBytes: safety.maxFileBytes,
+    maxMemoryBytes: safety.maxMemoryBytes,
+    maxDurationMs,
+    reconnectCount: reconnectSequence
+  });
+  const stopForSafetyLimit = (reason) => {
+    if (control.canceled || stoppedBySafetyLimit) {
+      return;
+    }
+    stoppedBySafetyLimit = true;
+    stopReason = reason;
+    abortController.abort();
+  };
+  const refreshCandidates = async () => {
+    if (refreshRounds >= 3) {
+      throw new Error("虎牙直播源连续刷新失败，请回到原直播间后重试。");
+    }
+    refreshRounds += 1;
+    const prepared = await prepareLiveRecording();
+    candidates = normalizeHuyaRecordingCandidates(readCandidates(prepared?.segments?.[0]));
+    candidateIndex = 0;
+    consecutiveFailures = 0;
+    stalledConnections = 0;
+  };
+
+  try {
+    if (control.canceled) {
+      const error = downloadCanceledError();
+      error.result = stoppedResult(false);
+      throw error;
+    }
+    if (!candidates.length) {
+      throw new Error("虎牙没有返回可录制的 HTTPS AVC FLV 直播流。");
+    }
+    beginCandidateProgress({
+      ...progressContext,
+      totalBytes: 0
+    });
+    state.progress.durationMs = durationMs();
+    renderProgress();
+    const remainingDurationMs = Math.max(deadlineAt - Date.now(), 0);
+    if (remainingDurationMs <= 0) {
+      stoppedBySafetyLimit = true;
+      stopReason = "duration";
+      return stoppedResult(false);
+    }
+    if (typeof setTimeout === "function") {
+      limitTimer = setTimeout(() => stopForSafetyLimit("duration"), remainingDurationMs);
+    }
+
+    while (!control.canceled && !stoppedBySafetyLimit && Date.now() < deadlineAt) {
+      await waitForSpecificControl(control);
+      if (control.canceled || stoppedBySafetyLimit) {
+        break;
+      }
+      const candidate = candidates[candidateIndex % candidates.length];
+      candidateIndex += 1;
+      reconnectSequence += 1;
+      const requestUrl = huyaRecordingRequestUrl(candidate.url, lastTimestamp, reconnectSequence);
+      const responseChunks = [];
+      let responseBytes = 0;
+      let readInterrupted = false;
+      try {
+        response = await fetch(requestUrl, {
+          credentials: "include",
+          cache: "no-store",
+          headers: {
+            "Accept": "*/*"
+          },
+          signal: abortController.signal
+        });
+        if (!response.ok) {
+          if ([401, 403, 410].includes(Number(response.status))) {
+            await refreshCandidates();
+            continue;
+          }
+          throw new Error(`HTTP ${response.status || "unknown"}`);
+        }
+        const reader = response.body?.getReader();
+        if (!reader) {
+          throw new Error("Live stream response did not include a readable body.");
+        }
+        while (true) {
+          await waitForSpecificControl(control);
+          let packet = null;
+          try {
+            packet = await reader.read();
+          } catch (error) {
+            if (control.canceled || stoppedBySafetyLimit || error?.name === "AbortError") {
+              readInterrupted = true;
+              stoppedByUser = control.canceled;
+              break;
+            }
+            throw error;
+          }
+          if (packet.done) {
+            break;
+          }
+          const nextResponseBytes = responseBytes + packet.value.byteLength;
+          const responseLimit = Math.min(
+            safety.maxMemoryBytes || maxBytes || 64 * 1024 * 1024,
+            64 * 1024 * 1024
+          );
+          if (responseLimit > 0 && nextResponseBytes > responseLimit) {
+            throw new Error("虎牙单个直播片段过大，已停止以保护浏览器内存。");
+          }
+          responseChunks.push(packet.value);
+          responseBytes = nextResponseBytes;
+        }
+      } catch (error) {
+        if (control.canceled || stoppedBySafetyLimit || error?.name === "AbortError") {
+          readInterrupted = true;
+          stoppedByUser = control.canceled;
+        } else {
+          consecutiveFailures += 1;
+          if (consecutiveFailures >= candidates.length) {
+            await refreshCandidates();
+          }
+          if (!control.canceled && !stoppedBySafetyLimit) {
+            await waitForHuyaReconnect(control, 250);
+          }
+          continue;
+        }
+      }
+
+      if (responseBytes > 0) {
+        const fragment = mergeHuyaFlvFragment(
+          joinUint8Arrays(responseChunks, responseBytes),
+          lastTimestamp,
+          chunks.length === 0,
+          readInterrupted
+        );
+        if (fragment.bytes.byteLength > 0) {
+          const nextReceivedBytes = receivedBytes + fragment.bytes.byteLength;
+          if (maxBytes > 0 && nextReceivedBytes > maxBytes) {
+            stopForSafetyLimit("size");
+          } else {
+            chunks.push(fragment.bytes);
+            receivedBytes = nextReceivedBytes;
+            lastTimestamp = fragment.lastTimestamp;
+            stalledConnections = 0;
+            consecutiveFailures = 0;
+            updateProgress({
+              ...progressContext,
+              receivedBytes,
+              totalBytes: 0,
+              done: false
+            });
+          }
+        } else {
+          stalledConnections += 1;
+        }
+      } else {
+        stalledConnections += 1;
+      }
+
+      if (readInterrupted || control.canceled || stoppedBySafetyLimit) {
+        break;
+      }
+      if (stalledConnections >= 2) {
+        await refreshCandidates();
+      }
+      await waitForHuyaReconnect(control, 250);
+    }
+
+    state.progress.durationMs = durationMs();
+    if (receivedBytes <= 0) {
+      const result = stoppedResult(false);
+      if (result.stoppedByUser) {
+        const error = downloadCanceledError();
+        error.result = result;
+        throw error;
+      }
+      return result;
+    }
+    const blob = new Blob(chunks, {
+      type: response?.headers?.get("content-type") || "video/x-flv"
+    });
+    if (blob.size <= 0) {
+      return stoppedResult(false);
+    }
+    saveBlob(blob, filename);
+    return stoppedResult(true, blob);
+  } finally {
+    if (limitTimer !== null && typeof clearTimeout === "function") {
+      clearTimeout(limitTimer);
+    }
+    control.abortControllers.delete(abortController);
+  }
+}
+
+function normalizeHuyaRecordingCandidates(candidates) {
+  return (Array.isArray(candidates) ? candidates : [])
+    .map((candidate) => ({
+      url: String(candidate?.url || ""),
+      kind: String(candidate?.kind || "backup"),
+      size: 0
+    }))
+    .filter((candidate) => {
+      try {
+        const parsed = new URL(candidate.url);
+        const host = parsed.hostname.toLowerCase();
+        return parsed.protocol === "https:" &&
+          (host === "flv.huya.com" || host.endsWith(".flv.huya.com")) &&
+          /\.flv$/i.test(parsed.pathname);
+      } catch (_error) {
+        return false;
+      }
+    })
+    .slice(0, 3);
+}
+
+function huyaRecordingRequestUrl(url, lastTimestamp, sequence) {
+  const parsed = new URL(url);
+  parsed.searchParams.set("timeStamp", `${Date.now()}-${Math.max(Number(sequence) || 0, 0)}`);
+  if (Number(lastTimestamp) >= 0) {
+    parsed.searchParams.set("startPts", String(Math.max(Number(lastTimestamp) - 2000, 0)));
+  } else {
+    parsed.searchParams.delete("startPts");
+  }
+  parsed.searchParams.delete("codec");
+  return parsed.href;
+}
+
+function mergeHuyaFlvFragment(bytes, lastTimestamp, includeHeader, allowTruncated = false) {
+  if (!(bytes instanceof Uint8Array) || bytes.byteLength < 13) {
+    throw new Error("虎牙返回了不完整的 FLV 直播片段。");
+  }
+  if (bytes[0] !== 0x46 || bytes[1] !== 0x4c || bytes[2] !== 0x56 || bytes[3] !== 0x01) {
+    throw new Error("虎牙返回了不支持的直播格式。");
+  }
+  const dataOffset = (
+    ((bytes[5] << 24) >>> 0) |
+    (bytes[6] << 16) |
+    (bytes[7] << 8) |
+    bytes[8]
+  );
+  let offset = dataOffset + 4;
+  if (dataOffset < 9 || offset > bytes.byteLength) {
+    throw new Error("虎牙返回了损坏的 FLV 直播片段。");
+  }
+  const retained = [];
+  let retainedBytes = 0;
+  let nextTimestamp = Number(lastTimestamp);
+  let completeEnd = offset;
+  while (offset + 15 <= bytes.byteLength) {
+    const tagType = bytes[offset];
+    const dataSize = (bytes[offset + 1] << 16) | (bytes[offset + 2] << 8) | bytes[offset + 3];
+    const timestamp = (
+      ((bytes[offset + 7] << 24) >>> 0) |
+      (bytes[offset + 4] << 16) |
+      (bytes[offset + 5] << 8) |
+      bytes[offset + 6]
+    );
+    const nextOffset = offset + 11 + dataSize + 4;
+    if (nextOffset > bytes.byteLength) {
+      if (allowTruncated) {
+        break;
+      }
+      throw new Error("虎牙返回了截断的 FLV 直播片段。");
+    }
+    if (includeHeader || (tagType !== 18 && timestamp > Number(lastTimestamp))) {
+      retained.push([offset, nextOffset]);
+      retainedBytes += nextOffset - offset;
+      if (tagType === 8 || tagType === 9) {
+        nextTimestamp = Math.max(nextTimestamp, timestamp);
+      }
+    }
+    offset = nextOffset;
+    completeEnd = nextOffset;
+  }
+  if (offset !== bytes.byteLength && !allowTruncated) {
+    throw new Error("虎牙返回了截断的 FLV 直播片段。");
+  }
+  if (includeHeader) {
+    if (!retained.length || nextTimestamp < 0) {
+      throw new Error("虎牙直播片段没有可录制的音视频数据。");
+    }
+    return {
+      bytes: completeEnd === bytes.byteLength ? bytes : bytes.slice(0, completeEnd),
+      lastTimestamp: nextTimestamp
+    };
+  }
+  if (!retained.length) {
+    return { bytes: new Uint8Array(0), lastTimestamp: Number(lastTimestamp) };
+  }
+  const merged = new Uint8Array(retainedBytes);
+  let writeOffset = 0;
+  for (const [start, end] of retained) {
+    const tag = bytes.subarray(start, end);
+    merged.set(tag, writeOffset);
+    writeOffset += tag.byteLength;
+  }
+  return { bytes: merged, lastTimestamp: nextTimestamp };
+}
+
+function joinUint8Arrays(chunks, totalBytes) {
+  const joined = new Uint8Array(Math.max(Number(totalBytes) || 0, 0));
+  let offset = 0;
+  for (const chunk of chunks) {
+    joined.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return joined;
+}
+
+async function waitForHuyaReconnect(control, delayMs) {
+  if (control.canceled || Number(delayMs) <= 0 || typeof setTimeout !== "function") {
+    return;
+  }
+  await new Promise((resolve) => setTimeout(resolve, Number(delayMs)));
+  await waitForSpecificControl(control);
 }
 
 async function downloadViaPageBlob(segment, diagnostic = createPageDiagnostic(segment), previousError = null, options = {}) {

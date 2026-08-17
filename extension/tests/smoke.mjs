@@ -5625,6 +5625,8 @@ test("popup records a live FLV stream until the user stops it", async () => {
   let abortLiveReadWithNetworkError = false;
   let liveLimitTimer = null;
   let liveLimitDelay = 0;
+  let liveProgressTimer = null;
+  let liveProgressDelay = 0;
   let liveCandidates = [{
     url: "https://live-primary.bilivideo.com/live/test.flv?token=1",
     kind: "primary",
@@ -5669,6 +5671,14 @@ test("popup records a live FLV stream until the user stops it", async () => {
       return 1;
     },
     clearTimeout() {},
+    setInterval(callback, delay) {
+      liveProgressTimer = callback;
+      liveProgressDelay = delay;
+      return 2;
+    },
+    clearInterval() {
+      liveProgressTimer = null;
+    },
     document: {
       addEventListener() {},
       body: {
@@ -5903,6 +5913,20 @@ test("popup records a live FLV stream until the user stops it", async () => {
     }
     return new PopupUint8Array(bytes);
   };
+  const flvAvcTag = (timestamp, keyframe, value) => {
+    const tag = new Uint8Array(18);
+    tag[0] = 9;
+    tag[3] = 3;
+    tag[4] = (timestamp >>> 16) & 0xff;
+    tag[5] = (timestamp >>> 8) & 0xff;
+    tag[6] = timestamp & 0xff;
+    tag[7] = (timestamp >>> 24) & 0xff;
+    tag[11] = keyframe ? 0x17 : 0x27;
+    tag[12] = 1;
+    tag[13] = value;
+    tag[17] = 14;
+    return tag;
+  };
   const firstFragment = flvFragment([
     flvTag(18, 100, 1),
     flvTag(9, 100, 2),
@@ -5955,6 +5979,37 @@ test("popup records a live FLV stream until the user stops it", async () => {
   assert.match(reconnectUrl.searchParams.get("timeStamp"), /^\d+-2$/);
   assert.equal(reconnectUrl.searchParams.has("codec"), false);
 
+  const gapFragment = flvFragment([
+    flvAvcTag(1000, true, 1),
+    flvTag(8, 1010, 2),
+    flvAvcTag(1050, false, 3)
+  ]);
+  const normalizedGap = sandbox.mergeHuyaFlvFragment(gapFragment, 200, false);
+  assert.equal(normalizedGap.timestampAdjustmentMs, 799);
+  assert.equal(normalizedGap.lastTimestamp, 251);
+  assert.equal(normalizedGap.sourceLastTimestamp, 1050);
+  assert.equal(normalizedGap.timestampOffsetMs, 799);
+  assert.deepEqual(Array.from(normalizedGap.bytes.slice(4, 8)), [0, 0, 201, 0]);
+  const laterGapFragment = flvFragment([
+    flvAvcTag(2000, true, 4),
+    flvTag(8, 2010, 5),
+    flvAvcTag(2050, false, 6)
+  ]);
+  const normalizedLaterGap = sandbox.mergeHuyaFlvFragment(
+    laterGapFragment,
+    normalizedGap.lastTimestamp,
+    false,
+    false,
+    {
+      lastSourceTimestamp: normalizedGap.sourceLastTimestamp,
+      timestampOffsetMs: normalizedGap.timestampOffsetMs
+    }
+  );
+  assert.equal(normalizedLaterGap.timestampAdjustmentMs, 949);
+  assert.equal(normalizedLaterGap.timestampOffsetMs, 1748);
+  assert.equal(normalizedLaterGap.lastTimestamp, 302);
+  assert.equal(normalizedLaterGap.sourceLastTimestamp, 2050);
+
   await sandbox.initialize();
   assert.equal(bvidInput.value, "7734200");
   assert.equal(downloadButton.hidden, true);
@@ -5976,6 +6031,10 @@ test("popup records a live FLV stream until the user stops it", async () => {
   }
   assert.equal(liveRecordButton.textContent, "结束录制");
   assert.equal(Boolean(pendingRead), true);
+  assert.equal(liveProgressDelay, 250);
+  fakeNow += 1000;
+  liveProgressTimer();
+  assert.equal(progressPercent.textContent, "00:01");
   assert.match(progressSize.textContent, /4 B \/ --/);
   assert.match(progressPercent.textContent, /^\d{2}:\d{2}$/);
   assert.notEqual(progressPercent.textContent, "--");
@@ -6080,7 +6139,7 @@ test("popup records a live FLV stream until the user stops it", async () => {
     liveRecording: true
   };
   sandbox.setTimeout = (callback, delay) => {
-    if (delay === 250 || delay === 30000) {
+    if (delay === 500 || delay === 30000) {
       callback();
     }
     return 1;
@@ -6096,6 +6155,7 @@ test("popup records a live FLV stream until the user stops it", async () => {
         headers: { get() { return "video/x-flv"; } }
       };
     }
+    const backupConnection = huyaFetchHosts.filter((host) => host === "backup.flv.huya.com").length;
     let reads = 0;
     return {
       ok: true,
@@ -6108,9 +6168,14 @@ test("popup records a live FLV stream until the user stops it", async () => {
             async read() {
               reads += 1;
               if (reads === 1) {
-                return { done: false, value: interruptedFragment };
+                return {
+                  done: false,
+                  value: backupConnection === 1 ? interruptedFragment : gapFragment
+                };
               }
-              huyaControl.canceled = true;
+              if (backupConnection >= 2) {
+                huyaControl.canceled = true;
+              }
               return { done: true };
             }
           };
@@ -6131,9 +6196,13 @@ test("popup records a live FLV stream until the user stops it", async () => {
       candidateCount: 2
     }
   );
-  assert.deepEqual(huyaFetchHosts, ["primary.flv.huya.com", "backup.flv.huya.com"]);
+  assert.deepEqual(huyaFetchHosts, [
+    "primary.flv.huya.com",
+    "backup.flv.huya.com",
+    "backup.flv.huya.com"
+  ]);
   assert.equal(huyaResult.savedToDisk, true);
-  assert.equal(huyaResult.receivedBytes, firstFragment.byteLength);
+  assert.ok(huyaResult.receivedBytes > firstFragment.byteLength);
   assert.equal(savedAnchors.length, savedCountBeforeHuyaFallback + 1);
   assert.equal(savedAnchors.at(-1).download, "Huya fallback.flv");
 });

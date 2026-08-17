@@ -882,7 +882,6 @@ class CompanionHost:
                     raise CompanionError("source_failed", "No live media source is available.")
 
                 source = sources[candidate_index % len(sources)]
-                candidate_index += 1
                 context.segment_count += 1
                 segment_index = context.segment_count
                 segment_path = _live_segment_path(context.output_path, segment_index)
@@ -961,6 +960,7 @@ class CompanionHost:
                 if failure is None:
                     failure = CandidateFailure()
                 failed_candidates.append(failure)
+                candidate_index = (candidate_index + 1) % len(sources)
 
                 if len(failed_candidates) >= len(sources):
                     latest_round = failed_candidates[-len(sources):]

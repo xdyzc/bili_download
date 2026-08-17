@@ -495,6 +495,7 @@ def test_live_splits_reopened_connections_and_writes_a_url_free_manifest(tmp_pat
 @with_tmp_path
 def test_huya_live_treats_short_flv_eof_as_expected_rollover(tmp_path: Path) -> None:
     source = "https://tx.flv.huya.com/src/stream.flv?wsSecret=redacted&wsTime=123&codec=265&startPts=50"
+    backup_source = "https://backup.flv.huya.com/src/stream.flv?wsSecret=redacted&wsTime=123&startPts=50"
     clock = FakeClock()
 
     def flv_fragment(timestamp: int, value: int) -> bytes:
@@ -535,7 +536,7 @@ def test_huya_live_treats_short_flv_eof_as_expected_rollover(tmp_path: Path) -> 
         "payload": {
             "outputName": "Huya session",
             "referer": "https://www.huya.com/fixture-anchor",
-            "sources": [source],
+            "sources": [source, backup_source],
             "maxBytes": 1024,
             "maxDurationSeconds": 3,
             "segmentDurationSeconds": 3,
@@ -553,6 +554,7 @@ def test_huya_live_treats_short_flv_eof_as_expected_rollover(tmp_path: Path) -> 
     request_urls = [request.full_url for request, _timeout in opener.requests]
     assert len(request_urls) == 3
     assert len(set(request_urls)) == 3
+    assert all(companion.urlparse(url).hostname == "tx.flv.huya.com" for url in request_urls)
     assert all("timeStamp=" in url for url in request_urls)
     assert all("codec=" not in url for url in request_urls)
     assert "startPts=50" in request_urls[0]

@@ -1077,6 +1077,7 @@ async function startLiveRecording() {
   control.liveDeadlineAt = 0;
   state.downloadControl = control;
   resetProgress();
+  startLiveProgressClock(control);
   setStatus(TEXT.liveRecording);
   updateControls();
 
@@ -1116,12 +1117,37 @@ async function startLiveRecording() {
     }
     setStatus(error.message);
   } finally {
+    stopLiveProgressClock(control);
     if (state.downloadControl === control) {
       state.downloadControl = null;
     }
     completeProgress();
     updateControls();
   }
+}
+
+function startLiveProgressClock(control) {
+  if (!control || typeof setInterval !== "function") {
+    return;
+  }
+  stopLiveProgressClock(control);
+  control.liveProgressTimer = setInterval(() => {
+    if (state.downloadControl !== control || control.canceled) {
+      stopLiveProgressClock(control);
+      return;
+    }
+    const startedAt = Number(control.liveStartedAt) || state.progress.startedAt || Date.now();
+    state.progress.durationMs = Math.max(Date.now() - startedAt, 0);
+    renderProgress();
+  }, 250);
+}
+
+function stopLiveProgressClock(control) {
+  if (!control?.liveProgressTimer || typeof clearInterval !== "function") {
+    return;
+  }
+  clearInterval(control.liveProgressTimer);
+  control.liveProgressTimer = null;
 }
 
 function stopLiveRecording() {
@@ -1138,6 +1164,7 @@ function stopLiveRecording() {
       .catch((error) => {
         if (state.downloadControl === control) {
           control.canceled = false;
+          startLiveProgressClock(control);
           setStatus(error.message || "无法结束增强下载录制。");
           updateControls();
         }
@@ -2864,7 +2891,10 @@ async function fetchHuyaLiveRecording(initialCandidates, filename, control, prog
   let stoppedBySafetyLimit = false;
   let stopReason = "";
   let limitTimer = null;
+  // Source timestamps drive CDN cursors; output timestamps may be compacted across short-response gaps.
   let lastTimestamp = -1;
+  let lastSourceTimestamp = -1;
+  let timestampOffsetMs = 0;
   let reconnectSequence = 0;
   let candidateIndex = 0;
   let consecutiveFailures = 0;
@@ -2945,12 +2975,10 @@ async function fetchHuyaLiveRecording(initialCandidates, filename, control, prog
         break;
       }
       const candidate = candidates[candidateIndex % candidates.length];
-      candidateIndex += 1;
       reconnectSequence += 1;
-      const requestUrl = huyaRecordingRequestUrl(candidate.url, lastTimestamp, reconnectSequence);
+      const requestUrl = huyaRecordingRequestUrl(candidate.url, lastSourceTimestamp, reconnectSequence);
       const responseChunks = [];
       let responseBytes = 0;
-      let readInterrupted = false;
       try {
         response = await fetch(requestUrl, {
           credentials: "include",
@@ -2965,9 +2993,11 @@ async function fetchHuyaLiveRecording(initialCandidates, filename, control, prog
             consecutiveFailures += 1;
             if (consecutiveFailures >= candidates.length) {
               await refreshCandidates();
+            } else {
+              candidateIndex = (candidateIndex + 1) % candidates.length;
             }
             if (!control.canceled && !stoppedBySafetyLimit) {
-              await waitForHuyaReconnect(control, 250);
+              await waitForHuyaReconnect(control, 500);
             }
             continue;
           }
@@ -2984,7 +3014,6 @@ async function fetchHuyaLiveRecording(initialCandidates, filename, control, prog
             packet = await reader.read();
           } catch (error) {
             if (control.canceled || stoppedBySafetyLimit || error?.name === "AbortError") {
-              readInterrupted = true;
               stoppedByUser = control.canceled;
               break;
             }
@@ -3006,15 +3035,16 @@ async function fetchHuyaLiveRecording(initialCandidates, filename, control, prog
         }
       } catch (error) {
         if (control.canceled || stoppedBySafetyLimit || error?.name === "AbortError") {
-          readInterrupted = true;
           stoppedByUser = control.canceled;
-        } else {
+        } else if (responseBytes <= 0) {
           consecutiveFailures += 1;
           if (consecutiveFailures >= candidates.length) {
             await refreshCandidates();
+          } else {
+            candidateIndex = (candidateIndex + 1) % candidates.length;
           }
           if (!control.canceled && !stoppedBySafetyLimit) {
-            await waitForHuyaReconnect(control, 250);
+            await waitForHuyaReconnect(control, 500);
           }
           continue;
         }
@@ -3025,7 +3055,8 @@ async function fetchHuyaLiveRecording(initialCandidates, filename, control, prog
           joinUint8Arrays(responseChunks, responseBytes),
           lastTimestamp,
           chunks.length === 0,
-          true
+          true,
+          { lastSourceTimestamp, timestampOffsetMs }
         );
         if (fragment.bytes.byteLength > 0) {
           const nextReceivedBytes = receivedBytes + fragment.bytes.byteLength;
@@ -3035,6 +3066,8 @@ async function fetchHuyaLiveRecording(initialCandidates, filename, control, prog
             chunks.push(fragment.bytes);
             receivedBytes = nextReceivedBytes;
             lastTimestamp = fragment.lastTimestamp;
+            lastSourceTimestamp = fragment.sourceLastTimestamp;
+            timestampOffsetMs = fragment.timestampOffsetMs;
             stalledConnections = 0;
             consecutiveFailures = 0;
             updateProgress({
@@ -3051,13 +3084,13 @@ async function fetchHuyaLiveRecording(initialCandidates, filename, control, prog
         stalledConnections += 1;
       }
 
-      if (readInterrupted || control.canceled || stoppedBySafetyLimit) {
+      if (control.canceled || stoppedBySafetyLimit) {
         break;
       }
-      if (stalledConnections >= 2) {
+      if (stalledConnections >= 6) {
         await refreshCandidates();
       }
-      await waitForHuyaReconnect(control, 250);
+      await waitForHuyaReconnect(control, 500);
     }
 
     state.progress.durationMs = durationMs();
@@ -3130,7 +3163,13 @@ function huyaRecordingRequestUrl(url, lastTimestamp, sequence) {
   return parsed.href;
 }
 
-function mergeHuyaFlvFragment(bytes, lastTimestamp, includeHeader, allowTruncated = false) {
+function mergeHuyaFlvFragment(
+  bytes,
+  lastTimestamp,
+  includeHeader,
+  allowTruncated = false,
+  continuity = {}
+) {
   if (!(bytes instanceof Uint8Array) || bytes.byteLength < 13) {
     throw new Error("虎牙返回了不完整的 FLV 直播片段。");
   }
@@ -3147,9 +3186,13 @@ function mergeHuyaFlvFragment(bytes, lastTimestamp, includeHeader, allowTruncate
   if (dataOffset < 9 || offset > bytes.byteLength) {
     throw new Error("虎牙返回了损坏的 FLV 直播片段。");
   }
-  const retained = [];
-  let retainedBytes = 0;
-  let nextTimestamp = Number(lastTimestamp);
+  const tags = [];
+  const previousTimestamp = Number(lastTimestamp);
+  const previousSourceTimestamp = Number.isFinite(Number(continuity.lastSourceTimestamp))
+    ? Number(continuity.lastSourceTimestamp)
+    : previousTimestamp;
+  let timestampOffsetMs = Math.max(Number(continuity.timestampOffsetMs) || 0, 0);
+  let nextSourceTimestamp = previousSourceTimestamp;
   let completeEnd = offset;
   while (offset + 15 <= bytes.byteLength) {
     const tagType = bytes[offset];
@@ -3167,12 +3210,18 @@ function mergeHuyaFlvFragment(bytes, lastTimestamp, includeHeader, allowTruncate
       }
       throw new Error("虎牙返回了截断的 FLV 直播片段。");
     }
-    if (includeHeader || (tagType !== 18 && timestamp > Number(lastTimestamp))) {
-      retained.push([offset, nextOffset]);
-      retainedBytes += nextOffset - offset;
-      if (tagType === 8 || tagType === 9) {
-        nextTimestamp = Math.max(nextTimestamp, timestamp);
-      }
+    const videoHeader = tagType === 9 && dataSize >= 2 ? bytes[offset + 11] : 0;
+    const videoPacketType = tagType === 9 && dataSize >= 2 ? bytes[offset + 12] : -1;
+    tags.push({
+      start: offset,
+      end: nextOffset,
+      tagType,
+      timestamp,
+      isAvcNalu: tagType === 9 && (videoHeader & 0x0f) === 7 && videoPacketType === 1,
+      isKeyframe: tagType === 9 && (videoHeader >> 4) === 1 && (videoHeader & 0x0f) === 7 && videoPacketType === 1
+    });
+    if (tagType === 8 || tagType === 9) {
+      nextSourceTimestamp = Math.max(nextSourceTimestamp, timestamp);
     }
     offset = nextOffset;
     completeEnd = nextOffset;
@@ -3181,25 +3230,95 @@ function mergeHuyaFlvFragment(bytes, lastTimestamp, includeHeader, allowTruncate
     throw new Error("虎牙返回了截断的 FLV 直播片段。");
   }
   if (includeHeader) {
-    if (!retained.length || nextTimestamp < 0) {
+    if (!tags.length || nextSourceTimestamp < 0) {
       throw new Error("虎牙直播片段没有可录制的音视频数据。");
     }
     return {
       bytes: completeEnd === bytes.byteLength ? bytes : bytes.slice(0, completeEnd),
-      lastTimestamp: nextTimestamp
+      lastTimestamp: nextSourceTimestamp,
+      sourceLastTimestamp: nextSourceTimestamp,
+      timestampAdjustmentMs: 0,
+      timestampOffsetMs: 0
     };
   }
+
+  const mediaTags = tags.filter((tag) => tag.tagType === 8 || tag.tagType === 9);
+  const firstNewMedia = mediaTags.find((tag) => tag.timestamp > previousSourceTimestamp);
+  const firstNewVideoNalu = tags.find((tag) => (
+    tag.isAvcNalu && tag.timestamp > previousSourceTimestamp
+  ));
+  let timestampAdjustmentMs = 0;
+  let normalizedBytes = bytes;
+  // Huya can skip wall-clock time between short responses. Collapse it only at a decodable AVC keyframe.
+  if (
+    Number.isFinite(previousTimestamp) &&
+    previousTimestamp >= 0 &&
+    firstNewMedia &&
+    firstNewMedia.timestamp - timestampOffsetMs > previousTimestamp + 250 &&
+    firstNewVideoNalu?.isKeyframe
+  ) {
+    timestampAdjustmentMs = firstNewMedia.timestamp - timestampOffsetMs - previousTimestamp - 1;
+    timestampOffsetMs += timestampAdjustmentMs;
+  }
+  if (timestampOffsetMs > 0) {
+    normalizedBytes = bytes.slice();
+    for (const tag of tags) {
+      writeHuyaFlvTimestamp(
+        normalizedBytes,
+        tag.start,
+        Math.max(tag.timestamp - timestampOffsetMs, 0)
+      );
+    }
+  }
+
+  const retained = [];
+  let retainedBytes = 0;
+  let nextTimestamp = previousTimestamp;
+  for (const tag of tags) {
+    const normalizedTimestamp = Math.max(tag.timestamp - timestampOffsetMs, 0);
+    if (
+      tag.tagType !== 18 &&
+      tag.timestamp > previousSourceTimestamp &&
+      normalizedTimestamp > previousTimestamp
+    ) {
+      retained.push([tag.start, tag.end]);
+      retainedBytes += tag.end - tag.start;
+      if (tag.tagType === 8 || tag.tagType === 9) {
+        nextTimestamp = Math.max(nextTimestamp, normalizedTimestamp);
+      }
+    }
+  }
   if (!retained.length) {
-    return { bytes: new Uint8Array(0), lastTimestamp: Number(lastTimestamp) };
+    return {
+      bytes: new Uint8Array(0),
+      lastTimestamp: previousTimestamp,
+      sourceLastTimestamp: previousSourceTimestamp,
+      timestampAdjustmentMs,
+      timestampOffsetMs
+    };
   }
   const merged = new Uint8Array(retainedBytes);
   let writeOffset = 0;
   for (const [start, end] of retained) {
-    const tag = bytes.subarray(start, end);
+    const tag = normalizedBytes.subarray(start, end);
     merged.set(tag, writeOffset);
     writeOffset += tag.byteLength;
   }
-  return { bytes: merged, lastTimestamp: nextTimestamp };
+  return {
+    bytes: merged,
+    lastTimestamp: nextTimestamp,
+    sourceLastTimestamp: nextSourceTimestamp,
+    timestampAdjustmentMs,
+    timestampOffsetMs
+  };
+}
+
+function writeHuyaFlvTimestamp(bytes, offset, timestamp) {
+  const normalized = Math.max(Math.trunc(Number(timestamp) || 0), 0) >>> 0;
+  bytes[offset + 4] = (normalized >>> 16) & 0xff;
+  bytes[offset + 5] = (normalized >>> 8) & 0xff;
+  bytes[offset + 6] = normalized & 0xff;
+  bytes[offset + 7] = (normalized >>> 24) & 0xff;
 }
 
 function joinUint8Arrays(chunks, totalBytes) {
@@ -4915,6 +5034,10 @@ function isLiveProgress() {
 }
 
 function progressDurationMs() {
+  if (state.downloadControl?.liveRecording && state.progress.active) {
+    const startedAt = Number(state.downloadControl.liveStartedAt) || state.progress.startedAt;
+    return startedAt ? Math.max(Date.now() - startedAt, 0) : 0;
+  }
   if (state.progress.durationMs) {
     return state.progress.durationMs;
   }

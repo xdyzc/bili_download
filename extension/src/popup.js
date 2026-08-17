@@ -2962,7 +2962,13 @@ async function fetchHuyaLiveRecording(initialCandidates, filename, control, prog
         });
         if (!response.ok) {
           if ([401, 403, 410].includes(Number(response.status))) {
-            await refreshCandidates();
+            consecutiveFailures += 1;
+            if (consecutiveFailures >= candidates.length) {
+              await refreshCandidates();
+            }
+            if (!control.canceled && !stoppedBySafetyLimit) {
+              await waitForHuyaReconnect(control, 250);
+            }
             continue;
           }
           throw new Error(`HTTP ${response.status || "unknown"}`);
@@ -3019,7 +3025,7 @@ async function fetchHuyaLiveRecording(initialCandidates, filename, control, prog
           joinUint8Arrays(responseChunks, responseBytes),
           lastTimestamp,
           chunks.length === 0,
-          readInterrupted
+          true
         );
         if (fragment.bytes.byteLength > 0) {
           const nextReceivedBytes = receivedBytes + fragment.bytes.byteLength;
@@ -3104,10 +3110,21 @@ function normalizeHuyaRecordingCandidates(candidates) {
 function huyaRecordingRequestUrl(url, lastTimestamp, sequence) {
   const parsed = new URL(url);
   parsed.searchParams.set("timeStamp", `${Date.now()}-${Math.max(Number(sequence) || 0, 0)}`);
-  if (Number(lastTimestamp) >= 0) {
-    parsed.searchParams.set("startPts", String(Math.max(Number(lastTimestamp) - 2000, 0)));
+  const normalizedLastTimestamp = Math.trunc(Number(lastTimestamp));
+  if (Number.isSafeInteger(normalizedLastTimestamp) && normalizedLastTimestamp >= 0) {
+    parsed.searchParams.set("startPts", String(Math.max(normalizedLastTimestamp - 2000, 0)));
   } else {
-    parsed.searchParams.delete("startPts");
+    const preparedStartPts = parsed.searchParams.get("startPts");
+    const normalizedStartPts = Math.trunc(Number(preparedStartPts));
+    if (
+      !/^\d+$/.test(String(preparedStartPts || "")) ||
+      !Number.isSafeInteger(normalizedStartPts) ||
+      normalizedStartPts < 0
+    ) {
+      parsed.searchParams.delete("startPts");
+    } else {
+      parsed.searchParams.set("startPts", String(normalizedStartPts));
+    }
   }
   parsed.searchParams.delete("codec");
   return parsed.href;

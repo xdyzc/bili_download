@@ -2100,6 +2100,9 @@ test("Huya page adapter filters AVC qualities and builds three HTTPS CDN candida
   sandbox.TT_ROOM_PLAYER = {
     initComplete(callback) {
       callback({
+        getCurrentSeiDts() {
+          return 345678;
+        },
         vcore: {
           h5player: {
             player: {
@@ -2141,6 +2144,7 @@ test("Huya page adapter filters AVC qualities and builds three HTTPS CDN candida
     assert.equal(url.searchParams.getAll("ratio").length, 1);
     assert.equal(url.searchParams.get("wsSecret"), "official-redacted");
     assert.equal(url.searchParams.has("timeStamp"), true);
+    assert.equal(url.searchParams.get("startPts"), "343678");
     assert.equal(url.searchParams.has("codec"), false);
   }
 
@@ -5930,6 +5934,18 @@ test("popup records a live FLV stream until the user stops it", async () => {
     () => sandbox.mergeHuyaFlvFragment(interruptedFragment, -1, true),
     /截断/
   );
+  const initialUrl = new URL(sandbox.huyaRecordingRequestUrl(
+    "https://tx.flv.huya.com/src/stream.flv?wsSecret=redacted&wsTime=123&codec=265&startPts=3456",
+    -1,
+    1
+  ));
+  assert.equal(initialUrl.searchParams.get("startPts"), "3456");
+  const invalidInitialUrl = new URL(sandbox.huyaRecordingRequestUrl(
+    "https://tx.flv.huya.com/src/stream.flv?wsSecret=redacted&wsTime=123&startPts=invalid",
+    -1,
+    1
+  ));
+  assert.equal(invalidInitialUrl.searchParams.has("startPts"), false);
   const reconnectUrl = new URL(sandbox.huyaRecordingRequestUrl(
     "https://tx.flv.huya.com/src/stream.flv?wsSecret=redacted&wsTime=123&codec=265",
     5000,
@@ -6043,6 +6059,83 @@ test("popup records a live FLV stream until the user stops it", async () => {
   assert.equal(savedAnchors.length, savedCountBeforeCandidateDeadline);
   assert.match(statusElement.textContent, /自动停止/);
   abortLiveReadWithNetworkError = false;
+
+  const huyaCandidates = [{
+    url: "https://primary.flv.huya.com/src/stream.flv?wsSecret=redacted&wsTime=123&startPts=1000",
+    kind: "primary",
+    size: 0
+  }, {
+    url: "https://backup.flv.huya.com/src/stream.flv?wsSecret=redacted&wsTime=123&startPts=1000",
+    kind: "backup",
+    size: 0
+  }];
+  const huyaFetchHosts = [];
+  const huyaControl = {
+    canceled: false,
+    paused: false,
+    waiters: [],
+    abortControllers: new Set(),
+    liveStartedAt: Date.now(),
+    liveDeadlineAt: Date.now() + 60_000,
+    liveRecording: true
+  };
+  sandbox.setTimeout = (callback, delay) => {
+    if (delay === 250 || delay === 30000) {
+      callback();
+    }
+    return 1;
+  };
+  sandbox.fetch = async (url) => {
+    const parsed = new URL(url);
+    huyaFetchHosts.push(parsed.hostname);
+    if (parsed.hostname === "primary.flv.huya.com") {
+      return {
+        ok: false,
+        status: 403,
+        statusText: "Forbidden",
+        headers: { get() { return "video/x-flv"; } }
+      };
+    }
+    let reads = 0;
+    return {
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      headers: { get() { return "video/x-flv"; } },
+      body: {
+        getReader() {
+          return {
+            async read() {
+              reads += 1;
+              if (reads === 1) {
+                return { done: false, value: interruptedFragment };
+              }
+              huyaControl.canceled = true;
+              return { done: true };
+            }
+          };
+        }
+      }
+    };
+  };
+  const savedCountBeforeHuyaFallback = savedAnchors.length;
+  const huyaResult = await sandbox.fetchHuyaLiveRecording(
+    huyaCandidates,
+    "Huya fallback.flv",
+    huyaControl,
+    {
+      site: "huya",
+      segmentIndex: 1,
+      segmentCount: 1,
+      candidateIndex: 1,
+      candidateCount: 2
+    }
+  );
+  assert.deepEqual(huyaFetchHosts, ["primary.flv.huya.com", "backup.flv.huya.com"]);
+  assert.equal(huyaResult.savedToDisk, true);
+  assert.equal(huyaResult.receivedBytes, firstFragment.byteLength);
+  assert.equal(savedAnchors.length, savedCountBeforeHuyaFallback + 1);
+  assert.equal(savedAnchors.at(-1).download, "Huya fallback.flv");
 });
 
 

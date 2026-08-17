@@ -1064,6 +1064,16 @@ async function readHuyaLiveStateInPage(requestedQuality, includeSources) {
       return { ok: false, error: "虎牙官方播放器没有提供可用的录制授权，请刷新直播页后重试。" };
     }
 
+    let initialStartPts = -1;
+    try {
+      const currentDts = Math.trunc(Number(officialPlayer?.getCurrentSeiDts?.()));
+      if (Number.isSafeInteger(currentDts) && currentDts >= 0) {
+        initialStartPts = Math.max(currentDts - 2000, 0);
+      }
+    } catch (_error) {
+      initialStartPts = -1;
+    }
+
     const requestedBitrate = Number(requestedQuality) === 10000 ? 0 : Number(requestedQuality) || 0;
     const seen = new Set();
     for (const item of group.gameStreamInfoList) {
@@ -1086,6 +1096,11 @@ async function readHuyaLiveStateInPage(requestedQuality, includeSources) {
         }
         parsed.searchParams.delete("codec");
         parsed.searchParams.set("timeStamp", String(Date.now()));
+        if (initialStartPts >= 0) {
+          parsed.searchParams.set("startPts", String(initialStartPts));
+        } else {
+          parsed.searchParams.delete("startPts");
+        }
         const host = parsed.hostname.toLowerCase();
         if (parsed.protocol === "https:" && (host === "flv.huya.com" || host.endsWith(".flv.huya.com"))) {
           url = parsed.href;

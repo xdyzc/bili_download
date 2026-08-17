@@ -494,7 +494,7 @@ def test_live_splits_reopened_connections_and_writes_a_url_free_manifest(tmp_pat
 
 @with_tmp_path
 def test_huya_live_treats_short_flv_eof_as_expected_rollover(tmp_path: Path) -> None:
-    source = "https://tx.flv.huya.com/src/stream.flv?wsSecret=redacted&wsTime=123&codec=265"
+    source = "https://tx.flv.huya.com/src/stream.flv?wsSecret=redacted&wsTime=123&codec=265&startPts=50"
     clock = FakeClock()
 
     def flv_fragment(timestamp: int, value: int) -> bytes:
@@ -555,7 +555,7 @@ def test_huya_live_treats_short_flv_eof_as_expected_rollover(tmp_path: Path) -> 
     assert len(set(request_urls)) == 3
     assert all("timeStamp=" in url for url in request_urls)
     assert all("codec=" not in url for url in request_urls)
-    assert "startPts=" not in request_urls[0]
+    assert "startPts=50" in request_urls[0]
     assert "startPts=101" in request_urls[1]
     assert "startPts=201" in request_urls[2]
     artifacts = serialized_artifacts(events, task.manifest_path)
@@ -791,6 +791,13 @@ def test_huya_live_connection_url_only_refreshes_safe_transport_parameters() -> 
     assert query["timeStamp"] == "987654321-7"
     assert query["startPts"] == "457"
     assert "codec" not in query
+    initial = companion._live_connection_url(
+        source,
+        "https://www.huya.com/fixture-anchor",
+        1,
+    )
+    initial_query = dict(companion.parse_qsl(companion.urlparse(initial).query, keep_blank_values=True))
+    assert initial_query["startPts"] == "10"
     assert companion._live_connection_url(
         source,
         "https://live.bilibili.com/123",

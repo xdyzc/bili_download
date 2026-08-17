@@ -1568,6 +1568,11 @@ def _live_connection_url(
     if not _is_huya_referer(referer):
         return value
     parsed = urlparse(value)
+    original_start_pts = next((
+        item
+        for key, item in parse_qsl(parsed.query, keep_blank_values=True)
+        if key == "startPts"
+    ), "")
     query = [
         (key, item)
         for key, item in parse_qsl(parsed.query, keep_blank_values=True)
@@ -1576,6 +1581,10 @@ def _live_connection_url(
     query.append(("timeStamp", f"{time.time_ns()}-{max(int(segment_index), 0)}"))
     if int(last_timestamp) >= 0:
         query.append(("startPts", str(int(last_timestamp) + 1)))
+    elif original_start_pts.isdecimal():
+        initial_start_pts = int(original_start_pts)
+        if 0 <= initial_start_pts <= 2**53 - 1:
+            query.append(("startPts", str(initial_start_pts)))
     return urlunparse(parsed._replace(query=urlencode(query)))
 
 

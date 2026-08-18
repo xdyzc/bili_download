@@ -1085,7 +1085,11 @@ async function startLiveRecording() {
   let usedCompanion = false;
   try {
     prepared = await prepareLiveRecording();
-    if (state.companionSettings.preferLive && await ensureStreamingCompanionAvailable()) {
+    // Huya's browser FLV fallback must rewrite timestamps across short
+    // responses. Prefer the companion's page-authorized HLS path whenever it
+    // is available; other sites keep the existing opt-in behavior.
+    const shouldUseCompanion = state.companionSettings.preferLive || normalizeSite(state.live?.site) === "huya";
+    if (shouldUseCompanion && await ensureStreamingCompanionAvailable()) {
       usedCompanion = true;
       const task = await downloadPreparedCompanionPayload(prepared);
       setStatus(task.outputName

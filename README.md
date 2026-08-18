@@ -18,7 +18,7 @@
 - 虎牙标准数字或主播别名直播间；
 - 浏览器内录制，以及可选 native companion 的流式写盘。
 
-斗鱼和虎牙首版仅录制当前页面实际提供的 HTTPS FLV + AVC 直播流，不支持 HLS、HEVC、回放、移动站、定时录制或聊天记录，也不会绕过登录、付费、地域或版权限制。扩展的详细安装、测试与权限边界见 [extension/README.md](extension/README.md)。
+斗鱼和虎牙录制只使用当前页面实际提供的 HTTPS AVC 直播流；虎牙增强录制优先使用官方 HLS 并以 FFmpeg 封装，浏览器端保留 FLV 回退。不支持 HEVC、回放、移动站、定时录制或聊天记录，也不会绕过登录、付费、地域或版权限制。扩展的详细安装、测试与权限边界见 [extension/README.md](extension/README.md)。
 
 ## 当前建议路线
 

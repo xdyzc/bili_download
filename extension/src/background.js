@@ -1076,18 +1076,20 @@ async function readHuyaLiveStateInPage(requestedQuality, includeSources) {
 
     const requestedBitrate = Number(requestedQuality) === 10000 ? 0 : Number(requestedQuality) || 0;
     const seen = new Set();
+    let flvCount = 0;
+    let hlsCount = 0;
     for (const item of group.gameStreamInfoList) {
-      if (candidates.length >= 3) {
+      if (candidates.length >= 6 || (flvCount >= 3 && hlsCount >= 3)) {
         break;
       }
       const suffix = String(item?.sFlvUrlSuffix || "").toLowerCase();
       const base = String(item?.sFlvUrl || "").replace(/^http:\/\//i, "https://").replace(/\/+$/, "");
       const streamName = String(item?.sStreamName || "");
-      if (suffix !== "flv" || !base || !streamName) {
-        continue;
-      }
       let url = "";
       try {
+        if (flvCount >= 3 || suffix !== "flv" || !base || !streamName) {
+          throw new Error("no flv source");
+        }
         const parsed = new URL(`${base}/${streamName}.${suffix}?${officialAntiCode}`);
         if (requestedBitrate > 0) {
           parsed.searchParams.set("ratio", String(requestedBitrate));
@@ -1110,7 +1112,42 @@ async function readHuyaLiveStateInPage(requestedQuality, includeSources) {
       }
       if (url && !seen.has(url)) {
         seen.add(url);
-        candidates.push({ url, kind: candidates.length ? "backup" : "primary", size: 0 });
+        candidates.push({ url, protocol: "flv", kind: candidates.length ? "backup" : "primary", size: 0 });
+        flvCount += 1;
+      }
+
+      const hlsSuffix = String(item?.sHlsUrlSuffix || "m3u8").replace(/^\./, "").toLowerCase();
+      const hlsBase = String(item?.sHlsUrl || "").replace(/^http:\/\//i, "https://").replace(/\/+$/, "");
+      if (!hlsBase || !streamName || !/^m3u8$/i.test(hlsSuffix)) {
+        continue;
+      }
+      let hlsUrl = "";
+      try {
+        const hlsAntiCode = String(item?.sHlsAntiCode || officialAntiCode).replace(/^\?/, "");
+        if (!hlsAntiCode || hlsAntiCode.length > 2048 || /[\r\n]/.test(hlsAntiCode)) {
+          throw new Error("invalid hls authorization");
+        }
+        const parsed = new URL(`${hlsBase}/${streamName}.${hlsSuffix}?${hlsAntiCode}`);
+        if (requestedBitrate > 0) {
+          parsed.searchParams.set("ratio", String(requestedBitrate));
+        } else {
+          parsed.searchParams.delete("ratio");
+        }
+        parsed.searchParams.delete("codec");
+        const host = parsed.hostname.toLowerCase();
+        if (parsed.protocol === "https:" && (
+          host === "hls.huya.com" || host.endsWith(".hls.huya.com") ||
+          host === "alhls.huya.com"
+        )) {
+          hlsUrl = parsed.href;
+        }
+      } catch (_error) {
+        hlsUrl = "";
+      }
+      if (hlsUrl && !seen.has(hlsUrl)) {
+        seen.add(hlsUrl);
+        candidates.push({ url: hlsUrl, protocol: "hls", kind: "hls", size: 0 });
+        hlsCount += 1;
       }
     }
   }
@@ -1134,7 +1171,7 @@ function buildSiteLivePreparation({ site, roomKey, roomId, title, anchorName, qu
   const uniqueParts = parts.filter((item, index) => parts.indexOf(item) === index);
   const outputTitle = uniqueParts.join("_") || `${site}_${roomKey}`;
   const baseName = safeFilename(`${outputTitle}_${timestampForFilename(new Date())}`);
-  const normalizedCandidates = (Array.isArray(candidates) ? candidates : []).slice(0, 3);
+  const normalizedCandidates = (Array.isArray(candidates) ? candidates : []).slice(0, 6);
   const segment = {
     url: normalizedCandidates[0]?.url || "",
     filename: `BiliDownload/${baseName}.flv`,
@@ -2370,6 +2407,9 @@ function describeCompanionLivePreparation(prepared) {
 
   const title = normalizeCompanionTitle(live.title || context.title, `live_${roomKey}`);
   const siteOutputName = String(segment?.filename || "").split(/[\\/]/).at(-1) || "";
+  const hlsSources = site === "huya" ? readCompanionSourceUrls(segment, site, "hls") : [];
+  const format = hlsSources.length ? "hls" : "flv";
+  const liveSources = hlsSources.length ? hlsSources : readCompanionSourceUrls(segment, site, "flv");
   return {
     kind: "live",
     metadata: {
@@ -2380,23 +2420,30 @@ function describeCompanionLivePreparation(prepared) {
       quality,
       title,
       source: "live",
-      format: "flv"
+      format
     },
     outputName: site === "bilibili"
       ? companionOutputName(title, "live", quality)
-      : normalizeCompanionOutputName(siteOutputName, "live", title, quality),
-    liveSources: readCompanionSourceUrls(segment, site),
+      : format === "hls"
+        ? companionOutputName(title, "live-hls", quality)
+        : normalizeCompanionOutputName(siteOutputName, "live", title, quality),
+    liveSources,
+    liveFormat: format,
     totalBytes: 0,
     videoExpectedBytes: 0,
     audioExpectedBytes: 0
   };
 }
 
-function readCompanionSourceUrls(segment, site = "bilibili") {
+function readCompanionSourceUrls(segment, site = "bilibili", protocol = "") {
   const urls = [];
   const seen = new Set();
   for (const candidate of readCandidates(segment)) {
     const url = String(candidate?.url || "");
+    const candidateProtocol = String(candidate?.protocol || (isHlsMediaUrl(url) ? "hls" : "flv")).toLowerCase();
+    if (protocol && candidateProtocol !== protocol) {
+      continue;
+    }
     if (!isAllowedCompanionMediaUrl(url, site) || seen.has(url)) {
       continue;
     }
@@ -2404,9 +2451,20 @@ function readCompanionSourceUrls(segment, site = "bilibili") {
     urls.push(url);
   }
   if (!urls.length) {
+    if (protocol === "hls") {
+      return [];
+    }
     throw new Error("The prepared media source is not an allowed HTTPS media URL for this site.");
   }
   return urls;
+}
+
+function isHlsMediaUrl(value) {
+  try {
+    return /\.m3u8(?:$|[?#])/i.test(new URL(String(value || "")).pathname);
+  } catch (_error) {
+    return false;
+  }
 }
 
 function isAllowedCompanionMediaUrl(value, site = "bilibili") {
@@ -2421,7 +2479,10 @@ function isAllowedCompanionMediaUrl(value, site = "bilibili") {
       douyu: ["douyucdn.cn"],
       huya: ["flv.huya.com", "mobgslb.tbcache.com"]
     }[normalizeLiveSite(site)];
-    return suffixes.some((suffix) => (
+    const extended = normalizeLiveSite(site) === "huya"
+      ? [...suffixes, "hls.huya.com", "alhls.huya.com"]
+      : suffixes;
+    return extended.some((suffix) => (
       host === suffix || host.endsWith(`.${suffix}`)
     ));
   } catch (_error) {
@@ -2440,7 +2501,7 @@ function normalizeCompanionTitle(value, fallback = "bili_download") {
 function companionOutputName(title, kind, quality = 0) {
   const labeled = kind === "dash" && quality ? `${title}_${quality}` : title;
   const stem = safeFilename(labeled).replace(/\.(?:mp4|flv|m4s)$/i, "") || "bili_download";
-  return `${stem.slice(0, 110)}.${kind === "dash" ? "mp4" : "flv"}`;
+  return `${stem.slice(0, 110)}.${kind === "dash" ? "mp4" : kind === "live-hls" ? "mkv" : "flv"}`;
 }
 
 function buildCompanionStartMessage(task, descriptor) {
@@ -2461,6 +2522,7 @@ function buildCompanionStartMessage(task, descriptor) {
     payload = {
       ...base,
       sources: descriptor.liveSources,
+      format: descriptor.liveFormat || "flv",
       maxDurationSeconds: normalizeCompanionDurationSeconds(task.maxDurationSeconds),
       segmentDurationSeconds: normalizeCompanionSegmentSeconds(task.segmentDurationSeconds)
     };
@@ -2489,7 +2551,8 @@ function buildCompanionRefreshMessage(task, descriptor) {
   } else {
     payload = {
       referer: liveSiteReferer(task.metadata?.site),
-      sources: descriptor.liveSources
+      sources: descriptor.liveSources,
+      format: descriptor.liveFormat || task.metadata?.format || "flv"
     };
   }
   return {
@@ -2801,7 +2864,7 @@ async function refreshCompanionDownloadSources(task, runtime) {
       maxDurationSeconds: task.maxDurationSeconds,
       segmentDurationSeconds: task.segmentDurationSeconds
     });
-    if (descriptor.kind !== task.kind) {
+    if (descriptor.kind !== task.kind || (task.kind === "live" && descriptor.metadata.format !== task.metadata?.format)) {
       throw new Error("The refreshed media no longer matches the local companion task type.");
     }
     const { requestId, message } = buildCompanionRefreshMessage(task, descriptor);
@@ -3104,7 +3167,7 @@ function normalizeCompanionTaskMetadata(value, kind) {
       quality,
       title: normalizeCompanionTitle(value?.title, `live_${roomKey}`),
       source: "live",
-      format: "flv"
+      format: value?.format === "hls" ? "hls" : "flv"
     };
   }
   return null;
@@ -3310,8 +3373,12 @@ function normalizeCompanionOutputName(value, kind, title, quality) {
   if (!source || /[\\/]/.test(source) || isLocalDiagnosticPath(source) || looksLikeDiagnosticUrl(source)) {
     return companionOutputName(normalizeCompanionTitle(title, "bili_download"), normalizeCompanionKind(kind) || "dash", Number(quality) || 0);
   }
-  const safe = safeFilename(source).replace(/\.(?:mp4|flv|m4s)$/i, "");
-  return `${safe.slice(0, 110) || "bili_download"}.${normalizeCompanionKind(kind) === "live" ? "flv" : "mp4"}`;
+  const safe = safeFilename(source);
+  if (normalizeCompanionKind(kind) === "live" && /\.mkv$/i.test(safe)) {
+    return safe.slice(0, 115);
+  }
+  const stem = safe.replace(/\.(?:mp4|flv|m4s|mkv)$/i, "");
+  return `${stem.slice(0, 110) || "bili_download"}.${normalizeCompanionKind(kind) === "live" ? "flv" : "mp4"}`;
 }
 
 function normalizeCompanionMaxBytes(value) {

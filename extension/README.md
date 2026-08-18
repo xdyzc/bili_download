@@ -14,7 +14,7 @@ streaming companion.
 - Falls back to the browser downloads API and records diagnostics if page-context downloading fails.
 - Optionally delegates a user-selected single DASH download or live recording to
   a separately installed Native Messaging companion for streaming disk output.
-- Records HTTPS FLV + AVC live streams at the qualities exposed by the current
+- Records HTTPS AVC live streams at the qualities exposed by the current
   page session. Douyu uses its page-provided official resolver; Huya uses the
   public player data already present on the page.
 - No local `bili.json` import is needed for the extension.
@@ -25,7 +25,7 @@ streaming companion.
 - Danmaku download and burning are not handled yet.
 - The extension only downloads content that the current browser session can access.
 - Page-context downloads, browser muxing, and browser live recording still buffer media in memory. The extension derives conservative limits from media metadata and the device's reported memory, then stops before an unsafe buffer can grow without bounds. These protections are automatic rather than user-facing settings.
-- The first multi-site live release supports only standard desktop room pages and HTTPS FLV + AVC. It does not support HLS, HEVC, replay, mobile pages, scheduled recording, danmaku, or chat capture.
+- The multi-site live release supports standard desktop room pages and AVC. Huya companion recording prefers the page-provided HTTPS HLS playlist and remuxes timestamp-preserving MPEG-TS parts with FFmpeg; browser recording falls back to HTTPS FLV. HEVC, replay, mobile pages, scheduled recording, danmaku, and chat capture remain unsupported.
 
 - The optional companion is never selected silently: enable it in the side
   panel first. It writes to `%USERPROFILE%\Videos\BiliDownload` by default and

@@ -79,5 +79,35 @@
         "other"
       ]
     }
+  },
+  {
+    "id": 104,
+    "priority": 1,
+    "action": {
+      "type": "modifyHeaders",
+      "requestHeaders": [
+        { "header": "Referer", "operation": "set", "value": "https://www.huya.com/" },
+        { "header": "Origin", "operation": "set", "value": "https://www.huya.com" }
+      ]
+    },
+    "condition": {
+      "urlFilter": "||hls.huya.com/",
+      "resourceTypes": ["xmlhttprequest", "media", "other"]
+    }
+  },
+  {
+    "id": 105,
+    "priority": 1,
+    "action": {
+      "type": "modifyHeaders",
+      "requestHeaders": [
+        { "header": "Referer", "operation": "set", "value": "https://www.huya.com/" },
+        { "header": "Origin", "operation": "set", "value": "https://www.huya.com" }
+      ]
+    },
+    "condition": {
+      "urlFilter": "||alhls.huya.com/",
+      "resourceTypes": ["xmlhttprequest", "media", "other"]
+    }
   }
 ]

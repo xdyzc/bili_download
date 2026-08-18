@@ -16,9 +16,12 @@ tries to bypass quality, membership, region, DRM, or copyright restrictions.
   files on disk, switches between supplied CDN candidates, resumes a finite
   download with `Range` when possible, and uses local FFmpeg with `-c copy` to
   create the final MP4.
-- Live FLV: writes independently reopened `.flv` segments instead of retaining
+- Live FLV fallback: writes independently reopened `.flv` segments instead of retaining
   an ever-growing browser `Blob`; retries supplied candidates with bounded
   backoff; produces a local manifest for the segment set.
+- Huya HLS: accepts only the page-provided AVC `.m3u8` source, records bounded
+  MPEG-TS parts with FFmpeg reconnect options, then remuxes them into the final
+  `.mkv` without browser-side FLV timestamp rewriting.
 - Signed URL expiry: when every supplied candidate returns HTTP 403, 404, or
   412, it emits `refresh_required`. The extension can run its normal existing
   prepare operation again and send fresh candidates using the same `taskId`.
@@ -36,7 +39,7 @@ Canceled or failed tasks remove their `.part` and mux temporary files. A DASH
 output is committed atomically only after FFmpeg succeeds, so an interrupted
 merge does not leave a partial final MP4.
 
-The first live implementation intentionally does **not** byte-concatenate
+The FLV fallback intentionally does **not** byte-concatenate
 segments: every reconnect can have a new FLV header and timestamp boundary.
 Keeping independent files plus a manifest is safer than silently creating a
 corrupt monolithic FLV. A later post-processing flow can remux the completed
@@ -48,7 +51,8 @@ This is a strict boundary, not a convenience workaround.
 
 - It accepts only HTTPS media URLs paired with the matching page origin:
   Bilibili uses `bilivideo.com`, `bilivideo.cn`, `hdslb.com`, and
-  `edge.mountaintoys.cn`; Douyu uses `douyucdn.cn`; Huya uses `flv.huya.com`
+  `edge.mountaintoys.cn`; Douyu uses `douyucdn.cn`; Huya uses `flv.huya.com`,
+  `hls.huya.com`, and `alhls.huya.com`
   and the verified redirect family `mobgslb.tbcache.com`. Every redirect is
   checked against the same site-specific pairing.
 - It rejects cross-site CDN combinations, site API URLs, non-HTTPS URLs, credentials embedded in a URL,
@@ -140,8 +144,9 @@ only in memory; it does not recreate or persist a task record.
 }
 ```
 
-Start a live recording. `outputName` is a basename, not a path. Segment files
-are named `<outputName>.segment-0001.flv`, and the manifest is
+Start a live recording. `outputName` is a basename, not a path. FLV fallback
+segment files are named `<outputName>.segment-0001.flv`; HLS uses temporary
+`.ts` parts and commits a final `.mkv`. Both write
 `<outputName>.live.manifest.json` inside the host output directory.
 The `referer` must match the source family: `https://live.bilibili.com/`,
 `https://www.douyu.com/`, or `https://www.huya.com/`.
@@ -156,6 +161,7 @@ The `referer` must match the source family: `https://live.bilibili.com/`,
     "outputName": "Live title_20260809",
     "referer": "https://live.bilibili.com/",
     "sources": ["<runtime signed FLV CDN URL>"],
+    "format": "flv",
     "maxBytes": 42949672960,
     "maxDurationSeconds": 7200,
     "segmentDurationSeconds": 300
@@ -173,7 +179,8 @@ Refresh a live source after `refresh_required`:
   "taskId": "task_live_1",
   "payload": {
     "referer": "https://live.bilibili.com/",
-    "sources": ["<fresh runtime signed FLV CDN URL>"]
+    "sources": ["<fresh runtime signed FLV CDN URL>"],
+    "format": "flv"
   }
 }
 ```

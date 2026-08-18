@@ -31,6 +31,9 @@ test("manifest declares the MV3 side panel extension and optional native compani
     "https://www.huya.com/*",
     "https://*.douyucdn.cn/*",
     "https://*.flv.huya.com/*",
+    "https://hls.huya.com/*",
+    "https://*.hls.huya.com/*",
+    "https://alhls.huya.com/*",
     "https://*.mobgslb.tbcache.com/*",
     "https://*.bilivideo.com/*",
     "https://*.bilivideo.cn/*",
@@ -157,12 +160,14 @@ test("media header rules use declarative request modification", async () => {
   );
   assert.deepEqual(
     liveRules.map((item) => item.condition.urlFilter),
-    ["||douyucdn.cn/", "||flv.huya.com/", "||mobgslb.tbcache.com/"]
+    ["||douyucdn.cn/", "||flv.huya.com/", "||mobgslb.tbcache.com/", "||hls.huya.com/", "||alhls.huya.com/"]
   );
   assert.deepEqual(
     liveRules.map((item) => item.action.requestHeaders.map((header) => header.value)),
     [
       ["https://www.douyu.com/", "https://www.douyu.com"],
+      ["https://www.huya.com/", "https://www.huya.com"],
+      ["https://www.huya.com/", "https://www.huya.com"],
       ["https://www.huya.com/", "https://www.huya.com"],
       ["https://www.huya.com/", "https://www.huya.com"]
     ]
@@ -2148,6 +2153,17 @@ test("Huya page adapter filters AVC qualities and builds three HTTPS CDN candida
     assert.equal(url.searchParams.has("codec"), false);
   }
 
+  fixture.data[0].gameStreamInfoList[1].sHlsUrl = "https://alhls.huya.com/src";
+  fixture.data[0].gameStreamInfoList[1].sHlsUrlSuffix = "m3u8";
+  fixture.data[0].gameStreamInfoList[1].sHlsAntiCode = "hlsSecret=official-hls-redacted";
+  sandbox.hyPlayerConfig = { stream: fixture };
+  const hlsResult = await sandbox.readHuyaLiveStateInPage(2000, true);
+  const hlsCandidate = hlsResult.payload.candidates.find((candidate) => candidate.protocol === "hls");
+  assert.ok(hlsCandidate);
+  assert.equal(new URL(hlsCandidate.url).hostname, "alhls.huya.com");
+  assert.equal(new URL(hlsCandidate.url).pathname.endsWith(".m3u8"), true);
+  assert.equal(new URL(hlsCandidate.url).searchParams.get("hlsSecret"), "official-hls-redacted");
+
   const sourceResult = await sandbox.readHuyaLiveStateInPage(10000, true);
   assert.equal(new URL(sourceResult.payload.candidates[0].url).searchParams.has("ratio"), false);
 
@@ -2298,6 +2314,48 @@ test("multi-site live registry loads and prepares Douyu and Huya recordings", as
     }),
     /Quality 9999/
   );
+});
+
+
+test("Huya companion selects page-provided HLS candidates and keeps signed URLs out of metadata", async () => {
+  const sandbox = await backgroundUnitSandbox();
+  const prepared = {
+    mode: "live",
+    live: {
+      site: "huya",
+      roomKey: "999002",
+      roomId: 999002,
+      quality: 2000,
+      title: "虎牙 Fixture"
+    },
+    segments: [{
+      filename: "BiliDownload/虎牙 Fixture.flv",
+      candidates: [
+        { url: "https://tx.flv.huya.com/src/live.flv?token=flv-secret", protocol: "flv" },
+        { url: "https://alhls.huya.com/src/live.m3u8?token=hls-secret", protocol: "hls" }
+      ],
+      context: { site: "huya", roomKey: "999002", roomId: 999002, quality: 2000, title: "虎牙 Fixture" }
+    }]
+  };
+  const descriptor = sandbox.describeCompanionLivePreparation(prepared);
+  assert.equal(descriptor.metadata.format, "hls");
+  assert.equal(descriptor.liveFormat, "hls");
+  assert.match(descriptor.outputName, /\.mkv$/);
+  assert.equal(descriptor.liveSources.length, 1);
+  assert.equal(JSON.stringify(descriptor).includes("hls-secret"), true);
+  const task = {
+    id: "task_hls",
+    kind: "live",
+    outputName: descriptor.outputName,
+    title: descriptor.metadata.title,
+    metadata: descriptor.metadata,
+    maxBytes: 1024 * 1024,
+    maxDurationSeconds: 60,
+    segmentDurationSeconds: 5
+  };
+  const start = sandbox.buildCompanionStartMessage(task, descriptor);
+  assert.equal(start.message.payload.format, "hls");
+  assert.equal(start.message.payload.sources[0].includes("hls-secret"), true);
 });
 
 

@@ -335,6 +335,58 @@ def test_ffmpeg_mux_never_reads_native_protocol_stdin() -> None:
 
 
 @with_tmp_path
+def test_hls_recording_uses_reconnect_flags_and_remuxes_ts_parts(tmp_path: Path) -> None:
+    class FakeFfmpegProcess:
+        def __init__(self, command, **_kwargs):
+            self.command = command
+            self.returncode = 0
+            output = Path(command[-1])
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_bytes(b"ts-data")
+
+        def poll(self):
+            return self.returncode
+
+    context = companion.TaskContext(
+        task_id="hls_test",
+        kind="live",
+        output_name="Huya.mkv",
+        output_path=tmp_path / "Huya.mkv",
+        manifest_path=tmp_path / "Huya.mkv.live.manifest.json",
+        referer="https://www.huya.com/fixture",
+        max_bytes=1024 * 1024,
+        reservation_bytes=1024 * 1024,
+        duration_seconds=10,
+        segment_seconds=5,
+    )
+    emitted: list[dict] = []
+    host = companion.CompanionHost(output_dir=tmp_path, max_disk_bytes=1024 * 1024, emit=emitted.append)
+    with patch.object(companion, "find_ffmpeg", return_value="ffmpeg"), patch.object(
+        companion.subprocess, "Popen", side_effect=FakeFfmpegProcess
+    ) as popen:
+        result = host._record_hls_connection(
+            "https://alhls.huya.com/live.m3u8?token=redacted",
+            tmp_path / "Huya.mkv.segment-0001.ts",
+            referer=context.referer,
+            cancel_event=context.cancel_event,
+            duration_seconds=5,
+            max_bytes=context.max_bytes,
+            context=context,
+            segment_index=1,
+        )
+        assert result.reason == "segment_duration"
+        command = popen.call_args.args[0]
+        assert "-reconnect_streamed" in command
+        assert "-reconnect_at_eof" in command
+        assert "-fflags" in command and "+discardcorrupt" in command
+        context.output_path.with_name("Huya.mkv.segment-0001.ts").write_bytes(b"ts-data")
+        host._finalize_hls_segments(context)
+
+    assert (tmp_path / "Huya.mkv").read_bytes() == b"ts-data"
+    assert not list(tmp_path.glob("*.segment-*.ts"))
+
+
+@with_tmp_path
 def test_live_cleanup_only_removes_parts_registered_by_the_task(tmp_path: Path) -> None:
     context = companion.TaskContext(
         task_id="cleanup_exact",

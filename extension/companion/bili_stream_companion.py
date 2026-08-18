@@ -61,7 +61,7 @@ MEDIA_SITE_POLICIES = {
     },
     "huya": {
         "referer_hosts": {"www.huya.com"},
-        "cdn_suffixes": {"flv.huya.com", "mobgslb.tbcache.com"},
+        "cdn_suffixes": {"flv.huya.com", "mobgslb.tbcache.com", "hls.huya.com", "alhls.huya.com"},
         "origin": "https://www.huya.com",
     },
 }
@@ -158,6 +158,7 @@ class TaskContext:
     dash_video: StreamInput | None = None
     dash_audio: StreamInput | None = None
     live_sources: tuple[str, ...] = ()
+    live_format: str = "flv"
     duration_seconds: int = DEFAULT_LIVE_DURATION_SECONDS
     segment_seconds: int = DEFAULT_LIVE_SEGMENT_SECONDS
     bytes_written: int = 0
@@ -523,6 +524,13 @@ class CompanionHost:
         output_name = _safe_output_name(payload.get("outputName"), suffix=None)
         referer = _safe_referer(payload.get("referer"), default="https://live.bilibili.com/")
         sources = _source_list(payload.get("sources"), referer=referer)
+        live_format = str(payload.get("format") or "flv").lower()
+        if live_format not in {"flv", "hls"}:
+            raise ProtocolError("format must be flv or hls.")
+        if live_format == "hls" and not _is_huya_referer(referer):
+            raise ProtocolError("HLS live recording is currently limited to Huya.")
+        if live_format == "hls" and not all(_is_hls_url(source) for source in sources):
+            raise ProtocolError("HLS sources must be HTTPS playlists.")
         max_bytes = _task_max_bytes(payload.get("maxBytes"), self.max_disk_bytes)
         duration_seconds = _bounded_int(
             payload.get("maxDurationSeconds", DEFAULT_LIVE_DURATION_SECONDS),
@@ -548,11 +556,13 @@ class CompanionHost:
             max_bytes=max_bytes,
             reservation_bytes=reservation_bytes,
             live_sources=sources,
+            live_format=live_format,
             duration_seconds=duration_seconds,
             segment_seconds=segment_seconds,
         )
         context.manifest = _base_manifest(context)
         context.manifest.update({
+            "format": live_format,
             "maxDurationSeconds": duration_seconds,
             "segmentDurationSeconds": segment_seconds,
             "segments": [],
@@ -664,7 +674,13 @@ class CompanionHost:
         payload = _payload(message)
         referer = _safe_referer(payload.get("referer"), default=context.referer)
         sources = _source_list(payload.get("sources"), referer=referer)
+        live_format = str(payload.get("format") or context.live_format).lower()
+        if live_format not in {"flv", "hls"} or (live_format == "hls" and not _is_huya_referer(referer)):
+            raise ProtocolError("The refreshed live format is not supported.")
+        if live_format == "hls" and not all(_is_hls_url(source) for source in sources):
+            raise ProtocolError("HLS sources must be HTTPS playlists.")
         context.refresh_live(sources, referer)
+        context.live_format = live_format
         self.emit({
             "type": "sources_refreshed",
             "requestId": request_id,
@@ -863,6 +879,16 @@ class CompanionHost:
             self._release_task(context)
 
     def _run_live(self, context: TaskContext) -> None:
+        if context.live_format == "hls":
+            try:
+                self._run_live_hls(context)
+            except Exception:
+                if context.manifest.get("status") == "running":
+                    self._finish_failed(context, CompanionError("internal_error", "The local HLS task stopped unexpectedly."))
+            finally:
+                _cleanup_live_part_files(context)
+                self._release_task(context)
+            return
         started = self._clock()
         deadline = started + context.duration_seconds
         candidate_index = 0
@@ -915,7 +941,7 @@ class CompanionHost:
                     raise
 
                 bytes_in_segment = _existing_size(part_path)
-                if bytes_in_segment > 0:
+                if bytes_in_segment > 0 and result is not None:
                     if _is_huya_referer(referer):
                         last_timestamp = _last_flv_media_timestamp(part_path)
                         if last_timestamp >= 0:
@@ -1003,6 +1029,232 @@ class CompanionHost:
         finally:
             _cleanup_live_part_files(context)
             self._release_task(context)
+
+    def _run_live_hls(self, context: TaskContext) -> None:
+        """Record Huya's page-provided HLS playlist with FFmpeg.
+
+        HLS keeps audio/video timestamps in the segment timeline; unlike the
+        browser FLV fallback it does not require us to rewrite tags while a
+        connection is being reopened.  Each authorization window is captured
+        to an independent MPEG-TS part and the parts are remuxed once at the
+        end, preserving packet order and avoiding the old FLV timestamp gaps.
+        """
+        started = self._clock()
+        deadline = started + context.duration_seconds
+        observed_version = -1
+        candidate_index = 0
+        refresh_rounds = 0
+        failed_round: list[CandidateFailure] = []
+        try:
+            while self._clock() < deadline:
+                if context.cancel_event.is_set():
+                    raise CanceledError()
+                version, sources, referer = context.live_snapshot()
+                if version != observed_version:
+                    observed_version = version
+                    candidate_index = 0
+                    failed_round.clear()
+                if not sources:
+                    raise CompanionError("source_failed", "No HLS media source is available.")
+                source = sources[candidate_index % len(sources)]
+                context.segment_count += 1
+                segment_index = context.segment_count
+                segment_path = _hls_segment_path(context.output_path, segment_index)
+                part_path = segment_path.with_name(f"{segment_path.name}.part")
+                context.track_live_part(part_path)
+                remaining = context.max_bytes - context.bytes_written
+                if remaining <= 0:
+                    break
+                self._ensure_live_space(context)
+                segment_seconds = min(
+                    context.segment_seconds,
+                    max(deadline - self._clock(), 1),
+                )
+                try:
+                    result = self._record_hls_connection(
+                        source,
+                        part_path,
+                        referer=referer,
+                        cancel_event=context.cancel_event,
+                        duration_seconds=segment_seconds,
+                        max_bytes=remaining,
+                        context=context,
+                        segment_index=segment_index,
+                    )
+                    failure = None
+                except CandidateFailure as error:
+                    result = None
+                    failure = error
+                bytes_in_segment = _existing_size(part_path)
+                if bytes_in_segment > 0:
+                    segment_path.parent.mkdir(parents=True, exist_ok=True)
+                    part_path.replace(segment_path)
+                    context.release_live_part(part_path)
+                    context.live_part_paths.discard(segment_path)
+                    context.bytes_written += bytes_in_segment
+                    context.manifest["segments"].append({
+                        "file": segment_path.name,
+                        "bytes": bytes_in_segment,
+                        "startedAt": _utc_timestamp(),
+                        "endedAt": _utc_timestamp(),
+                        "reason": result.reason if result else "source_error",
+                    })
+                    context.manifest["bytesWritten"] = context.bytes_written
+                    _write_manifest(context)
+                else:
+                    part_path.unlink(missing_ok=True)
+                    context.release_live_part(part_path)
+
+                if result is not None and result.reason in {"duration", "disk_limit"}:
+                    break
+                if failure is None:
+                    failed_round.clear()
+                    continue
+                failed_round.append(failure)
+                candidate_index = (candidate_index + 1) % len(sources)
+                if len(failed_round) >= len(sources):
+                    refresh_rounds += 1
+                    if refresh_rounds > 3:
+                        raise CompanionError("refresh_limit", "Fresh HLS media URLs were rejected repeatedly.")
+                    self.emit({
+                        "type": "refresh_required",
+                        "taskId": context.task_id,
+                        "kind": context.kind,
+                        "reason": "source_expired",
+                    })
+                    if not context.wait_for_refresh(observed_version, DEFAULT_LIVE_REFRESH_SECONDS):
+                        raise CompanionError("refresh_timeout", "Fresh HLS media URLs were not provided in time.")
+                    continue
+                self.emit({
+                    "type": "progress",
+                    "taskId": context.task_id,
+                    "kind": context.kind,
+                    "phase": "reconnecting",
+                    "receivedBytes": context.bytes_written,
+                    "segmentIndex": segment_index,
+                    "reconnectAttempt": len(failed_round),
+                })
+                if context.cancel_event.wait(min(2 ** min(len(failed_round) - 1, 3), 8)):
+                    raise CanceledError()
+
+            self._finalize_hls_segments(context)
+            self._finish_live_stop(context, "duration" if self._clock() >= deadline else "disk_limit")
+        except CanceledError:
+            if context.manifest.get("segments"):
+                try:
+                    self._finalize_hls_segments(context, ignore_cancel=True)
+                except CompanionError:
+                    pass
+            self._finish_canceled(context)
+        except CompanionError as error:
+            self._finish_failed(context, error)
+
+    def _record_hls_connection(
+        self,
+        url: str,
+        destination: Path,
+        *,
+        referer: str,
+        cancel_event: threading.Event,
+        duration_seconds: int,
+        max_bytes: int,
+        context: TaskContext,
+        segment_index: int,
+    ) -> LiveConnectionResult:
+        ffmpeg = find_ffmpeg()
+        if not ffmpeg:
+            raise CompanionError("ffmpeg_missing", "FFmpeg is required for smooth HLS live recording.")
+        headers = _media_request_headers(referer)
+        header_blob = "".join(f"{key}: {value}\r\n" for key, value in headers.items())
+        command = [
+            ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
+            "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_at_eof", "1",
+            "-reconnect_delay_max", "5", "-fflags", "+discardcorrupt",
+            "-correct_ts_overflow", "1", "-avoid_negative_ts", "make_non_negative",
+            "-headers", header_blob, "-i", url, "-t", str(max(int(duration_seconds), 1)),
+            "-c", "copy", "-f", "mpegts", str(destination),
+        ]
+        try:
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError as error:
+            raise CompanionError("ffmpeg_start_failed", "FFmpeg could not be started for HLS recording.") from error
+        while process.poll() is None:
+            if cancel_event.wait(0.1):
+                process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=2)
+                raise CanceledError()
+            written = _existing_size(destination)
+            if written > max_bytes:
+                process.terminate()
+                raise CandidateFailure()
+            self.emit({
+                "type": "progress",
+                "taskId": context.task_id,
+                "kind": context.kind,
+                "phase": "recording",
+                "receivedBytes": context.bytes_written + written,
+                "segmentIndex": segment_index,
+                "durationMs": 0,
+            })
+        if process.returncode != 0 or _existing_size(destination) <= 0:
+            raise CandidateFailure(expired=True)
+        return LiveConnectionResult("segment_duration", _existing_size(destination))
+
+    def _finalize_hls_segments(self, context: TaskContext, *, ignore_cancel: bool = False) -> None:
+        segments = sorted(
+            context.output_path.parent.glob(f"{context.output_path.name}.segment-*.ts"),
+            key=lambda path: path.name,
+        )
+        if not segments:
+            raise CompanionError("source_failed", "No HLS media was received.")
+        self._ensure_hls_mux_space(context)
+        mux_temp = context.output_path.with_name(f".{context.output_path.name}.{context.task_id}.mux.tmp")
+        concat_list = context.output_path.with_name(f".{context.output_path.name}.{context.task_id}.concat.txt")
+        try:
+            concat_lines = []
+            for path in segments:
+                concat_lines.append("file '" + path.name.replace("'", "'\\''") + "'\n")
+            concat_list.write_text("".join(concat_lines), encoding="utf-8")
+            ffmpeg = find_ffmpeg()
+            if not ffmpeg:
+                raise CompanionError("ffmpeg_missing", "FFmpeg is required to finalize the HLS recording.")
+            command = [
+                ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
+                "-f", "concat", "-safe", "0", "-i", str(concat_list),
+                "-c", "copy", "-fflags", "+genpts", "-avoid_negative_ts", "make_non_negative",
+                str(mux_temp),
+            ]
+            process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            while process.poll() is None:
+                if not ignore_cancel and context.cancel_event.wait(0.1):
+                    process.terminate()
+                    raise CanceledError()
+            if process.returncode != 0:
+                raise CompanionError("mux_failed", "FFmpeg could not finalize the HLS recording.")
+            mux_temp.replace(context.output_path)
+            for path in segments:
+                path.unlink(missing_ok=True)
+        except OSError as error:
+            raise CompanionError("local_io", "The companion could not finalize the HLS recording.") from error
+        finally:
+            concat_list.unlink(missing_ok=True)
+            mux_temp.unlink(missing_ok=True)
+
+    def _ensure_hls_mux_space(self, context: TaskContext) -> None:
+        with self._tasks_lock:
+            own = self._reservations.get(context.task_id, context.reservation_bytes)
+            others = max(sum(self._reservations.values()) - own, 0)
+            if self._disk_free_bytes() < others + context.bytes_written + DISK_SPACE_HEADROOM_BYTES:
+                raise CompanionError("disk_space", "Not enough free disk space to finalize the HLS recording.")
 
     def _record_live_connection(
         self,
@@ -1559,6 +1811,10 @@ def _is_huya_referer(value: str) -> bool:
     return _site_for_referer(value) == "huya"
 
 
+def _is_hls_url(value: str) -> bool:
+    return bool(re.search(r"\.m3u8(?:$|[?#])", urlparse(value).path, re.IGNORECASE))
+
+
 def _live_connection_url(
     value: str,
     referer: str,
@@ -1739,6 +1995,10 @@ def _dash_mux_temp_path(output_path: Path, task_id: str) -> Path:
 
 def _live_segment_path(output_path: Path, segment_index: int) -> Path:
     return output_path.with_name(f"{output_path.name}.segment-{segment_index:04d}.flv")
+
+
+def _hls_segment_path(output_path: Path, segment_index: int) -> Path:
+    return output_path.with_name(f"{output_path.name}.segment-{segment_index:04d}.ts")
 
 
 def _cleanup_dash_artifacts(output_path: Path, task_id: str) -> None:

@@ -333,11 +333,19 @@ function renderCompanionStatus() {
 function companionInstallCommandText() {
   const extensionId = String(chrome.runtime?.id || "").trim() || "在 chrome://extensions 复制扩展 ID";
   const browser = /Edg\//i.test(String(globalThis.navigator?.userAgent || "")) ? "Edge" : "Chrome";
+  // The companion is built from this checkout. Absolute paths keep the
+  // command independent of PowerShell's current directory (often System32).
+  // If the checkout is moved, the displayed path is the only part to update.
+  const repositoryPath = "F:\\AI\\codex\\bili_download";
+  const scriptPath = `${repositoryPath}\\extension\\companion\\install_windows.ps1`;
+  const hostPath = `${repositoryPath}\\dist\\bili-stream-companion.exe`;
   return [
-    "powershell -NoProfile -File .\\extension\\companion\\install_windows.ps1 `",
+    `powershell -NoProfile -ExecutionPolicy Bypass -File \"${scriptPath}\" ` + "`",
     `  -ExtensionId ${extensionId} ` + "`",
-    "  -HostExe (Resolve-Path .\\dist\\bili-stream-companion.exe) `",
-    `  -Browser ${browser}`
+    `  -HostExe (Resolve-Path \"${hostPath}\") ` + "`",
+    `  -Browser ${browser}`,
+    "",
+    "# 如果项目不在 F:\\AI\\codex\\bili_download，请把上面的两个路径改成实际路径。"
   ].join("\n");
 }
 

@@ -293,6 +293,42 @@ test("popup keeps advanced controls in a secondary settings view", async () => {
 });
 
 
+test("popup generates an absolute companion install command", async () => {
+  const code = await readFile("extension/src/popup.js", "utf8");
+  const sandbox = {
+    Array,
+    Date,
+    Error,
+    Map,
+    Number,
+    Promise,
+    RegExp,
+    Set,
+    String,
+    URL,
+    navigator: { userAgent: "Chrome" },
+    document: {
+      addEventListener() {},
+      querySelector(selector) {
+        return selector === "#quality" ? { addEventListener() {} } : undefined;
+      }
+    },
+    chrome: {
+      runtime: {
+        id: "cioibbcfbkfnopbeabcfgjhomlbeihm",
+        connect() { return { onMessage: { addListener() {} } }; }
+      }
+    }
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(code, sandbox);
+  const command = sandbox.companionInstallCommandText();
+  assert.ok(command.includes('-File "F:\\AI\\codex\\bili_download\\extension\\companion\\install_windows.ps1"'));
+  assert.ok(command.includes('Resolve-Path "F:\\AI\\codex\\bili_download\\dist\\bili-stream-companion.exe"'));
+  assert.equal(command.includes("-File .\\\\extension"), false);
+});
+
+
 test("popup calculates download capacity from device memory and known video size", async () => {
   const code = await readFile("extension/src/popup.js", "utf8");
   const elements = {

@@ -106,14 +106,14 @@
           </div>
           <button id="companion-install" class="secondary companion-install" type="button" hidden>&#23433;&#35013;&#22686;&#24378;&#32452;&#20214;</button>
           <div id="companion-install-guide" class="companion-install-guide" hidden>
-            <p>增强组件需要在系统中注册一次。浏览器不能直接运行安装程序，请在项目目录的 PowerShell 中执行下面的命令。</p>
+            <p>增强组件需要在系统中注册一次。浏览器不能直接运行安装程序，下面的命令已使用绝对路径，可从任意 PowerShell 目录执行。</p>
             <label for="companion-install-command">注册命令</label>
             <textarea id="companion-install-command" rows="4" readonly spellcheck="false"></textarea>
             <div class="companion-install-actions">
               <button id="companion-copy-command" type="button">复制命令</button>
               <button id="companion-install-close" class="secondary" type="button">收起</button>
             </div>
-            <p class="companion-note">执行完成后点击“检查可用性”。如果组件已构建，直接执行注册命令即可。</p>
+            <p class="companion-note">执行完成后点击“检查可用性”。如果项目移动过，请先把命令中的项目路径改成实际路径。</p>
           </div>
           <label class="companion-option">
             <input id="companion-prefer-dash" type="checkbox">

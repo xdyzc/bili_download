@@ -389,6 +389,40 @@ def test_hls_recording_uses_reconnect_flags_and_remuxes_ts_parts(tmp_path: Path)
 
 
 @with_tmp_path
+def test_hls_worker_does_not_roll_over_on_configured_segment_interval(tmp_path: Path) -> None:
+    context = companion.TaskContext(
+        task_id="hls_continuous",
+        kind="live",
+        output_name="Huya.mkv",
+        output_path=tmp_path / "Huya.mkv",
+        manifest_path=tmp_path / "Huya.mkv.live.manifest.json",
+        referer="https://www.huya.com/fixture",
+        max_bytes=1024 * 1024,
+        reservation_bytes=1024 * 1024,
+        duration_seconds=30,
+        segment_seconds=5,
+        live_sources=("https://alhls.huya.com/live.m3u8?token=redacted",),
+        live_format="hls",
+    )
+    context.manifest = {"segments": []}
+    host = companion.CompanionHost(output_dir=tmp_path, max_disk_bytes=1024 * 1024)
+    durations: list[int] = []
+
+    def record(_url, destination, **kwargs):
+        durations.append(kwargs["duration_seconds"])
+        destination.write_bytes(b"ts-data")
+        return companion.LiveConnectionResult("segment_duration", 7)
+
+    host._record_hls_connection = record
+    host._finalize_hls_segments = lambda _context: None
+    host._finish_live_stop = lambda _context, _reason: None
+    host._release_task = lambda _context: None
+    host._run_live_hls(context)
+
+    assert durations == [30]
+
+
+@with_tmp_path
 def test_live_cleanup_only_removes_parts_registered_by_the_task(tmp_path: Path) -> None:
     context = companion.TaskContext(
         task_id="cleanup_exact",

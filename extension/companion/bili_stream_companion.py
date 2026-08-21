@@ -1105,7 +1105,7 @@ class CompanionHost:
                     part_path.unlink(missing_ok=True)
                     context.release_live_part(part_path)
 
-                if result is not None and result.reason in {"duration", "disk_limit"}:
+                if result is not None and result.reason in {"duration", "segment_duration", "disk_limit"}:
                     break
                 if failure is None:
                     failed_round.clear()

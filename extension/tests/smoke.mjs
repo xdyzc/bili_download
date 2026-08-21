@@ -213,6 +213,11 @@ test("popup contains MVP controls", async () => {
     "cancel",
     "companion-status",
     "companion-check",
+    "companion-install",
+    "companion-install-guide",
+    "companion-install-command",
+    "companion-copy-command",
+    "companion-install-close",
     "companion-prefer-dash",
     "companion-prefer-live",
     "companion-save"

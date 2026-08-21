@@ -143,6 +143,11 @@ const pauseButton = document.querySelector("#pause");
 const cancelButton = document.querySelector("#cancel");
 const companionStatusElement = document.querySelector("#companion-status");
 const companionCheckButton = document.querySelector("#companion-check");
+const companionInstallButton = document.querySelector("#companion-install");
+const companionInstallGuide = document.querySelector("#companion-install-guide");
+const companionInstallCommand = document.querySelector("#companion-install-command");
+const companionCopyCommandButton = document.querySelector("#companion-copy-command");
+const companionInstallCloseButton = document.querySelector("#companion-install-close");
 const companionPreferDashInput = document.querySelector("#companion-prefer-dash");
 const companionPreferLiveInput = document.querySelector("#companion-prefer-live");
 const companionSaveButton = document.querySelector("#companion-save");
@@ -172,6 +177,9 @@ cancelButton?.addEventListener("click", cancelDownload);
 companionCheckButton?.addEventListener("click", () => {
   checkStreamingCompanion({ userInitiated: true }).catch(() => {});
 });
+companionInstallButton?.addEventListener("click", showCompanionInstallGuide);
+companionCopyCommandButton?.addEventListener("click", copyCompanionInstallCommand);
+companionInstallCloseButton?.addEventListener("click", hideCompanionInstallGuide);
 companionSaveButton?.addEventListener("click", saveCompanionSettings);
 taskCenterRefreshButton?.addEventListener("click", () => {
   refreshTaskCenter({ resumeBatch: false }).catch(() => {});
@@ -316,6 +324,53 @@ function renderCompanionStatus() {
   companionStatusElement.textContent = labels[status] || labels.unknown;
   if (companionCheckButton) {
     companionCheckButton.disabled = status === "checking";
+  }
+  if (companionInstallButton) {
+    companionInstallButton.hidden = status === "available" || status === "checking";
+  }
+}
+
+function companionInstallCommandText() {
+  const extensionId = String(chrome.runtime?.id || "").trim() || "在 chrome://extensions 复制扩展 ID";
+  const browser = /Edg\//i.test(String(globalThis.navigator?.userAgent || "")) ? "Edge" : "Chrome";
+  return [
+    "powershell -NoProfile -File .\\extension\\companion\\install_windows.ps1 `",
+    `  -ExtensionId ${extensionId} ` + "`",
+    "  -HostExe (Resolve-Path .\\dist\\bili-stream-companion.exe) `",
+    `  -Browser ${browser}`
+  ].join("\n");
+}
+
+function showCompanionInstallGuide() {
+  if (companionInstallCommand) {
+    companionInstallCommand.value = companionInstallCommandText();
+  }
+  if (companionInstallGuide) {
+    companionInstallGuide.hidden = false;
+  }
+  if (companionInstallButton) {
+    companionInstallButton.hidden = true;
+  }
+  companionInstallCommand?.focus?.();
+}
+
+function hideCompanionInstallGuide() {
+  if (companionInstallGuide) {
+    companionInstallGuide.hidden = true;
+  }
+  renderCompanionStatus();
+}
+
+async function copyCompanionInstallCommand() {
+  const command = companionInstallCommandText();
+  if (companionInstallCommand) {
+    companionInstallCommand.value = command;
+  }
+  try {
+    await navigator.clipboard.writeText(command);
+    setStatus("安装命令已复制");
+  } catch (_error) {
+    setStatus("无法自动复制，请从命令框中复制");
   }
 }
 

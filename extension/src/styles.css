@@ -468,6 +468,52 @@ select:disabled {
   font-size: 12px;
 }
 
+.companion-install {
+  width: 100%;
+  margin-top: 10px;
+}
+
+.companion-install-guide {
+  margin-top: 10px;
+  padding: 10px;
+  background: var(--surface, #f7f8fa);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+.companion-install-guide p {
+  margin: 0 0 8px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.companion-install-guide label {
+  display: block;
+  margin-bottom: 5px;
+  color: var(--text);
+  font-size: 12px;
+}
+
+.companion-install-guide textarea {
+  width: 100%;
+  min-height: 86px;
+  box-sizing: border-box;
+  resize: vertical;
+  font: 11px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+.companion-install-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.companion-install-actions button {
+  flex: 1;
+  min-width: 0;
+}
+
 .companion-option {
   display: grid;
   grid-template-columns: 16px minmax(0, 1fr);

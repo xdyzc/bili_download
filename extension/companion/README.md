@@ -19,9 +19,10 @@ tries to bypass quality, membership, region, DRM, or copyright restrictions.
 - Live FLV fallback: writes independently reopened `.flv` segments instead of retaining
   an ever-growing browser `Blob`; retries supplied candidates with bounded
   backoff; produces a local manifest for the segment set.
-- Huya HLS: accepts only the page-provided AVC `.m3u8` source, records bounded
-  MPEG-TS parts with FFmpeg reconnect options, then remuxes them into the final
-  `.mkv` without browser-side FLV timestamp rewriting.
+- Huya HLS: accepts only the page-provided AVC `.m3u8` source, records one
+  continuous MPEG-TS timeline per authorization window with FFmpeg reconnect
+  options, then remuxes it into the final `.mkv` without periodic timestamp
+  resets or browser-side FLV timestamp rewriting.
 - Signed URL expiry: when every supplied candidate returns HTTP 403, 404, or
   412, it emits `refresh_required`. The extension can run its normal existing
   prepare operation again and send fresh candidates using the same `taskId`.

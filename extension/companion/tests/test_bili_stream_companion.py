@@ -378,7 +378,9 @@ def test_hls_recording_uses_reconnect_flags_and_remuxes_ts_parts(tmp_path: Path)
         command = popen.call_args.args[0]
         assert "-reconnect_streamed" in command
         assert "-reconnect_at_eof" in command
-        assert "-fflags" in command and "+discardcorrupt" in command
+        assert "-fflags" in command and "+discardcorrupt+genpts" in command
+        assert "-copyts" in command
+        assert "-fps_mode" in command and "passthrough" in command
         context.output_path.with_name("Huya.mkv.segment-0001.ts").write_bytes(b"ts-data")
         host._finalize_hls_segments(context)
 

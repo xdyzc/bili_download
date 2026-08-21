@@ -1066,10 +1066,10 @@ class CompanionHost:
                 if remaining <= 0:
                     break
                 self._ensure_live_space(context)
-                segment_seconds = min(
-                    context.segment_seconds,
-                    max(deadline - self._clock(), 1),
-                )
+                # Keep one FFmpeg process for the whole authorization window.
+                # Recreating it on a normal cadence resets the timestamp origin
+                # and produces the periodic flash seen after concat/remux.
+                segment_seconds = max(int(deadline - self._clock()), 1)
                 try:
                     result = self._record_hls_connection(
                         source,
@@ -1169,8 +1169,9 @@ class CompanionHost:
         command = [
             ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
             "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_at_eof", "1",
-            "-reconnect_delay_max", "5", "-fflags", "+discardcorrupt",
-            "-correct_ts_overflow", "1", "-avoid_negative_ts", "make_non_negative",
+            "-reconnect_delay_max", "5", "-fflags", "+discardcorrupt+genpts",
+            "-correct_ts_overflow", "1", "-copyts", "-start_at_zero",
+            "-avoid_negative_ts", "disabled", "-fps_mode", "passthrough",
             "-headers", header_blob, "-i", url, "-t", str(max(int(duration_seconds), 1)),
             "-c", "copy", "-f", "mpegts", str(destination),
         ]

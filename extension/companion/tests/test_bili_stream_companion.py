@@ -335,7 +335,7 @@ def test_ffmpeg_mux_never_reads_native_protocol_stdin() -> None:
 
 
 @with_tmp_path
-def test_hls_recording_uses_reconnect_flags_and_remuxes_ts_parts(tmp_path: Path) -> None:
+def test_hls_recording_lets_the_demuxer_reload_playlists_and_remuxes_ts_parts(tmp_path: Path) -> None:
     class FakeFfmpegProcess:
         def __init__(self, command, **_kwargs):
             self.command = command
@@ -376,16 +376,19 @@ def test_hls_recording_uses_reconnect_flags_and_remuxes_ts_parts(tmp_path: Path)
         )
         assert result.reason == "segment_duration"
         command = popen.call_args.args[0]
-        assert "-reconnect_streamed" in command
-        assert "-reconnect_at_eof" in command
+        assert "-reconnect_at_eof" not in command
+        assert "-reconnect_streamed" not in command
+        assert "-rw_timeout" in command and "15000000" in command
         assert "-fflags" in command and "+discardcorrupt+genpts" in command
         assert "-copyts" in command
         assert "-fps_mode" in command and "passthrough" in command
+        assert command.index("-fps_mode") > command.index("-i")
         context.output_path.with_name("Huya.mkv.segment-0001.ts").write_bytes(b"ts-data")
         host._finalize_hls_segments(context)
 
     assert (tmp_path / "Huya.mkv").read_bytes() == b"ts-data"
     assert not list(tmp_path.glob("*.segment-*.ts"))
+    assert emitted[0]["phase"] == "connecting"
 
 
 @with_tmp_path
@@ -420,6 +423,48 @@ def test_hls_worker_does_not_roll_over_on_configured_segment_interval(tmp_path: 
     host._run_live_hls(context)
 
     assert durations == [30]
+
+
+@with_tmp_path
+def test_hls_user_stop_keeps_current_part_and_completes_output(tmp_path: Path) -> None:
+    context = companion.TaskContext(
+        task_id="hls_user_stop",
+        kind="live",
+        output_name="Huya.mkv",
+        output_path=tmp_path / "Huya.mkv",
+        manifest_path=tmp_path / "Huya.mkv.live.manifest.json",
+        referer="https://www.huya.com/fixture",
+        max_bytes=1024 * 1024,
+        reservation_bytes=1024 * 1024,
+        duration_seconds=30,
+        segment_seconds=5,
+        live_sources=("https://alhls.huya.com/live.m3u8?token=redacted",),
+        live_format="hls",
+    )
+    context.manifest = {"status": "running", "segments": []}
+    host = companion.CompanionHost(output_dir=tmp_path, max_disk_bytes=1024 * 1024)
+    terminal: list[tuple[str, str]] = []
+
+    def record(_url, destination, **_kwargs):
+        destination.write_bytes(b"current-ts-data")
+        context.cancel_event.set()
+        return companion.LiveConnectionResult("user_stop", len(b"current-ts-data"))
+
+    def finalize(recording, **_kwargs):
+        recording.output_path.write_bytes(b"final-mkv-data")
+
+    host._record_hls_connection = record
+    host._finalize_hls_segments = finalize
+    host._finish_live_stop = lambda _context, reason: terminal.append(("completed", reason))
+    host._finish_canceled = lambda _context: terminal.append(("canceled", ""))
+    host._release_task = lambda _context: None
+
+    host._run_live_hls(context)
+
+    assert terminal == [("completed", "user")]
+    assert context.bytes_written == len(b"current-ts-data")
+    assert context.manifest["segments"][0]["reason"] == "user_stop"
+    assert context.output_path.read_bytes() == b"final-mkv-data"
 
 
 @with_tmp_path

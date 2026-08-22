@@ -2201,9 +2201,12 @@ test("Huya page adapter filters AVC qualities and builds three HTTPS CDN candida
   const hlsResult = await sandbox.readHuyaLiveStateInPage(2000, true);
   const hlsCandidate = hlsResult.payload.candidates.find((candidate) => candidate.protocol === "hls");
   assert.ok(hlsCandidate);
-  assert.equal(new URL(hlsCandidate.url).hostname, "alhls.huya.com");
-  assert.equal(new URL(hlsCandidate.url).pathname.endsWith(".m3u8"), true);
-  assert.equal(new URL(hlsCandidate.url).searchParams.get("hlsSecret"), "official-hls-redacted");
+  const hlsUrl = new URL(hlsCandidate.url);
+  assert.equal(hlsUrl.hostname, "alhls.huya.com");
+  assert.equal(hlsUrl.pathname.endsWith(".m3u8"), true);
+  assert.equal(hlsUrl.searchParams.get("wsSecret"), "official-redacted");
+  assert.equal(hlsUrl.searchParams.get("wsTime"), "12345678");
+  assert.equal(hlsUrl.searchParams.has("hlsSecret"), false);
 
   const sourceResult = await sandbox.readHuyaLiveStateInPage(10000, true);
   assert.equal(new URL(sourceResult.payload.candidates[0].url).searchParams.has("ratio"), false);
@@ -7016,6 +7019,13 @@ test("popup automatically uses the companion for oversized DASH and explicitly e
     };
     state.page = { type: "live", roomId: "100", title: "Popup Live", url: "https://live.bilibili.com/100" };
   `, sandbox);
+
+  vm.runInContext("state.downloadControl = { liveRecording: true, canceled: false };", sandbox);
+  sandbox.updateCompanionLivePhaseStatus({ companionDownload: true, phase: "connecting" });
+  assert.equal(statusElement.textContent, "正在连接直播源…");
+  sandbox.updateCompanionLivePhaseStatus({ companionDownload: true, phase: "recording" });
+  assert.equal(statusElement.textContent, "正在录制直播...");
+  vm.runInContext("state.downloadControl = null;", sandbox);
 
   const automaticDashLimit = sandbox.getDashSafetyLimits().maxInputBytes;
   const dashPrepared = {

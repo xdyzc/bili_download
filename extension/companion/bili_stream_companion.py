@@ -1107,6 +1107,8 @@ class CompanionHost:
 
                 if result is not None and result.reason in {"duration", "segment_duration", "disk_limit"}:
                     break
+                if context.cancel_event.is_set():
+                    raise CanceledError()
                 if failure is None:
                     failed_round.clear()
                     continue
@@ -1145,7 +1147,10 @@ class CompanionHost:
                     self._finalize_hls_segments(context, ignore_cancel=True)
                 except CompanionError:
                     pass
-            self._finish_canceled(context)
+            if context.bytes_written > 0 and context.output_path.exists():
+                self._finish_live_stop(context, "user")
+            else:
+                self._finish_canceled(context)
         except CompanionError as error:
             self._finish_failed(context, error)
 
@@ -1168,13 +1173,26 @@ class CompanionHost:
         header_blob = "".join(f"{key}: {value}\r\n" for key, value in headers.items())
         command = [
             ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
-            "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_at_eof", "1",
-            "-reconnect_delay_max", "5", "-fflags", "+discardcorrupt+genpts",
-            "-correct_ts_overflow", "1", "-copyts", "-start_at_zero",
-            "-avoid_negative_ts", "disabled", "-fps_mode", "passthrough",
+            # The HLS demuxer reloads live playlists itself.  HTTP
+            # `reconnect_at_eof` must not be used here: EOF is how FFmpeg knows
+            # that one playlist response is complete, so reconnecting at that
+            # layer prevents the demuxer from ever opening its TS segments.
+            "-rw_timeout", "15000000",
+            "-fflags", "+discardcorrupt+genpts", "-correct_ts_overflow", "1",
+            "-copyts", "-start_at_zero",
             "-headers", header_blob, "-i", url, "-t", str(max(int(duration_seconds), 1)),
-            "-c", "copy", "-f", "mpegts", str(destination),
+            "-c", "copy", "-avoid_negative_ts", "disabled",
+            "-fps_mode", "passthrough", "-f", "mpegts", str(destination),
         ]
+        self.emit({
+            "type": "progress",
+            "taskId": context.task_id,
+            "kind": context.kind,
+            "phase": "connecting",
+            "receivedBytes": context.bytes_written,
+            "segmentIndex": segment_index,
+            "durationMs": 0,
+        })
         try:
             process = subprocess.Popen(
                 command,
@@ -1192,11 +1210,16 @@ class CompanionHost:
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait(timeout=2)
-                raise CanceledError()
+                return LiveConnectionResult("user_stop", _existing_size(destination))
             written = _existing_size(destination)
-            if written > max_bytes:
+            if written >= max_bytes:
                 process.terminate()
-                raise CandidateFailure()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=2)
+                return LiveConnectionResult("disk_limit", min(written, max_bytes))
             self.emit({
                 "type": "progress",
                 "taskId": context.task_id,

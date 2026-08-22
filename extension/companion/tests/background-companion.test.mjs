@@ -446,6 +446,7 @@ test("background companion starts DASH privately, relays progress, refreshes, ca
 
 test("background companion preserves live site metadata and makes page reauthorization recoverable", async () => {
   const harness = await createHarness();
+  const progressMessages = connectProgressPort(harness);
   const startPromise = sendRuntimeMessage(harness.listeners.message, {
     type: "BILI_DOWNLOAD_START_COMPANION",
     payload: {
@@ -470,6 +471,17 @@ test("background companion preserves live site metadata and makes page reauthori
   assert.equal(started.ok, true);
   assert.equal(started.payload.metadata.site, "huya");
   assert.equal(started.payload.metadata.roomKey, "999002");
+  native.emit({
+    version: 1,
+    type: "progress",
+    taskId: startMessage.taskId,
+    kind: "live",
+    phase: "connecting",
+    receivedBytes: 0
+  });
+  await waitFor(() => progressMessages.some((message) => (
+    message.payload?.taskId === startMessage.taskId && message.payload?.phase === "connecting"
+  )));
   harness.sandbox.__liveTaskId = startMessage.taskId;
   const progressSite = vm.runInContext(
     "companionDownloadTaskProgress(companionDownloadTasks.get(__liveTaskId)).site",

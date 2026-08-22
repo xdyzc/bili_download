@@ -207,6 +207,7 @@ progressPort.onMessage.addListener((message) => {
       ? state.downloadControl?.companionTaskId === companionTask?.taskId
       : true;
   if (belongsToCurrentControl) {
+    updateCompanionLivePhaseStatus(payload);
     updateProgress(payload);
   }
 });
@@ -221,6 +222,23 @@ chrome.tabs?.onUpdated?.addListener((tabId, changeInfo) => {
   }
   refreshFromActiveTab({ force: true });
 });
+
+function updateCompanionLivePhaseStatus(payload) {
+  const control = state.downloadControl;
+  if (!payload?.companionDownload || !control?.liveRecording || control.canceled) {
+    return;
+  }
+  const phase = String(payload.phase || "");
+  if (!phase || control.companionPhase === phase) {
+    return;
+  }
+  control.companionPhase = phase;
+  if (phase === "connecting" || phase === "reconnecting") {
+    setStatus(phase === "connecting" ? "正在连接直播源…" : "直播源已断开，正在重新连接…");
+  } else if (phase === "recording") {
+    setStatus(TEXT.liveRecording);
+  }
+}
 
 async function initialize() {
   renderActiveView();

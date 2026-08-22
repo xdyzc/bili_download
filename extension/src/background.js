@@ -1123,7 +1123,12 @@ async function readHuyaLiveStateInPage(requestedQuality, includeSources) {
       }
       let hlsUrl = "";
       try {
-        const hlsAntiCode = String(item?.sHlsAntiCode || officialAntiCode).replace(/^\?/, "");
+        // `sHlsAntiCode` in the initial player configuration is only an
+        // authorization template and is commonly stale by the time recording
+        // starts.  The official player has already refreshed the matching
+        // AVC authorization for this browser session; the HLS and FLV entries
+        // share that template, so use only the current player value here.
+        const hlsAntiCode = officialAntiCode;
         if (!hlsAntiCode || hlsAntiCode.length > 2048 || /[\r\n]/.test(hlsAntiCode)) {
           throw new Error("invalid hls authorization");
         }
@@ -3363,7 +3368,7 @@ function normalizeCompanionKind(value) {
 
 function normalizeCompanionPhase(value) {
   const phase = String(value || "") === "completed" ? "complete" : String(value || "");
-  return ["download_video", "download_audio", "muxing", "recording", "reconnecting", "complete"].includes(phase)
+  return ["download_video", "download_audio", "muxing", "connecting", "recording", "reconnecting", "complete"].includes(phase)
     ? phase
     : "";
 }
